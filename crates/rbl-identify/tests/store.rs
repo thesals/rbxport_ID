@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use rbl_identify::IdentifyError;
-use rbl_identify::model::{Decision, ExistingTags, Field, FrameValues, RawId3, TagSnapshot};
+use rbl_identify::model::{Decision, ExistingTags, Field, FieldChange, FrameValues, RawId3, TagSnapshot};
 use rbl_identify::store::{Filter, ReviewState, SCHEMA_VERSION, Store, TrackKey};
 
 fn key(path: &str) -> TrackKey {
@@ -30,14 +30,16 @@ fn a_store_survives_closing_and_reopening() {
     let file = dir.path().join("identify.sqlite");
     let path = "C:\\Music\\Röyksopp\\Eple.mp3";
     let tags = ExistingTags { artist: "Röyksopp".into(), title: "Eple".into(), ..ExistingTags::default() };
-    let (track, result, art) = {
+    let changes = vec![FieldChange { field: Field::Label, current: String::new(), proposed: "Wall of Sound".into() }];
+    let after = TrackKey { file_size: 4_200, modified_unix: 1_700_000_100, ..key(path) };
+    let (track, result, application, art) = {
         let store = Store::open(&file).unwrap();
         let track = store.upsert_track(&key(path), 220.5, Some("AQAB"), &tags).unwrap();
-        assert!(store.save_original_snapshot(track, &snapshot()).unwrap());
         let result = store.save_result(track, Decision::Review, &[], None, None, &["w".into()], false).unwrap();
         store.set_state(result, ReviewState::Accepted).unwrap();
+        let application = store.record_applied(result, &changes, None, &snapshot(), &after, Some("{}")).unwrap();
         let art = store.put_artwork(b"\xff\xd8jpeg", "image/jpeg").unwrap();
-        (track, result, art)
+        (track, result, application, art)
     };
     let journal: String = rusqlite::Connection::open(&file)
         .unwrap()
@@ -49,10 +51,12 @@ fn a_store_survives_closing_and_reopening() {
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     assert_eq!(store.track_id(path).unwrap(), Some(track));
     assert_eq!(store.original_snapshot(track).unwrap(), Some(snapshot()));
-    assert!(!store.save_original_snapshot(track, &TagSnapshot::default()).unwrap());
-    let items = store.list(Filter::All, 0, 10).unwrap();
+    assert_eq!(store.application_snapshot(application).unwrap(), Some(snapshot()));
+    let last = store.last_application(result).unwrap().unwrap();
+    assert_eq!((last.id, last.changes, last.file_after), (application, changes, after));
+    let items = store.list(Filter::Applied, 0, 10).unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!((items[0].result, items[0].state, items[0].path.as_str()), (result, ReviewState::Accepted, path));
+    assert_eq!((items[0].result, items[0].state, items[0].path.as_str()), (result, ReviewState::Applied, path));
     assert_eq!(items[0].existing, tags);
     assert_eq!(store.artwork(&art).unwrap().unwrap().1, "image/jpeg");
 }
