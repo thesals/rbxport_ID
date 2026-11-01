@@ -34,6 +34,8 @@ const DURATION_REJECT_SECS: f64 = 10.0;
 const MIX_CONFLICT_CAP: f64 = 0.49;
 /// The ceiling for a candidate without an AcoustID score.
 const TEXT_ONLY_CAP: f64 = 0.90;
+/// The ceiling when the mixes cannot be compared: below auto-apply.
+const UNKNOWN_MIX_CAP: f64 = 0.91;
 /// Score for a factor with nothing to compare.
 const NEUTRAL: f64 = 0.5;
 
@@ -50,7 +52,9 @@ const NEUTRAL: f64 = 0.5;
 ///   alone; with neither, 0.5.
 /// - **mix**: [`agree`] on the file's and the candidate's mix: Same 1.0,
 ///   Compatible 0.8, Unknown 0.5, Conflict 0.0. A conflict also caps the
-///   total at 0.49, so a remix can never be proposed for the original.
+///   total at 0.49, so a remix can never be proposed for the original, and
+///   an unknown agreement (a radio edit against an untagged mix, say) caps
+///   it at 0.91, so it can be reviewed but never auto-applied.
 /// - **acoustid**: the AcoustID score as is.
 ///
 /// Design decision: a text-search candidate (no AcoustID score) is scored
@@ -97,6 +101,13 @@ pub fn score(existing: &ExistingTags, file_duration_secs: f64, candidate: Candid
     } else if acoustid.is_none() && total > TEXT_ONLY_CAP {
         total = TEXT_ONLY_CAP;
         rejected = Some("text search only: capped at 0.90".to_owned());
+    } else if agreement == MixAgreement::Unknown && total > UNKNOWN_MIX_CAP {
+        total = UNKNOWN_MIX_CAP;
+        rejected = Some(format!(
+            "mix unknown: {} vs {}: capped at 0.91",
+            mix_label(&file_title),
+            mix_label(&cand_title)
+        ));
     }
 
     Scored {
@@ -318,6 +329,67 @@ mod tests {
         assert!((mix_of("The Music") - 0.8).abs() < f64::EPSILON);
         assert!((mix_of("The Music (Club Mix)") - 0.5).abs() < f64::EPSILON);
         assert!(mix_of("The Music (Radio Edit)").abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unknown_mix_is_capped_below_auto_apply() {
+        // A radio edit against a title with no mix: Unknown.
+        let file = tags("Armin van Buuren", "The Music");
+        let s = score(
+            &file,
+            FILE_SECS,
+            cand("m", "Armin van Buuren", "The Music (Radio Edit)", Some(300_000), Some(1.0)),
+        );
+        assert!((s.score - 0.91).abs() < f64::EPSILON, "{s:?}");
+        assert_eq!(
+            s.breakdown.rejected.as_deref(),
+            Some("mix unknown: no mix vs Radio Edit: capped at 0.91")
+        );
+        // Club against Extended likewise.
+        let s = score(
+            &music(),
+            FILE_SECS,
+            cand("m", "Armin van Buuren", "The Music (Club Mix)", Some(300_000), Some(1.0)),
+        );
+        assert!(s.score <= 0.91, "{s:?}");
+    }
+
+    #[test]
+    fn other_versions_never_pass_as_the_original() {
+        let file = tags("Sander van Doorn", "End of Life (Original Mix)");
+        for title in [
+            "End of Life (TC Refix)",
+            "End of Life (Yan Oxygen Mix)",
+            "End of Life (Vocal Mix)",
+            "End of Life (TC Remix Radio Edit)",
+            "End of Life - TC Remix - Radio Edit",
+            "End of Life (Chris Deepak Dub)",
+        ] {
+            let s = score(&file, FILE_SECS, cand("m", "Sander van Doorn", title, Some(300_000), Some(1.0)));
+            assert!(s.score <= 0.49, "{title}: {s:?}");
+        }
+        for disambiguation in ["remix by X", "X remix, radio edit", "extended remix by X", "2008 edit"] {
+            let mut c = cand("m", "Sander van Doorn", "End of Life", Some(300_000), Some(1.0));
+            c.disambiguation = disambiguation.to_owned();
+            let s = score(&file, FILE_SECS, c);
+            assert!(s.score <= 0.49, "{disambiguation}: {s:?}");
+        }
+        // A remixer's dub is not their remix.
+        let remix_file = tags("Sander van Doorn", "End of Life (Chris Deepak Remix)");
+        let s = score(
+            &remix_file,
+            FILE_SECS,
+            cand("m", "Sander van Doorn", "End of Life (Chris Deepak Dub)", Some(300_000), Some(1.0)),
+        );
+        assert!(s.score <= 0.49, "{s:?}");
+        // The same remix, however its name is dotted, still matches.
+        let tc_file = tags("Sander van Doorn", "End of Life (T.C. Remix)");
+        let s = score(
+            &tc_file,
+            FILE_SECS,
+            cand("m", "Sander van Doorn", "End of Life (TC Remix)", Some(300_000), Some(0.97)),
+        );
+        assert!(s.score >= 0.92, "{s:?}");
     }
 
     #[test]
