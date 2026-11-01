@@ -162,6 +162,11 @@ mod tests {
         };
         let one = leak(music.join("A/one.mp3"));
         let two = leak(music.join("A/two.mp3"));
+        // The shallow track sits on the temp dir's drive: `/` on Unix, `C:\`
+        // (exported as `/C/`) on Windows, so both share one export.
+        let (export, relative) = split(one).unwrap();
+        let host_root = &one[..one.len() - relative.len()];
+        let three = leak(format!("{host_root}Users/me/three.mp3").into());
         let track = |id, path: &'static str| TestTrack {
             id,
             title: "t",
@@ -171,13 +176,12 @@ mod tests {
         let library = library_from(&[
             track(1, one),
             track(2, two),
-            track(3, "/Users/me/three.mp3"),
+            track(3, three),
             track(4, "not absolute.mp3"),
         ]);
         let exports = exports(&library);
-        assert_eq!(exports.names(), ["/"]);
-        let root = exports.get("/").unwrap();
-        let (_, relative) = split(one).unwrap();
+        assert_eq!(exports.names(), [export.as_str()]);
+        let root = exports.get(&export).unwrap();
         let (folder, _) = root_of(one, &relative).unwrap();
 
         // Nothing is built until asked: the tree is the root alone.
@@ -191,11 +195,10 @@ mod tests {
         assert!(a_dir.starts_with(folder));
         let a = root.resolve(a_dir).unwrap();
         assert_eq!(root.children(a).len(), 2);
+        // Compared as paths: the host path joins with `\` on Windows.
         assert_eq!(
-            root.source(root.resolve(&relative).unwrap())
-                .unwrap()
-                .to_str(),
-            Some(one)
+            root.source(root.resolve(&relative).unwrap()).as_deref(),
+            Some(std::path::Path::new(one))
         );
         assert!(
             root.resolve(&format!("{}/stray.wav", a_dir.rsplit_once('/').unwrap().0))
@@ -216,7 +219,7 @@ mod tests {
             root.source(root.resolve("Users/me/three.mp3").unwrap())
                 .unwrap()
                 .to_str(),
-            Some("/Users/me/three.mp3")
+            Some(three)
         );
     }
 }
