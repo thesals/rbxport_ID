@@ -59,6 +59,12 @@ pub struct Candidate {
     /// (`The Music (Extended Mix)`), sometimes only in `disambiguation`.
     pub title: String,
     pub disambiguation: String,
+    /// Artists with a MusicBrainz `remixer` relationship to the recording.
+    /// Non-empty means the recording is a remix even when its title does
+    /// not say so. Only a full lookup fills it: search results and AcoustID
+    /// data carry no relationships.
+    #[serde(default)]
+    pub remixers: Vec<String>,
     pub length_ms: Option<u32>,
     pub isrcs: Vec<String>,
     pub genres: Vec<String>,

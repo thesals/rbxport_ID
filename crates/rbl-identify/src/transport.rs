@@ -12,7 +12,9 @@ pub enum Method {
     Post,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` is written by hand: the URL's query and the body can carry a key
+/// (AcoustID's `client=` is in the body), so neither is ever printed.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Request {
     pub method: Method,
     /// The full URL. It may carry a key in its query, so it is never
@@ -43,6 +45,20 @@ impl Request {
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
         self
+    }
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Scheme, host and path only; header values (a Discogs token) and
+        // the body are summarised, never shown.
+        let path = self.url.split(['?', '#']).next().unwrap_or_default();
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("url", &path)
+            .field("headers", &self.headers.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>())
+            .field("body_bytes", &self.body.as_ref().map(|(_, bytes)| bytes.len()))
+            .finish()
     }
 }
 
@@ -138,6 +154,17 @@ impl Transport for HttpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_never_prints_its_body_query_or_header_values() {
+        let request = Request::post_form("https://api.acoustid.org/v2/lookup?client=QUERYKEY", &[("client", "BODYKEY")])
+            .header("Authorization", "Discogs token=HEADERKEY");
+        let shown = format!("{request:?}");
+        for secret in ["QUERYKEY", "BODYKEY", "HEADERKEY"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        assert!(shown.contains("api.acoustid.org/v2/lookup") && shown.contains("Authorization"), "{shown}");
+    }
 
     #[test]
     fn form_values_are_percent_encoded() {
