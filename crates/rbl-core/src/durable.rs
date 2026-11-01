@@ -489,7 +489,13 @@ mod tests {
     fn mark_newer(path: &Path) {
         let times = std::fs::FileTimes::new()
             .set_modified(std::time::SystemTime::now() + Duration::from_secs(10));
-        std::fs::File::open(path).unwrap().set_times(times).unwrap();
+        // Windows needs write access to the handle to set file times.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
     }
     #[test]
     fn failed_publication_replays_retained_images_and_deletions() {
