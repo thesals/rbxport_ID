@@ -50,6 +50,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| IdentifyError::Config(format!("cannot read {}: {e}", path.display())))?;
+        // Notepad saves UTF-8 with a BOM, which `trim` does not remove.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
         Self::from_lookup(|key| std::env::var(key).ok().filter(|v| !v.is_empty()).or_else(|| file_value(&text, key)))
     }
 
@@ -65,7 +67,8 @@ impl Config {
 }
 
 /// The value of `key` in dotenv-style text: `KEY=value`, optional quotes,
-/// `#` comments and blank lines ignored.
+/// `#` comment lines and blank lines ignored, and an unquoted value's
+/// trailing ` # comment` dropped (a quoted value keeps its `#`).
 fn file_value(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let line = line.trim();
@@ -77,11 +80,14 @@ fn file_value(text: &str, key: &str) -> Option<String> {
             return None;
         }
         let value = value.trim();
-        let value = value
+        let quoted = value
             .strip_prefix('"')
             .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            .unwrap_or(value);
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')));
+        let value = match quoted {
+            Some(inner) => inner,
+            None => value.split_once(" #").map_or(value, |(v, _)| v).trim_end(),
+        };
         (!value.is_empty()).then(|| value.to_owned())
     })
 }
@@ -112,6 +118,16 @@ mod tests {
         assert_eq!(file_value(text, "MB_USER_AGENT").as_deref(), Some("ua 1.0"));
         assert_eq!(file_value(text, "DISCOGS_TOKEN"), None);
         assert_eq!(file_value(text, "MISSING"), None);
+    }
+
+    #[test]
+    fn a_file_saved_with_a_bom_and_inline_comments_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env.identify");
+        std::fs::write(&path, "\u{feff}ACOUSTID_API_KEY=abc # the key\r\nMB_USER_AGENT=\"ua 1.0 # not a comment\"\r\n").unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.acoustid_key.expose(), "abc");
+        assert_eq!(config.mb_user_agent, "ua 1.0 # not a comment");
     }
 
     #[test]

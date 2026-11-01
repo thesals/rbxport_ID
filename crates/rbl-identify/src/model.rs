@@ -1,11 +1,15 @@
 //! The data passed between the stages: what the file says, what the
 //! services propose, and what scoring and the decision make of it.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// What a file's own tags say before identification. Empty strings and
 /// `None` mean the tag is absent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+///
+/// For scoring and proposals only. It is lossy (trimmed values, the year
+/// alone of a full date, absent and empty alike), so it must never serve
+/// as the undo snapshot; Phase 2 adds an exact raw snapshot for that.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExistingTags {
     pub artist: String,
     /// As tagged, mix name included: `The Music (Extended Mix)`.
@@ -18,7 +22,7 @@ pub struct ExistingTags {
 }
 
 /// Where a candidate came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CandidateSource {
     /// An AcoustID fingerprint match, resolved through MusicBrainz.
     Fingerprint,
@@ -27,7 +31,7 @@ pub enum CandidateSource {
 }
 
 /// One release a recording appears on.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseInfo {
     pub mbid: String,
     pub title: String,
@@ -44,7 +48,7 @@ pub struct ReleaseInfo {
 }
 
 /// A recording the services propose for a file.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
     pub recording_mbid: String,
     /// The credited artist names, in order.
@@ -65,7 +69,7 @@ pub struct Candidate {
 }
 
 /// How each factor scored, for the review screen and the evaluation CSV.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScoreBreakdown {
     /// `None` for a text-search candidate.
     pub acoustid: Option<f64>,
@@ -76,7 +80,7 @@ pub struct ScoreBreakdown {
     pub rejected: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Scored {
     pub candidate: Candidate,
     /// 0..=1.
@@ -85,7 +89,7 @@ pub struct Scored {
 }
 
 /// What may happen to a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
     /// Score ≥ 0.92, only empty fields would change, and the user enabled
     /// auto-apply (off by default).

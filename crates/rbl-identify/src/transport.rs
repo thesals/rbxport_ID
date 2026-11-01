@@ -89,10 +89,25 @@ impl HttpTransport {
     pub fn new() -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
+            // A redirect could carry a key-bearing request to another host.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| IdentifyError::Http { service: "http", reason: e.without_url().to_string() })?;
+            .map_err(|e| http_error("http", e))?;
         Ok(Self { client })
     }
+}
+
+/// A transport error without its URL (which may hold a key), but with its
+/// cause chain, which does not.
+fn http_error(service: &'static str, error: reqwest::Error) -> IdentifyError {
+    let error = error.without_url();
+    let mut reason = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        let _ = write!(reason, ": {cause}");
+        source = cause.source();
+    }
+    IdentifyError::Http { service, reason }
 }
 
 impl Transport for HttpTransport {
@@ -107,8 +122,7 @@ impl Transport for HttpTransport {
         if let Some((content_type, body)) = &request.body {
             builder = builder.header("Content-Type", content_type).body(body.clone());
         }
-        // `without_url`: the URL can hold a key, and must not reach an error.
-        let response = builder.send().map_err(|e| IdentifyError::Http { service, reason: e.without_url().to_string() })?;
+        let response = builder.send().map_err(|e| http_error(service, e))?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -116,7 +130,7 @@ impl Transport for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
-        let body = response.bytes().map_err(|e| IdentifyError::Http { service, reason: e.without_url().to_string() })?.to_vec();
+        let body = response.bytes().map_err(|e| http_error(service, e))?.to_vec();
         Ok(Response { status, body, retry_after })
     }
 }
