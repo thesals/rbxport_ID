@@ -23,7 +23,7 @@ pub fn copy_file(source: &Path, target: &Path, progress: &mut Progress<'_>) -> i
     #[cfg(windows)]
     {
         windows::copy(source, target, meta.len(), progress)?;
-        return Ok(meta.len());
+        Ok(meta.len())
     }
     #[cfg(not(windows))]
     buffered_copy(source, target, progress)
@@ -236,13 +236,17 @@ mod mac {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows {
-    use super::*;
+    use super::{fs, io, Path, Progress};
     use std::{
         ffi::c_void,
         os::windows::ffi::OsStrExt,
         panic::{catch_unwind, AssertUnwindSafe},
     };
-    use windows_sys::Win32::Storage::FileSystem::*;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CopyFile2, COPYFILE2_CALLBACK_CHUNK_FINISHED, COPYFILE2_EXTENDED_PARAMETERS,
+        COPYFILE2_MESSAGE, COPYFILE2_MESSAGE_ACTION, COPYFILE2_PROGRESS_CANCEL,
+        COPYFILE2_PROGRESS_CONTINUE, COPY_FILE_FAIL_IF_EXISTS,
+    };
 
     struct Context<'a> {
         progress: &'a mut Progress<'a>,
@@ -322,16 +326,21 @@ mod windows {
             length,
             error: None,
         };
+        // The struct is a few dozen bytes, so this never fails in practice;
+        // report rather than truncate if it ever did.
+        let size = u32::try_from(std::mem::size_of::<COPYFILE2_EXTENDED_PARAMETERS>())
+            .map_err(|_| io::Error::other("Windows copy parameters too large"))?;
         let parameters = COPYFILE2_EXTENDED_PARAMETERS {
-            dwSize: std::mem::size_of::<COPYFILE2_EXTENDED_PARAMETERS>() as u32,
+            dwSize: size,
             dwCopyFlags: COPY_FILE_FAIL_IF_EXISTS,
             pfCancel: std::ptr::null_mut(),
             pProgressRoutine: Some(notify),
-            pvCallbackContext: (&mut context as *mut Context<'_>).cast(),
+            pvCallbackContext: (&raw mut context).cast(),
         };
         // All pointer targets outlive CopyFile2. Supported ReFS volumes can
         // clone automatically; NTFS and other volumes use native copying.
-        let result = unsafe { CopyFile2(source.as_ptr(), destination.as_ptr(), &parameters) };
+        let result =
+            unsafe { CopyFile2(source.as_ptr(), destination.as_ptr(), &raw const parameters) };
         if let Some(error) = context.error {
             return Err(error);
         }
@@ -347,6 +356,12 @@ mod windows {
         // read-only attribute after flushing the newly created backup file.
         if permissions.readonly() {
             let mut writable = permissions.clone();
+            // On Windows this only clears FILE_ATTRIBUTE_READONLY on our own
+            // new copy (no Unix world-writable bits); it is restored below.
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "Windows-only: clears FILE_ATTRIBUTE_READONLY on the new backup copy so it can be flushed, then restores it"
+            )]
             writable.set_readonly(false);
             fs::set_permissions(target, writable)?;
         }
