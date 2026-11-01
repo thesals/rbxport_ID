@@ -648,6 +648,7 @@ fn pin_to_interface(socket: &socket2::Socket, name: &str) -> io::Result<()> {
 
 /// Bound to the interface's address instead, above.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[allow(clippy::unnecessary_wraps, reason = "matches the fallible signature of the other platforms")]
 fn pin_to_interface(_socket: &socket2::Socket, _name: &str) -> io::Result<()> {
     Ok(())
 }
