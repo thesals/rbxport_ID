@@ -117,7 +117,6 @@ impl HttpTransport {
     /// `archive.org` host, because every image is served by a redirect to
     /// archive.org. Crate-private so no client holding a key or token can be
     /// given it; `coverart::CoverArtClient` builds its own.
-    #[allow(dead_code, reason = "called by coverart::CoverArtClient, which lands next in Phase 2")]
     pub(crate) fn for_cover_art() -> Result<Self> {
         let policy = reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
