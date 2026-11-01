@@ -112,18 +112,38 @@ impl HttpTransport {
         Ok(Self { client })
     }
 
-    /// A transport that follows up to five redirects, for requests that
-    /// carry no secret at all: Cover Art Archive answers every image with a
-    /// redirect to archive.org. Never give it to a client holding a key or
-    /// token.
-    pub fn following_redirects() -> Result<Self> {
+    /// The Cover Art Archive transport, and only that: it follows up to five
+    /// redirects, each only over https to `coverartarchive.org` or an
+    /// `archive.org` host, because every image is served by a redirect to
+    /// archive.org. Crate-private so no client holding a key or token can be
+    /// given it; `coverart::CoverArtClient` builds its own.
+    #[allow(dead_code, reason = "called by coverart::CoverArtClient, which lands next in Phase 2")]
+    pub(crate) fn for_cover_art() -> Result<Self> {
+        let policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if redirect_allowed(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(policy)
             .build()
             .map_err(|e| http_error("http", e))?;
         Ok(Self { client })
     }
+}
+
+/// Where a Cover Art Archive redirect may lead: https, and a host that is
+/// `coverartarchive.org` or `archive.org` or one of its subdomains.
+fn redirect_allowed(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str().is_some_and(|host| {
+            host == "coverartarchive.org" || host == "archive.org" || host.ends_with(".archive.org")
+        })
 }
 
 /// A transport error without its URL (which may hold a key), but with its
@@ -165,6 +185,7 @@ impl Transport for HttpTransport {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -177,6 +198,18 @@ mod tests {
             assert!(!shown.contains(secret), "{shown}");
         }
         assert!(shown.contains("api.acoustid.org/v2/lookup") && shown.contains("Authorization"), "{shown}");
+    }
+
+    #[test]
+    fn cover_art_redirects_stay_on_https_archive_hosts() {
+        let allowed = |url: &str| redirect_allowed(&reqwest::Url::parse(url).unwrap());
+        assert!(allowed("https://coverartarchive.org/release/x/front-500"));
+        assert!(allowed("https://ia800500.us.archive.org/1/items/mbid-x/mbid-x-1_thumb500.jpg"));
+        assert!(allowed("https://archive.org/download/mbid-x/x.jpg"));
+        assert!(!allowed("http://ia800500.us.archive.org/x.jpg"), "plain http");
+        assert!(!allowed("https://archive.org.evil.example/x.jpg"));
+        assert!(!allowed("https://notarchive.org/x.jpg"));
+        assert!(!allowed("https://api.discogs.com/releases/1"));
     }
 
     #[test]

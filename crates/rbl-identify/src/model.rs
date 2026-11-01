@@ -52,8 +52,18 @@ pub enum Field {
     MbReleaseId,
     MbReleaseGroupId,
     MbArtistId,
+    /// Picard's `MusicBrainz Release Track Id`: tied to the release, so it
+    /// must change (or be cleared) whenever the release ID does.
+    MbReleaseTrackId,
+    /// Picard's `MusicBrainz Album Artist Id`, also tied to the release.
+    MbAlbumArtistId,
     DiscogsReleaseId,
     Artwork,
+}
+
+impl Field {
+    /// The value an absent artwork is described by in a [`FieldChange`].
+    pub const NO_ARTWORK: &'static str = "none";
 }
 
 /// One proposed change, current value against proposed, as the review
@@ -88,6 +98,11 @@ pub struct ArtworkRef {
 }
 
 /// What may change in a file: only fields that actually differ.
+///
+/// Artwork is one change like any other: `changes` holds a
+/// [`Field::Artwork`] entry (current [`Field::NO_ARTWORK`]) exactly when
+/// `artwork` is `Some`, and only for a file that has none. Build proposals
+/// with [`Proposal::new`] so the two can never disagree.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
     pub changes: Vec<FieldChange>,
@@ -95,27 +110,84 @@ pub struct Proposal {
 }
 
 impl Proposal {
-    /// True when every change fills a field that is empty now: the only
-    /// proposals auto-apply may ever take. An empty proposal changes nothing
-    /// and is not "only empty fields".
+    /// A proposal from text-field changes and, for a file without artwork,
+    /// fetched artwork. Any `Field::Artwork` entry in `changes` is replaced
+    /// by the one derived from `artwork`, and artwork for a file that already
+    /// has some is dropped: identification never replaces artwork.
+    #[must_use]
+    pub fn new(changes: Vec<FieldChange>, artwork: Option<ArtworkRef>, file_has_artwork: bool) -> Self {
+        let mut changes: Vec<FieldChange> = changes.into_iter().filter(|c| c.field != Field::Artwork).collect();
+        let artwork = artwork.filter(|_| !file_has_artwork);
+        if let Some(art) = &artwork {
+            let source = match art.source {
+                ArtworkSource::CoverArtArchive => "Cover Art Archive",
+                ArtworkSource::Discogs => "Discogs",
+            };
+            let kind = if art.mime == "image/png" { "PNG" } else { "JPEG" };
+            changes.push(FieldChange {
+                field: Field::Artwork,
+                current: Field::NO_ARTWORK.to_owned(),
+                proposed: format!("{kind} from {source}"),
+            });
+        }
+        Self { changes, artwork }
+    }
+
+    /// True when every change fills a field that is empty now (artwork:
+    /// added to a file that has none): the only proposals auto-apply may
+    /// ever take. An empty proposal changes nothing and is not "only empty
+    /// fields".
     #[must_use]
     pub fn fills_only_empty(&self) -> bool {
-        !self.changes.is_empty() && self.changes.iter().all(|c| c.current.trim().is_empty())
+        !self.changes.is_empty()
+            && self.changes.iter().all(|c| {
+                c.current.trim().is_empty() || (c.field == Field::Artwork && c.current == Field::NO_ARTWORK)
+            })
     }
 }
 
 /// The exact original values of every [`Field`], taken before anything is
 /// written so a change can be undone. Unlike [`ExistingTags`] nothing is
 /// trimmed or reduced: a field's values are stored as the tag holds them
-/// (all of a multi-value frame, a full `2014-06-01` date), and a field the
-/// file does not have is simply missing from `values`.
+/// (all of a multi-value frame, a full `2014-06-01` date), per source
+/// frame, and a field the file does not have is simply missing from
+/// `values`.
+///
+/// Write rule for Phase 4: a field already held under a variant frame
+/// (`TXXX:Catalog #`) is updated in that frame, never duplicated into the
+/// standard one, and undo restores exactly the frames listed here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagSnapshot {
-    /// The tag format the values were read from: `ID3v2.3`, `ID3v2.4`,
-    /// `VorbisComments`, `MP4ilst`, ...
+    /// The tag type the values were read from (`Id3v2`, `VorbisComments`,
+    /// `Mp4Ilst`, ...). For ID3 the exact version is in `raw_id3`'s header;
+    /// a write must keep it.
     pub format: String,
-    pub values: std::collections::BTreeMap<Field, Vec<String>>,
+    /// Every frame holding each field, in reading order.
+    pub values: std::collections::BTreeMap<Field, Vec<FrameValues>>,
     pub has_artwork: bool,
+    /// For a file with ID3 tags: the `ID3v2` block (header included) and the
+    /// 128-byte `ID3v1` trailer, byte for byte, as unpadded standard base64.
+    /// `values` is only as exact as the tag reader; it drops what it cannot
+    /// parse (an invalid `2010-00-00` date, say). These bytes let undo put a
+    /// file's tags back exactly, whatever the reader made of them.
+    #[serde(default)]
+    pub raw_id3: Option<RawId3>,
+}
+
+/// One frame's values for a field: `frame` names it as the tag format does
+/// (`TPUB`, `TXXX:Catalog #`, `CATALOGNUMBER`, `©day`), so undo restores the
+/// same frame it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameValues {
+    pub frame: String,
+    pub values: Vec<String>,
+}
+
+/// A file's ID3 tags, byte for byte. Either part may be absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawId3 {
+    pub v2: Option<String>,
+    pub v1: Option<String>,
 }
 
 /// What Discogs adds to an identified track.
@@ -224,10 +296,36 @@ mod tests {
         FieldChange { field: Field::Label, current: current.to_owned(), proposed: "New".to_owned() }
     }
 
+    fn art() -> ArtworkRef {
+        ArtworkRef {
+            source: ArtworkSource::CoverArtArchive,
+            url: "https://coverartarchive.org/release/x/front-500".into(),
+            sha256: "ab".into(),
+            mime: "image/jpeg".into(),
+            bytes: 2048,
+        }
+    }
+
     #[test]
     fn only_a_proposal_that_fills_empty_fields_may_auto_apply() {
-        assert!(Proposal { changes: vec![change(""), change("  ")], artwork: None }.fills_only_empty());
-        assert!(!Proposal { changes: vec![change(""), change("Old")], artwork: None }.fills_only_empty());
+        assert!(Proposal::new(vec![change(""), change("  ")], None, false).fills_only_empty());
+        assert!(!Proposal::new(vec![change(""), change("Old")], None, false).fills_only_empty());
         assert!(!Proposal::default().fills_only_empty(), "nothing to change is not an empty-field fill");
+    }
+
+    #[test]
+    fn artwork_is_one_change_and_counts_as_a_fill_only_for_a_file_without_any() {
+        let only_art = Proposal::new(Vec::new(), Some(art()), false);
+        assert_eq!(only_art.changes.len(), 1);
+        assert_eq!(only_art.changes[0].field, Field::Artwork);
+        assert_eq!(only_art.changes[0].current, Field::NO_ARTWORK);
+        assert!(only_art.fills_only_empty());
+        // With a filled field beside it, the proposal is not fill-only.
+        assert!(!Proposal::new(vec![change("Old")], Some(art()), false).fills_only_empty());
+        // A file that has artwork never gets any proposed, and a stray
+        // Artwork change cannot slip in without the image.
+        let stray = FieldChange { field: Field::Artwork, current: "none".into(), proposed: "x".into() };
+        let has_art = Proposal::new(vec![stray], Some(art()), true);
+        assert_eq!(has_art, Proposal::default());
     }
 }
