@@ -98,6 +98,8 @@ pub fn launch(path: &Path, restart_after_install: bool) -> Result<bool, String> 
     {
         use std::os::windows::process::CommandExt as _;
 
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
         if !is_shared_staging(path) {
             return Ok(false);
         }
@@ -105,7 +107,6 @@ pub fn launch(path: &Path, restart_after_install: bool) -> Result<bool, String> 
         metadata.restart_after_install = restart_after_install;
         write_metadata(path, &metadata)?;
 
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let status = std::process::Command::new("schtasks.exe")
             .args(["/Run", "/TN", TASK_NAME])
             .creation_flags(CREATE_NO_WINDOW)
@@ -211,6 +212,8 @@ fn apply_staged_update() -> Result<(), String> {
     use std::time::{Duration, Instant};
     use sysinfo::{ProcessesToUpdate, System};
 
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let directory = shared_staging_dir().ok_or_else(|| "ProgramData is unavailable".to_owned())?;
     let staged = directory.join(STAGED_INSTALLER);
     let metadata = read_metadata(&staged)?;
@@ -265,7 +268,6 @@ fn apply_staged_update() -> Result<(), String> {
     if metadata.restart_after_install {
         command.arg("/R");
     }
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NO_WINDOW);
     command
         .spawn()
