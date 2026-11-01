@@ -179,9 +179,26 @@ impl Transport for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
-        let body = response.bytes().map_err(|e| http_error(service, e))?.to_vec();
+        let body = read_capped(response, MAX_BODY_BYTES).map_err(|reason| IdentifyError::Http { service, reason })?;
         Ok(Response { status, body, retry_after })
     }
+}
+
+/// The most any response may hold. Every answer the services give is far
+/// smaller (JSON well under 1 MiB, a cover at most a few); the cap stops a
+/// broken or hostile server, or a redirect target, from filling memory.
+pub const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads a body without ever buffering more than `cap` bytes: a body
+/// longer than that is an error, not a truncation.
+fn read_capped(source: impl std::io::Read, cap: u64) -> std::result::Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut body = Vec::new();
+    source.take(cap + 1).read_to_end(&mut body).map_err(|e| format!("reading the response: {e}"))?;
+    if body.len() as u64 > cap {
+        return Err(format!("response larger than {cap} bytes"));
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -198,6 +215,15 @@ mod tests {
             assert!(!shown.contains(secret), "{shown}");
         }
         assert!(shown.contains("api.acoustid.org/v2/lookup") && shown.contains("Authorization"), "{shown}");
+    }
+
+    #[test]
+    fn a_body_over_the_cap_is_refused_not_truncated() {
+        assert_eq!(read_capped(&[7_u8; 10][..], 10).unwrap(), vec![7; 10]);
+        let error = read_capped(&[7_u8; 11][..], 10).unwrap_err();
+        assert!(error.contains("larger than 10"), "{error}");
+        // An endless body stops at the cap instead of filling memory.
+        assert!(read_capped(std::io::repeat(1), 1024).is_err());
     }
 
     #[test]
