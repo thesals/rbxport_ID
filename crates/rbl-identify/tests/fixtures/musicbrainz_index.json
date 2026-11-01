@@ -1,0 +1,11 @@
+{
+  "/ws/2/recording/41f4b491-cc31-40f1-8d81-cc58b7d8f761?inc=artists+releases+release-groups+isrcs+genres+tags+artist-rels&fmt=json": "musicbrainz_recording_41f4b491-cc31-40f1-8d81-cc58b7d8f761.json",
+  "/ws/2/recording/91bd1ecd-c2fc-4d03-a720-ae6800ee9963?inc=artists+releases+release-groups+isrcs+genres+tags+artist-rels&fmt=json": "musicbrainz_recording_91bd1ecd-c2fc-4d03-a720-ae6800ee9963.json",
+  "/ws/2/recording/a6087c9d-507d-4d3e-bcf1-3eb51e008bb1?inc=artists+releases+release-groups+isrcs+genres+tags+artist-rels&fmt=json": "musicbrainz_recording_a6087c9d-507d-4d3e-bcf1-3eb51e008bb1.json",
+  "/ws/2/recording?query=artist%3A%22Boral%20Kibil%22%20AND%20recording%3A%22End%20of%20Life%22&limit=25&fmt=json": "musicbrainz_search_boral_kibil_end_of_life.json",
+  "/ws/2/recording?query=artist%3A%22Deepack%22%20AND%20recording%3A%22The%20Music%22&limit=25&fmt=json": "musicbrainz_search_deepack_the_music.json",
+  "/ws/2/recording?query=artist%3A%22E%5C%26G%22%20AND%20recording%3A%22Spirit%20%5C%28Aerofoil%20Remix%5C%29%22&limit=25&fmt=json": "musicbrainz_search_eg_spirit_aerofoil_remix.json",
+  "/ws/2/release?recording=41f4b491-cc31-40f1-8d81-cc58b7d8f761&inc=labels+release-groups&limit=100&fmt=json": "musicbrainz_releases_41f4b491-cc31-40f1-8d81-cc58b7d8f761.json",
+  "/ws/2/release?recording=91bd1ecd-c2fc-4d03-a720-ae6800ee9963&inc=labels+release-groups&limit=100&fmt=json": "musicbrainz_releases_91bd1ecd-c2fc-4d03-a720-ae6800ee9963.json",
+  "/ws/2/release?recording=a6087c9d-507d-4d3e-bcf1-3eb51e008bb1&inc=labels+release-groups&limit=100&fmt=json": "musicbrainz_releases_a6087c9d-507d-4d3e-bcf1-3eb51e008bb1.json"
+}
