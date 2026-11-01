@@ -28,6 +28,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Reading the file's own tags and true duration (writing comes in Phase 4).
 # The version rbl-db already uses.
 lofty = { version = "0.22", default-features = false }
+# NFKD decomposition to fold accents when comparing names. Already in the
+# lock through rbl-export and rbl-nfs.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
