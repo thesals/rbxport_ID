@@ -511,6 +511,8 @@ fn artwork_and_my_tags_go_to_the_stick_with_the_tracks() {
     assert_eq!(with_image, 2);
     let path: String = lib.connection().query_row("SELECT path FROM image WHERE image_id = 1", [], |r| r.get(0)).unwrap();
     assert_eq!(path, "/PIONEER/Artwork/00001/a1.jpg");
+    // Closed before exporting again: Windows refuses to replace an open file.
+    drop(lib);
 
     // A second export finds the artwork in place and writes none again.
     let again = export_full(dest.path(), &tracks, &playlists, &my_tags, None, None, &mut |_| {}).unwrap();
