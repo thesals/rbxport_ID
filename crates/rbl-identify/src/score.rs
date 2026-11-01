@@ -69,10 +69,7 @@ pub fn score(existing: &ExistingTags, file_duration_secs: f64, candidate: Candid
     let weights = DEFAULT_WEIGHTS;
     let (duration, duration_delta) = duration_score(file_duration_secs, candidate.length_ms);
     let file_title = parse_title(&existing.title);
-    let cand_title = with_remixers(
-        parse_candidate(&candidate.title, &candidate.disambiguation),
-        &candidate.remixers,
-    );
+    let cand_title = candidate_mix(&candidate);
     let text = text_score(existing, &file_title, &candidate, &cand_title);
     let agreement = agree(&file_title.mix, &cand_title.mix);
     let mix = match agreement {
@@ -190,6 +187,15 @@ fn text_score(existing: &ExistingTags, file_title: &ParsedTitle, candidate: &Can
         (false, true) => title(),
         (false, false) => NEUTRAL,
     }
+}
+
+/// A candidate's title and mix exactly as scoring sees them: its title and
+/// disambiguation parsed, then its remixers applied. The proposal and the
+/// evaluation use this too, so none of them can disagree about whether a
+/// candidate is a remix.
+#[must_use]
+pub fn candidate_mix(candidate: &Candidate) -> ParsedTitle {
+    with_remixers(parse_candidate(&candidate.title, &candidate.disambiguation), &candidate.remixers)
 }
 
 /// A recording with MusicBrainz remixer relationships is a remix even when

@@ -236,19 +236,49 @@ pub fn propose(existing: &ExistingTags, candidate: &Candidate) -> ExistingTags {
     proposed
 }
 
-/// `Title (Mix)`: the candidate's own mix when it names one; otherwise the
-/// file's mix when the two agree, so an untagged-mix MusicBrainz title
-/// does not strip "(Extended Mix)" from a file that has it.
+/// `Title (Mix)`, the mix taken as scoring saw it (remixers included):
+/// - the same mix → the file's own mix text, so a review never proposes
+///   only a change of spelling or case;
+/// - the candidate names no mix → the file's mix text (a plain MusicBrainz
+///   title must not strip "(Aerofoil Remix)" or "(Radio Edit)");
+/// - the candidate names a different, compatible mix → the candidate's, in
+///   store casing ("(extended mix)" becomes "(Extended Mix)").
+///
+/// A conflicting candidate is capped below review and never proposed.
 fn proposed_title(existing: &ExistingTags, candidate: &Candidate) -> String {
-    let theirs = mixname::parse_candidate(&candidate.title, &candidate.disambiguation);
-    if !theirs.mix_text.is_empty() {
-        return mixname::format_title(&theirs.base, &theirs.mix_text);
-    }
+    let theirs = score::candidate_mix(candidate);
     let ours = mixname::parse_title(&existing.title);
-    match mixname::agree(&ours.mix, &theirs.mix) {
-        mixname::MixAgreement::Same | mixname::MixAgreement::Compatible => mixname::format_title(&theirs.base, &ours.mix_text),
-        mixname::MixAgreement::Unknown | mixname::MixAgreement::Conflict => theirs.base,
-    }
+    let agreement = mixname::agree(&ours.mix, &theirs.mix);
+    let mix_text = if agreement == mixname::MixAgreement::Same || theirs.mix_text.is_empty() {
+        ours.mix_text
+    } else {
+        store_case(&theirs.mix_text)
+    };
+    mixname::format_title(&theirs.base, &mix_text)
+}
+
+/// Store casing for a mix name: the generic words capitalised ("Extended
+/// Mix", "Radio Edit", "VIP"), a remixer's name kept as written.
+fn store_case(mix_text: &str) -> String {
+    const GENERIC: [&str; 22] = [
+        "original", "extended", "radio", "club", "dub", "instrumental", "mix", "remix", "edit", "version", "rework",
+        "bootleg", "refix", "flip", "remake", "reconstruction", "interpretation", "redux", "album", "main", "vocal", "re-edit",
+    ];
+    mix_text
+        .split(' ')
+        .map(|word| {
+            let lower = word.to_lowercase();
+            if lower == "vip" {
+                "VIP".to_owned()
+            } else if GENERIC.contains(&lower.as_str()) {
+                let mut chars = lower.chars();
+                chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The release a proposal takes album, label and year from: an original
@@ -280,6 +310,48 @@ mod tests {
             secondary_types: secondary.iter().map(|s| (*s).to_owned()).collect(),
             ..ReleaseInfo::default()
         }
+    }
+
+    fn candidate(title: &str, disambiguation: &str, remixers: &[&str]) -> Candidate {
+        Candidate {
+            recording_mbid: "m".into(),
+            artists: vec!["E&G".into()],
+            artist_credit: "E&G".into(),
+            title: title.into(),
+            disambiguation: disambiguation.into(),
+            remixers: remixers.iter().map(|r| (*r).to_owned()).collect(),
+            length_ms: None,
+            isrcs: Vec::new(),
+            genres: Vec::new(),
+            releases: Vec::new(),
+            acoustid_score: Some(1.0),
+            source: CandidateSource::Fingerprint,
+        }
+    }
+
+    fn file(title: &str) -> ExistingTags {
+        ExistingTags { title: title.into(), ..ExistingTags::default() }
+    }
+
+    #[test]
+    fn a_plain_titled_remix_keeps_the_files_remix_name() {
+        let title = proposed_title(&file("Spirit (Aerofoil Remix)"), &candidate("Spirit", "", &["Aerofoil"]));
+        assert_eq!(title, "Spirit (Aerofoil Remix)");
+    }
+
+    #[test]
+    fn a_plain_musicbrainz_title_does_not_strip_a_radio_edit() {
+        assert_eq!(proposed_title(&file("Song (Radio Edit)"), &candidate("Song", "", &[])), "Song (Radio Edit)");
+        assert_eq!(proposed_title(&file("Song (Extended Mix)"), &candidate("Song", "", &[])), "Song (Extended Mix)");
+    }
+
+    #[test]
+    fn the_same_mix_keeps_the_files_spelling_and_a_new_one_is_store_cased() {
+        assert_eq!(proposed_title(&file("The Music (Extended Mix)"), &candidate("The Music (extended mix)", "", &[])), "The Music (Extended Mix)");
+        assert_eq!(proposed_title(&file("The Music"), &candidate("The Music (extended mix)", "", &[])), "The Music (Extended Mix)");
+        assert_eq!(store_case("Aerofoil remix"), "Aerofoil Remix");
+        assert_eq!(store_case("DJ Shog vip"), "DJ Shog VIP");
+        assert_eq!(store_case("deadmau5 edit"), "deadmau5 Edit");
     }
 
     #[test]
