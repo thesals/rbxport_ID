@@ -217,13 +217,27 @@ fn an_image_that_is_not_a_picture_is_refused() {
 }
 
 #[test]
-fn a_refused_token_is_a_status_error_that_does_not_name_the_token() {
+fn a_refused_token_stops_discogs_without_naming_the_token() {
     let body = br#"{"message": "You must authenticate to access this resource."}"#;
     let transport = Arc::new(FakeTransport::new().route_status("/releases/1", 401, body));
-    let (_, client) = client(transport);
+    let (_, client) = client(Arc::clone(&transport));
+    assert!(!client.is_refused());
     let error = client.release(1).unwrap_err();
-    assert!(matches!(error, IdentifyError::Status { service: "discogs", status: 401 }), "{error}");
+    assert!(matches!(error, IdentifyError::Service { service: "discogs", .. }), "{error}");
+    assert!(error.to_string().contains("personal access token"), "{error}");
     assert!(!error.to_string().contains(TOKEN) && !format!("{error:?}").contains(TOKEN));
+    // Once refused, nothing more is sent: a bad token would fail every track.
+    assert!(client.is_refused());
+    assert!(client.release(1).is_err());
+    assert!(client.search(&rbl_identify::discogs::DiscogsQuery {
+        artist: "A".into(),
+        track: "T".into(),
+        label: None,
+        catno: None,
+        per_page: 5,
+    })
+    .is_err());
+    assert_eq!(transport.requests().len(), 1, "only the first request was sent");
 }
 
 #[test]

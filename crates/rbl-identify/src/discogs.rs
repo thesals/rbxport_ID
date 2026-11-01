@@ -10,6 +10,7 @@
 //! show), never to the image host. Neither the token nor the User-Agent
 //! appears in this client's `Debug` output.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer};
@@ -26,6 +27,10 @@ const SERVICE: &str = "discogs";
 /// The API root. The token is sent only to this host.
 pub const BASE_URL: &str = "https://api.discogs.com";
 const API_HOST: &str = "api.discogs.com";
+/// Said once Discogs answers 401/403: the token is not a personal access
+/// token (a consumer key looks similar but does not authenticate).
+const TOKEN_REFUSED: &str =
+    "Discogs refused the token; use a personal access token (Discogs → Settings → Developers → Generate token)";
 /// Where Discogs serves release images. Public: no token goes here.
 const IMAGE_HOST: &str = "i.discogs.com";
 
@@ -118,6 +123,9 @@ pub struct DiscogsClient {
     clock: Arc<dyn Clock>,
     token: Secret,
     user_agent: String,
+    /// Set once Discogs refuses the token (401/403): a bad token would fail
+    /// every request, so after the first the client stops asking.
+    refused: AtomicBool,
 }
 
 impl std::fmt::Debug for DiscogsClient {
@@ -141,7 +149,7 @@ impl DiscogsClient {
         token: Secret,
         user_agent: String,
     ) -> Self {
-        Self { transport, limiter, clock, token, user_agent }
+        Self { transport, limiter, clock, token, user_agent, refused: AtomicBool::new(false) }
     }
 
     /// Searches releases by artist and track title (and label and catalog
@@ -198,8 +206,23 @@ impl DiscogsClient {
 
     fn api_get(&self, url: &str) -> Result<Vec<u8>> {
         debug_assert_eq!(https_host(url), Some(API_HOST));
+        if self.is_refused() {
+            return Err(IdentifyError::Service { service: SERVICE, message: TOKEN_REFUSED.to_owned() });
+        }
         let request = self.api_request(url);
-        Ok(ratelimit::send(&*self.transport, &self.limiter, &*self.clock, SERVICE, &request)?.body)
+        match ratelimit::send(&*self.transport, &self.limiter, &*self.clock, SERVICE, &request) {
+            Err(IdentifyError::Status { status: 401 | 403, .. }) => {
+                self.refused.store(true, Ordering::Relaxed);
+                Err(IdentifyError::Service { service: SERVICE, message: TOKEN_REFUSED.to_owned() })
+            }
+            other => Ok(other?.body),
+        }
+    }
+
+    /// Whether Discogs has refused the token in this run. Callers skip
+    /// Discogs entirely once it has.
+    pub fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
     }
 }
 

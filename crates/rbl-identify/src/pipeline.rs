@@ -22,7 +22,7 @@ use crate::error::Result;
 use crate::fingerprint;
 use crate::mixname;
 use crate::model::{
-    ArtworkRef, Candidate, CandidateSource, Decision, Enrichment, ExistingTags, Field, FieldChange, Proposal, ReleaseInfo,
+    ArtworkRef, ArtworkSource, Candidate, CandidateSource, Decision, Enrichment, ExistingTags, Field, FieldChange, Proposal, ReleaseInfo,
     Scored, TagSnapshot,
 };
 use crate::musicbrainz::MusicBrainzClient;
@@ -164,7 +164,10 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
     //    fetch a cover; then propose and decide.
     let best = ranked.first().filter(|b| b.score >= decide::REVIEW_THRESHOLD).map(|b| &b.candidate);
     let chosen = best.and_then(|c| chosen_release(&current(&info.snapshot, Field::Album), &c.releases));
-    let (enrichment, discogs_image) = match (best, services.discogs) {
+    // A token Discogs has refused stops Discogs for the rest of the run; the
+    // track that saw the refusal carries the one warning.
+    let discogs = services.discogs.filter(|d| !d.is_refused());
+    let (enrichment, discogs_image) = match (best, discogs) {
         (Some(candidate), Some(discogs)) => match enrich(discogs, candidate, chosen) {
             Ok(Some((enrichment, image))) => (Some(enrichment), image),
             Ok(None) => (None, None),
@@ -175,14 +178,20 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
         },
         _ => (None, None),
     };
-    let artwork = if best.is_some() && !info.snapshot.has_artwork {
+    let fetched = if best.is_some() && !info.snapshot.has_artwork {
         fetch_artwork(services, chosen, discogs_image.as_deref(), &mut warnings)
     } else {
         None
     };
+    let (artwork, art_ref) = match fetched {
+        Some((image, source)) => {
+            let reference = artwork_ref(&image, source);
+            (Some(image), Some(reference))
+        }
+        None => (None, None),
+    };
     let proposal = best.map(|candidate| {
-        let artwork_ref = artwork.as_ref().map(artwork_ref);
-        propose(&existing, &info.snapshot, candidate, enrichment.as_ref(), artwork_ref, settings.genre)
+        propose(&existing, &info.snapshot, candidate, enrichment.as_ref(), art_ref, settings.genre)
     });
     let fills_only_empty = proposal.as_ref().is_some_and(Proposal::fills_only_empty);
     let decision = decide::decide(ranked.first(), fills_only_empty, settings.auto_apply);
@@ -284,7 +293,7 @@ fn fetch_artwork(
     chosen: Option<&ReleaseInfo>,
     discogs_image: Option<&str>,
     warnings: &mut Vec<String>,
-) -> Option<FetchedImage> {
+) -> Option<(FetchedImage, ArtworkSource)> {
     let mut attempt = |what: &str, result: Result<Option<FetchedImage>>| match result {
         Ok(image) => image,
         Err(e) => {
@@ -295,28 +304,23 @@ fn fetch_artwork(
     if let (Some(coverart), Some(release)) = (services.coverart, chosen) {
         if !release.mbid.is_empty() {
             if let Some(image) = attempt("Cover Art Archive", coverart.front(&release.mbid)) {
-                return Some(image);
+                return Some((image, ArtworkSource::CoverArtArchive));
             }
         }
         if !release.release_group_mbid.is_empty() {
             if let Some(image) = attempt("Cover Art Archive", coverart.front_of_group(&release.release_group_mbid)) {
-                return Some(image);
+                return Some((image, ArtworkSource::CoverArtArchive));
             }
         }
     }
-    let (discogs, uri) = (services.discogs?, discogs_image?);
-    attempt("Discogs image", discogs.image(uri).map(Some))
+    let (discogs, uri) = (services.discogs.filter(|d| !d.is_refused())?, discogs_image?);
+    attempt("Discogs image", discogs.image(uri).map(Some)).map(|image| (image, ArtworkSource::Discogs))
 }
 
 /// How a fetched image is referred to in a proposal.
-fn artwork_ref(image: &FetchedImage) -> ArtworkRef {
+fn artwork_ref(image: &FetchedImage, source: ArtworkSource) -> ArtworkRef {
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(&image.bytes);
-    let source = if image.url.contains("discogs.com") {
-        crate::model::ArtworkSource::Discogs
-    } else {
-        crate::model::ArtworkSource::CoverArtArchive
-    };
     ArtworkRef {
         source,
         url: image.url.clone(),
