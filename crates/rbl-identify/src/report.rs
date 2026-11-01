@@ -156,6 +156,17 @@ pub struct Summary {
 }
 
 impl Summary {
+    /// A file that could not be read. It still counts toward the
+    /// mainstream denominator (as not correct), so failures cannot make
+    /// the ≥ 80% check look better.
+    pub fn add_failure(&mut self, truth: Option<&GroundTruth>) {
+        self.tracks += 1;
+        self.failed += 1;
+        if truth.and_then(|t| t.mainstream) == Some(true) {
+            self.mainstream += 1;
+        }
+    }
+
     pub fn add(&mut self, result: &TrackResult, verdict: Verdict, truth: Option<&GroundTruth>) {
         self.tracks += 1;
         if truth.and_then(|t| t.mainstream) == Some(true) {
@@ -434,6 +445,15 @@ mod tests {
         let text = Summary::default().render();
         assert!(text.contains("mainstream correct: n/a"), "{text}");
         assert!(text.contains("expected-unidentified given a candidate: n/a"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_mainstream_file_counts_against_the_check() {
+        let mut summary = Summary::default();
+        summary.add_failure(Some(&GroundTruth { mainstream: Some(true), ..GroundTruth::default() }));
+        summary.add_failure(None);
+        assert_eq!((summary.tracks, summary.failed, summary.mainstream, summary.mainstream_correct), (2, 2, 1, 0));
+        assert!(summary.render().contains("mainstream correct: 0 of 1"), "{}", summary.render());
     }
 
     #[test]

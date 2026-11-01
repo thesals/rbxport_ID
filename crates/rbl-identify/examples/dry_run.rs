@@ -130,8 +130,7 @@ fn run() -> Result<(), String> {
                 results.push((name, result, verdict));
             }
             Err(e) => {
-                summary.tracks += 1;
-                summary.failed += 1;
+                summary.add_failure(truth.get(&name));
                 eprintln!("[{}/{}] FAILED {name}: {e}", i + 1, files.len());
                 failures.push((name, e.to_string()));
             }
