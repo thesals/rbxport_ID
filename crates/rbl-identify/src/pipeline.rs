@@ -237,23 +237,22 @@ pub fn propose(existing: &ExistingTags, candidate: &Candidate) -> ExistingTags {
 }
 
 /// `Title (Mix)`, the mix taken as scoring saw it (remixers included):
-/// - the same mix → the file's own mix text, so a review never proposes
-///   only a change of spelling or case;
+/// - the same or a compatible mix the file already names ("Original Mix"
+///   vs "extended mix") → the file's own text, so a review never proposes
+///   only a respelling or an Original/Extended rename;
 /// - the candidate names no mix → the file's mix text (a plain MusicBrainz
 ///   title must not strip "(Aerofoil Remix)" or "(Radio Edit)");
-/// - the candidate names a different, compatible mix → the candidate's, in
-///   store casing ("(extended mix)" becomes "(Extended Mix)").
+/// - otherwise (the file names none, or the pair is unknown) → the
+///   candidate's, in store casing ("(extended mix)" → "(Extended Mix)").
 ///
 /// A conflicting candidate is capped below review and never proposed.
 fn proposed_title(existing: &ExistingTags, candidate: &Candidate) -> String {
     let theirs = score::candidate_mix(candidate);
     let ours = mixname::parse_title(&existing.title);
     let agreement = mixname::agree(&ours.mix, &theirs.mix);
-    let mix_text = if agreement == mixname::MixAgreement::Same || theirs.mix_text.is_empty() {
-        ours.mix_text
-    } else {
-        store_case(&theirs.mix_text)
-    };
+    let file_names_it = !ours.mix_text.is_empty()
+        && matches!(agreement, mixname::MixAgreement::Same | mixname::MixAgreement::Compatible);
+    let mix_text = if file_names_it || theirs.mix_text.is_empty() { ours.mix_text } else { store_case(&theirs.mix_text) };
     mixname::format_title(&theirs.base, &mix_text)
 }
 
@@ -349,6 +348,8 @@ mod tests {
     fn the_same_mix_keeps_the_files_spelling_and_a_new_one_is_store_cased() {
         assert_eq!(proposed_title(&file("The Music (Extended Mix)"), &candidate("The Music (extended mix)", "", &[])), "The Music (Extended Mix)");
         assert_eq!(proposed_title(&file("The Music"), &candidate("The Music (extended mix)", "", &[])), "The Music (Extended Mix)");
+        // Compatible, and the file already names its mix: no rename churn.
+        assert_eq!(proposed_title(&file("Ilya (Original Mix)"), &candidate("Ilya (extended mix)", "", &[])), "Ilya (Original Mix)");
         assert_eq!(store_case("Aerofoil remix"), "Aerofoil Remix");
         assert_eq!(store_case("DJ Shog vip"), "DJ Shog VIP");
         assert_eq!(store_case("deadmau5 edit"), "deadmau5 Edit");
