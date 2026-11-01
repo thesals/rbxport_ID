@@ -1217,6 +1217,27 @@ fn nothing_beside_or_above_an_allowed_folder_resolves() {
     assert_eq!(lookup(&server, &allowed, "Artist/Album"), Err(nfs_status::NOENT));
 }
 
+#[test]
+fn a_file_added_on_the_way_does_not_hide_an_allowed_folder_below() {
+    // A shallow track and an allowed folder share their first folders: the
+    // folders the track's path builds must still lead to the allowed one.
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("A")).unwrap();
+    fs::write(dir.path().join("A/one.mp3"), b"one").unwrap();
+    let mut vfs = Vfs::new("/");
+    vfs.add_file_unsized("Users/me/three.mp3", dir.path().join("three.mp3"));
+    vfs.allow_folder("Users/me/Music", dir.path());
+
+    let one = vfs.resolve("Users/me/Music/A/one.mp3").expect("reachable under the allowed folder");
+    assert_eq!(vfs.source(one), Some(dir.path().join("A").join("one.mp3")));
+    let me = vfs.resolve("Users/me").unwrap();
+    let mut names: Vec<String> = vfs.children(me).iter().map(|&i| vfs.name(i).unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["Music", "three.mp3"]);
+    // Still only the way: nothing else on the host appears beside them.
+    assert_eq!(vfs.resolve("Users/me/other.mp3"), None);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_symlink_in_an_allowed_folder_is_not_followed() {

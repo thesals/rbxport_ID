@@ -382,8 +382,11 @@ impl Vfs {
             },
             None => (&"", parts.as_slice()),
         };
+        // Not marked listed: an allowed folder may lie below one of these
+        // directories, and a listed node answers only from its own children.
+        // Listing it consults the allowed folders and keeps what is here.
         for part in directories {
-            at = Self::insert(nodes, at, part, NodeKind::Directory, None, Some(dir_stat), true);
+            at = Self::insert(nodes, at, part, NodeKind::Directory, None, Some(dir_stat), false);
         }
         match file {
             Some((source, stat)) => Self::insert(nodes, at, last, NodeKind::File, Some(source), stat, true),
