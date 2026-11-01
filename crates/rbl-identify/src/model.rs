@@ -194,6 +194,10 @@ pub struct RawId3 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Enrichment {
     pub discogs_release_id: Option<u64>,
+    /// The Discogs release's title, to tell whether it is the same release
+    /// MusicBrainz chose before any of its fields are used.
+    #[serde(default)]
+    pub release_title: String,
     pub label: String,
     pub catalog_number: String,
     pub year: Option<u16>,

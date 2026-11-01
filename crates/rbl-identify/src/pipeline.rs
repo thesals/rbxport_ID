@@ -223,7 +223,7 @@ fn from_acoustid(score: f64, recording: &AcoustIdRecording) -> Candidate {
 
 /// How Discogs styles reach the Genre tag. Key, BPM and analysis are never
 /// touched by identification whatever the policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum GenrePolicy {
     /// The spec's default: styles joined with "; " fill an empty Genre; a
     /// genre the user set is left alone.
@@ -239,6 +239,15 @@ pub enum GenrePolicy {
 /// field, against the file's exact current values. Only fields that differ
 /// are listed. Artwork is proposed only for a file without any.
 ///
+/// Album, label, catalog number, year and the release IDs all come from
+/// one release, never mixed: the MusicBrainz release whose title matches
+/// the file's album (so a track bought from a compilation keeps that
+/// compilation), else the preferred original release. Discogs fills only
+/// the release fields MusicBrainz left empty, and its styles and release
+/// ID count only when its release agrees with the chosen one (same catalog
+/// number, or same title and year); with no MusicBrainz release, Discogs's
+/// is the release.
+///
 /// When the MusicBrainz release ID changes, Picard's release-bound IDs
 /// already in the file (release track, album artist) are proposed for
 /// clearing, so the file never carries IDs that contradict each other.
@@ -251,16 +260,17 @@ pub fn propose(
     artwork: Option<ArtworkRef>,
     genre: GenrePolicy,
 ) -> Proposal {
-    let release = preferred_release(&candidate.releases);
-    let enriched = |pick: fn(&Enrichment) -> &str| enrichment.map(pick).filter(|v| !v.is_empty()).map(str::to_owned);
+    let release = chosen_release(&current(snapshot, Field::Album), &candidate.releases);
+    let discogs = enrichment.filter(|e| release.is_none_or(|r| same_release(r, e)));
     let release_text = |pick: fn(&ReleaseInfo) -> &str| release.map(pick).filter(|v| !v.is_empty()).map(str::to_owned);
+    let discogs_text = |pick: fn(&Enrichment) -> &str| discogs.map(pick).filter(|v| !v.is_empty()).map(str::to_owned);
     let year = release
         .and_then(|r| r.date.get(..4))
         .map(str::to_owned)
-        .or_else(|| enrichment.and_then(|e| e.year).map(|y| y.to_string()));
-    let styles = enrichment.map(|e| e.styles.join("; ")).filter(|s| !s.is_empty());
+        .or_else(|| discogs.and_then(|e| e.year).map(|y| y.to_string()));
+    let styles = discogs.map(|e| e.styles.join("; ")).filter(|s| !s.is_empty());
     let genre = match genre {
-        GenrePolicy::FillEmpty => styles.filter(|_| existing.genre.trim().is_empty()),
+        GenrePolicy::FillEmpty => styles.filter(|_| current(snapshot, Field::Genre).trim().is_empty()),
         GenrePolicy::Replace => styles,
         GenrePolicy::Never => None,
     };
@@ -268,18 +278,16 @@ pub fn propose(
     let mut wanted: Vec<(Field, Option<String>)> = vec![
         (Field::Artist, Some(candidate.artist_credit.clone()).filter(|v| !v.is_empty())),
         (Field::Title, Some(proposed_title(existing, candidate)).filter(|v| !v.is_empty())),
-        (Field::Album, release_text(|r| &r.title)),
-        // Discogs is the better source for label and catalog number: Beatport
-        // releases are thinly documented in MusicBrainz.
-        (Field::Label, enriched(|e| &e.label).or_else(|| release_text(|r| &r.label))),
-        (Field::CatalogNumber, enriched(|e| &e.catalog_number).or_else(|| release_text(|r| &r.catalog_number))),
+        (Field::Album, release_text(|r| &r.title).or_else(|| discogs_text(|e| &e.release_title))),
+        (Field::Label, release_text(|r| &r.label).or_else(|| discogs_text(|e| &e.label))),
+        (Field::CatalogNumber, release_text(|r| &r.catalog_number).or_else(|| discogs_text(|e| &e.catalog_number))),
         (Field::Year, year),
         (Field::Isrc, candidate.isrcs.first().cloned()),
         (Field::Genre, genre),
         (Field::MbRecordingId, Some(candidate.recording_mbid.clone()).filter(|v| !v.is_empty())),
         (Field::MbReleaseId, release_text(|r| &r.mbid)),
         (Field::MbReleaseGroupId, release_text(|r| &r.release_group_mbid)),
-        (Field::DiscogsReleaseId, enrichment.and_then(|e| e.discogs_release_id).map(|id| id.to_string())),
+        (Field::DiscogsReleaseId, discogs.and_then(|e| e.discogs_release_id).map(|id| id.to_string())),
     ];
     let new_release = wanted.iter().find(|(f, _)| *f == Field::MbReleaseId).and_then(|(_, v)| v.clone());
     if new_release.is_some_and(|new| new != current(snapshot, Field::MbReleaseId)) {
@@ -296,6 +304,41 @@ pub fn propose(
         })
         .collect();
     Proposal::new(changes, artwork, snapshot.has_artwork)
+}
+
+/// The release a proposal takes every release field from: the one whose
+/// title matches the file's current album, else the preferred original.
+fn chosen_release<'a>(current_album: &str, releases: &'a [ReleaseInfo]) -> Option<&'a ReleaseInfo> {
+    let album = current_album.trim();
+    if !album.is_empty() {
+        if let Some(matching) = releases
+            .iter()
+            .filter(|r| !r.title.is_empty())
+            .map(|r| (normalize::similarity(album, &r.title), r))
+            .filter(|(s, _)| *s >= ALBUM_MATCH)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+        {
+            return Some(matching.1);
+        }
+    }
+    preferred_release(releases)
+}
+
+/// How close a release title must be to the file's album to be "the
+/// release this file came from".
+const ALBUM_MATCH: f64 = 0.85;
+
+/// Whether Discogs matched the same release MusicBrainz chose: the same
+/// catalog number (case, spaces and dashes aside), or the same title and
+/// year.
+fn same_release(release: &ReleaseInfo, discogs: &Enrichment) -> bool {
+    let catno = |c: &str| c.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
+    let (ours, theirs) = (catno(&release.catalog_number), catno(&discogs.catalog_number));
+    if !ours.is_empty() && !theirs.is_empty() {
+        return ours == theirs;
+    }
+    let year = release.date.get(..4).and_then(|y| y.parse::<u16>().ok());
+    normalize::similarity(&release.title, &discogs.release_title) >= ALBUM_MATCH && year.is_some() && year == discogs.year
 }
 
 /// A field's current value as the review screen shows it: every value of
@@ -490,6 +533,71 @@ mod tests {
         assert_eq!(change_for(&proposal, Field::Label).unwrap().proposed, "Fraction Records");
         assert_eq!(change_for(&proposal, Field::CatalogNumber).unwrap().proposed, "FRA224");
         assert_eq!(change_for(&proposal, Field::DiscogsReleaseId).unwrap().proposed, "42");
+    }
+
+    fn full_release(mbid: &str, title: &str, date: &str, label: &str, catno: &str, secondary: &[&str]) -> ReleaseInfo {
+        ReleaseInfo {
+            mbid: mbid.into(),
+            title: title.into(),
+            date: date.into(),
+            label: label.into(),
+            catalog_number: catno.into(),
+            secondary_types: secondary.iter().map(|s| (*s).to_owned()).collect(),
+            ..ReleaseInfo::default()
+        }
+    }
+
+    #[test]
+    fn a_compilation_rip_keeps_its_compilation_release() {
+        let mut c = candidate("Last Ones Standing (TC remix)", "", &[]);
+        c.releases = vec![
+            full_release("single", "Last Ones Standing", "2010-08-01", "Ministry of Sound", "MOS-1", &[]),
+            full_release("annual", "MOS The Annual 2011", "2010-11-22", "Ministry Of Sound (UK)", "ANCD2K10E", &["Compilation"]),
+        ];
+        let snap = snapshot(&[
+            (Field::Album, "TALB", "MOS The Annual 2011"),
+            (Field::Label, "TPUB", "Ministry Of Sound (UK)"),
+            (Field::CatalogNumber, "TXXX:Catalog #", "ANCD2K10E"),
+        ]);
+        let proposal = propose(&file(""), &snap, &c, None, None, GenrePolicy::FillEmpty);
+        for field in [Field::Album, Field::Label, Field::CatalogNumber] {
+            assert_eq!(change_for(&proposal, field), None, "{field:?} stays the compilation's");
+        }
+        assert_eq!(change_for(&proposal, Field::MbReleaseId).unwrap().proposed, "annual");
+    }
+
+    #[test]
+    fn discogs_and_musicbrainz_release_fields_never_mix() {
+        let mut c = candidate("x", "", &[]);
+        c.releases = vec![full_release("mb", "Original EP", "2014-06-01", "", "", &[])];
+        let other = Enrichment {
+            discogs_release_id: Some(7),
+            release_title: "Some Compilation".into(),
+            label: "Other Label".into(),
+            catalog_number: "OTH-1".into(),
+            year: Some(2016),
+            styles: vec!["Techno".into()],
+            ..Enrichment::default()
+        };
+        let proposal = propose(&file(""), &TagSnapshot::default(), &c, Some(&other), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&proposal, Field::Album).unwrap().proposed, "Original EP");
+        assert_eq!(change_for(&proposal, Field::Year).unwrap().proposed, "2014");
+        for field in [Field::Label, Field::CatalogNumber, Field::DiscogsReleaseId, Field::Genre] {
+            assert_eq!(change_for(&proposal, field), None, "{field:?} must not come from another release");
+        }
+        // The same release on Discogs (title and year agree) fills the gaps.
+        let same = Enrichment { release_title: "Original EP".into(), year: Some(2014), ..other };
+        let proposal = propose(&file(""), &TagSnapshot::default(), &c, Some(&same), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&proposal, Field::Label).unwrap().proposed, "Other Label");
+        assert_eq!(change_for(&proposal, Field::DiscogsReleaseId).unwrap().proposed, "7");
+    }
+
+    #[test]
+    fn an_unreadable_genre_is_not_filled_over() {
+        let enrichment = Enrichment { styles: vec!["Techno".into()], ..Enrichment::default() };
+        let snap = snapshot(&[(Field::Genre, "TCON", crate::tags::UNREADABLE)]);
+        let proposal = propose(&file(""), &snap, &candidate("x", "", &[]), Some(&enrichment), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&proposal, Field::Genre), None);
     }
 
     #[test]
