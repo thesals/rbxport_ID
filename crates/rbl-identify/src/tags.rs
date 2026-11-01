@@ -125,11 +125,19 @@ pub fn read(path: &Path) -> Result<FileInfo> {
         return Ok(FileInfo { tags: ExistingTags::default(), snapshot: TagSnapshot::default(), duration_secs });
     };
 
-    let values: BTreeMap<Field, Vec<FrameValues>> = TEXT_FIELDS
+    let mut values: BTreeMap<Field, Vec<FrameValues>> = TEXT_FIELDS
         .iter()
         .map(|&field| (field, frames(tag, field)))
         .filter(|(_, found)| !found.is_empty())
         .collect();
+    let (raw_v2, raw_v1) = read_raw_id3(path)?;
+    // A frame the reader could not parse (an invalid `2010-00-00` date) must
+    // not look absent, or a proposal would count as filling an empty field
+    // and auto-apply could overwrite it. Such a field is taken from the raw
+    // frame instead.
+    for (field, frame) in raw_v2.as_deref().map(id3v2_fields).unwrap_or_default() {
+        values.entry(field).or_insert_with(|| vec![frame]);
+    }
     let has_artwork = tagged.tags().iter().any(|t| t.picture_count() > 0);
     // The first value of the first frame, for scoring.
     let first_value = |field: Field| values.get(&field).and_then(|f| f.first()).and_then(|f| f.values.first());
@@ -149,14 +157,142 @@ pub fn read(path: &Path) -> Result<FileInfo> {
         discogs_release_id: first(Field::DiscogsReleaseId),
         has_artwork,
     };
-    let snapshot = TagSnapshot { format: format!("{:?}", tag.tag_type()), values, has_artwork, raw_id3: raw_id3(path)? };
+    let raw_id3 = (raw_v2.is_some() || raw_v1.is_some()).then(|| {
+        use base64::Engine as _;
+        let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
+        RawId3 { v2: raw_v2.map(encode), v1: raw_v1.map(encode) }
+    });
+    let snapshot = TagSnapshot { format: format!("{:?}", tag.tag_type()), values, has_artwork, raw_id3 };
     Ok(FileInfo { tags, snapshot, duration_secs })
 }
 
+/// What [`read_raw_id3`] marks a frame's value as when it cannot decode it.
+pub const UNREADABLE: &str = "<unreadable>";
+
+/// The fields an `ID3v2` block holds, straight from its frames: one entry
+/// per frame that maps to a [`Field`], with the frame's text decoded
+/// leniently (or [`UNREADABLE`]). Frame names are as stored: an `ID3v2.3`
+/// file shows `TYER` where the tag reader reports `TDRC`. Versions before
+/// 2.3 (three-character frame IDs) yield nothing.
+fn id3v2_fields(block: &[u8]) -> Vec<(Field, FrameValues)> {
+    let Some(&version) = block.get(3) else { return Vec::new() };
+    if !(3..=4).contains(&version) || block.len() < 10 {
+        return Vec::new();
+    }
+    let flags = block[5];
+    let body_end = block.len().min(10 + syncsafe(&block[6..10]));
+    let mut at = 10;
+    if flags & 0x40 != 0 {
+        // Extended header: v2.3 gives its size without the 4 size bytes,
+        // v2.4 as a syncsafe size including them.
+        let Some(size_bytes) = block.get(10..14) else { return Vec::new() };
+        at += if version == 4 { syncsafe(size_bytes) } else { 4 + be_u32(size_bytes) };
+    }
+    let mut found = Vec::new();
+    while let Some(header) = block.get(at..at + 10).filter(|_| at + 10 <= body_end) {
+        if header[0] == 0 || !header[..4].iter().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+            break; // padding, or nothing a frame could start with
+        }
+        let id = String::from_utf8_lossy(&header[..4]).into_owned();
+        let size = if version == 4 { syncsafe(&header[4..8]) } else { be_u32(&header[4..8]) };
+        let Some(data) = block.get(at + 10..at + 10 + size) else { break };
+        if let Some(entry) = frame_field(&id, data) {
+            found.push(entry);
+        }
+        at += 10 + size;
+    }
+    found
+}
+
+/// The field a frame holds, with its values, when it is one identification
+/// may change.
+fn frame_field(id: &str, data: &[u8]) -> Option<(Field, FrameValues)> {
+    let (name, values) = match id {
+        "TXXX" => {
+            let (description, value) = split_once_text(data)?;
+            (format!("TXXX:{description}"), vec![value])
+        }
+        "UFID" => {
+            let end = data.iter().position(|&b| b == 0)?;
+            let owner = String::from_utf8_lossy(&data[..end]).into_owned();
+            (format!("UFID:{owner}"), vec![String::from_utf8_lossy(&data[end + 1..]).into_owned()])
+        }
+        _ if id.starts_with('T') => (id.to_owned(), decode_text(data).map_or_else(|| vec![UNREADABLE.to_owned()], |text| split_values(&text))),
+        _ => return None,
+    };
+    let field = match name.as_str() {
+        "TIT2" => Field::Title,
+        "TPE1" => Field::Artist,
+        "TALB" => Field::Album,
+        "TPUB" => Field::Label,
+        "TDRC" | "TYER" => Field::Year,
+        "TCON" => Field::Genre,
+        "TSRC" => Field::Isrc,
+        "UFID:http://musicbrainz.org" => Field::MbRecordingId,
+        other => match other.strip_prefix("TXXX:").map(str::to_ascii_lowercase).as_deref() {
+            Some("catalognumber" | "catalog #" | "catalog") => Field::CatalogNumber,
+            Some("musicbrainz album id") => Field::MbReleaseId,
+            Some("musicbrainz release group id") => Field::MbReleaseGroupId,
+            Some("musicbrainz artist id") => Field::MbArtistId,
+            Some("musicbrainz release track id") => Field::MbReleaseTrackId,
+            Some("musicbrainz album artist id") => Field::MbAlbumArtistId,
+            Some("discogs_release_id" | "discogs_releaseid") => Field::DiscogsReleaseId,
+            _ => return None,
+        },
+    };
+    let values = if values.iter().all(String::is_empty) { vec![UNREADABLE.to_owned()] } else { values };
+    Some((field, FrameValues { frame: name, values }))
+}
+
+/// A text frame's payload: an encoding byte, then text.
+fn decode_text(data: &[u8]) -> Option<String> {
+    let (&encoding, text) = data.split_first()?;
+    match encoding {
+        0 => Some(text.iter().map(|&b| char::from(b)).collect()),
+        3 => Some(String::from_utf8_lossy(text).into_owned()),
+        1 | 2 => {
+            let (big_endian, text) = match text {
+                [0xFE, 0xFF, rest @ ..] => (true, rest),
+                [0xFF, 0xFE, rest @ ..] => (false, rest),
+                _ => (encoding == 2, text),
+            };
+            let units: Vec<u16> = text
+                .chunks_exact(2)
+                .map(|p| if big_endian { u16::from_be_bytes([p[0], p[1]]) } else { u16::from_le_bytes([p[0], p[1]]) })
+                .collect();
+            Some(String::from_utf16_lossy(&units))
+        }
+        _ => None,
+    }
+}
+
+/// A `TXXX` payload: description and value, in the frame's encoding.
+fn split_once_text(data: &[u8]) -> Option<(String, String)> {
+    let text = decode_text(data)?;
+    let (description, value) = text.split_once('\0').unwrap_or((text.as_str(), ""));
+    Some((description.to_owned(), value.trim_end_matches('\0').to_owned()))
+}
+
+/// Multiple values of a text frame are NUL-separated; trailing NULs are
+/// padding.
+fn split_values(text: &str) -> Vec<String> {
+    text.trim_end_matches('\0').split('\0').map(str::to_owned).collect()
+}
+
+fn syncsafe(bytes: &[u8]) -> usize {
+    bytes.iter().fold(0_usize, |acc, &b| (acc << 7) | usize::from(b & 0x7f))
+}
+
+fn be_u32(bytes: &[u8]) -> usize {
+    bytes.iter().fold(0_usize, |acc, &b| (acc << 8) | usize::from(b))
+}
+
+/// A file's `ID3v2` block and `ID3v1` trailer, either possibly absent.
+type RawBlocks = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// The `ID3v2` block at the start of the file and the `ID3v1` trailer at
-/// its end, byte for byte; `None` when the file has neither.
-fn raw_id3(path: &Path) -> Result<Option<RawId3>> {
-    use base64::Engine as _;
+/// its end, byte for byte.
+fn read_raw_id3(path: &Path) -> Result<RawBlocks> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
@@ -164,9 +300,9 @@ fn raw_id3(path: &Path) -> Result<Option<RawId3>> {
     let mut header = [0_u8; 10];
     let v2 = if len >= 10 && file.read_exact(&mut header).is_ok() && &header[..3] == b"ID3" {
         // Syncsafe size of everything after the header, plus a 10-byte
-        // footer when flag bit 4 says there is one.
+        // footer, which only ID3v2.4 has (flag bit 4).
         let size = header[6..10].iter().fold(0_u64, |acc, &b| (acc << 7) | u64::from(b & 0x7f));
-        let footer = if header[5] & 0x10 == 0 { 0 } else { 10 };
+        let footer = if header[3] == 4 && header[5] & 0x10 != 0 { 10 } else { 0 };
         let total = 10 + size + footer;
         if total > len {
             return Err(IdentifyError::Io(std::io::Error::other(format!("{}: ID3v2 size beyond the file", path.display()))));
@@ -186,11 +322,7 @@ fn raw_id3(path: &Path) -> Result<Option<RawId3>> {
     } else {
         None
     };
-    if v2.is_none() && v1.is_none() {
-        return Ok(None);
-    }
-    let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes);
-    Ok(Some(RawId3 { v2: v2.map(encode), v1: v1.map(encode) }))
+    Ok((v2, v1))
 }
 
 #[cfg(test)]
@@ -230,10 +362,6 @@ mod tests {
         assert_eq!(frames(&tag, Field::Label), Vec::new());
     }
 
-    fn decode(text: &str) -> Vec<u8> {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD_NO_PAD.decode(text).unwrap()
-    }
 
     #[test]
     fn the_raw_id3_blocks_are_captured_byte_for_byte() {
@@ -241,21 +369,79 @@ mod tests {
         let path = dir.path().join("t.mp3");
         // ID3v2.3 header with a 20-byte body (syncsafe), audio, ID3v1 trailer.
         let mut v2 = b"ID3\x03\x00\x00\x00\x00\x00\x14".to_vec();
-        v2.extend_from_slice(&[0xAB; 20]);
+        v2.extend_from_slice(&[0x00; 20]);
         let mut v1 = b"TAG".to_vec();
         v1.extend_from_slice(&[0x20; 125]);
         let mut file = v2.clone();
         file.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
         file.extend_from_slice(&v1);
         std::fs::write(&path, &file).unwrap();
-        let raw = raw_id3(&path).unwrap().unwrap();
-        assert_eq!(decode(raw.v2.as_deref().unwrap()), v2);
-        assert_eq!(decode(raw.v1.as_deref().unwrap()), v1);
+        assert_eq!(read_raw_id3(&path).unwrap(), (Some(v2), Some(v1)));
 
         std::fs::write(&path, [0xFF_u8, 0xFB, 0x90, 0x00]).unwrap();
-        assert_eq!(raw_id3(&path).unwrap(), None);
+        assert_eq!(read_raw_id3(&path).unwrap(), (None, None));
         // A size claiming more than the file holds is refused, not truncated.
         std::fs::write(&path, b"ID3\x03\x00\x00\x7f\x7f\x7f\x7f").unwrap();
-        assert!(raw_id3(&path).is_err());
+        assert!(read_raw_id3(&path).is_err());
+        // The footer flag only means a footer in ID3v2.4.
+        let mut v23_with_flag = b"ID3\x03\x00\x10\x00\x00\x00\x04".to_vec();
+        v23_with_flag.extend_from_slice(&[0; 4]);
+        std::fs::write(&path, &v23_with_flag).unwrap();
+        assert_eq!(read_raw_id3(&path).unwrap().0.unwrap().len(), 14);
+    }
+
+    /// An ID3v2.3 block holding the given (frame ID, payload) frames.
+    fn id3v23(frames: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, payload) in frames {
+            body.extend_from_slice(id.as_bytes());
+            body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+            body.extend_from_slice(&[0, 0]);
+            body.extend_from_slice(payload);
+        }
+        body.extend_from_slice(&[0; 16]); // padding
+        let size = body.len();
+        let mut block = b"ID3\x03\x00\x00".to_vec();
+        block.extend(
+            [21, 14, 7, 0].iter().map(|shift| u8::try_from((size >> shift) & 0x7f).unwrap()),
+        );
+        block.extend_from_slice(&body);
+        block
+    }
+
+    fn latin1(text: &str) -> Vec<u8> {
+        let mut payload = vec![0];
+        payload.extend_from_slice(text.as_bytes());
+        payload
+    }
+
+    #[test]
+    fn frames_the_reader_drops_are_still_seen_as_present() {
+        let block = id3v23(&[
+            ("TDRC", latin1("2010-00-00")),
+            ("TXXX", latin1("Catalog #\0ANCD2K10E")),
+            ("TPUB", latin1("Ministry Of Sound (UK)")),
+            ("TCOM", latin1("not a field we change")),
+        ]);
+        let found = id3v2_fields(&block);
+        let get = |field: Field| found.iter().find(|(f, _)| *f == field).map(|(_, v)| v.clone());
+        assert_eq!(get(Field::Year), Some(FrameValues { frame: "TDRC".into(), values: vec!["2010-00-00".into()] }));
+        assert_eq!(
+            get(Field::CatalogNumber),
+            Some(FrameValues { frame: "TXXX:Catalog #".into(), values: vec!["ANCD2K10E".into()] })
+        );
+        assert_eq!(get(Field::Label).unwrap().values, vec!["Ministry Of Sound (UK)".to_owned()]);
+        assert_eq!(found.len(), 3, "TCOM is not a field identification changes");
+    }
+
+    #[test]
+    fn utf16_values_and_undecodable_frames_are_handled() {
+        let mut utf16 = vec![1, 0xFF, 0xFE];
+        utf16.extend("Röyksopp".encode_utf16().flat_map(u16::to_le_bytes));
+        let block = id3v23(&[("TPE1", utf16), ("TALB", vec![9, b'x'])]);
+        let found = id3v2_fields(&block);
+        assert_eq!(found[0].1.values, vec!["Röyksopp".to_owned()]);
+        assert_eq!(found[1].1.values, vec![UNREADABLE.to_owned()], "an unknown encoding is present, not absent");
+        assert!(id3v2_fields(b"ID3\x02\x00\x00\x00\x00\x00\x00").is_empty(), "v2.2 is not scanned");
     }
 }
