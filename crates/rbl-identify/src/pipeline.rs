@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::acoustid::{AcoustIdClient, AcoustIdMatch, AcoustIdRecording};
+use crate::coverart::{CoverArtClient, FetchedImage};
 use crate::decide;
+use crate::discogs::{DiscogsClient, DiscogsQuery, DiscogsRelease};
 use crate::error::Result;
 use crate::fingerprint;
 use crate::mixname;
@@ -43,11 +45,18 @@ pub struct Settings {
     pub genre: GenrePolicy,
 }
 
-/// The services a run talks to.
+/// The services a run talks to. Discogs needs the user's personal token
+/// and Cover Art Archive is optional, so either may be absent; enrichment
+/// and artwork are then simply skipped.
 pub struct Services<'a> {
     pub acoustid: &'a AcoustIdClient,
     pub musicbrainz: &'a MusicBrainzClient,
+    pub discogs: Option<&'a DiscogsClient>,
+    pub coverart: Option<&'a CoverArtClient>,
 }
+
+/// How many Discogs releases are opened to find the track, after one search.
+const MAX_DISCOGS_RELEASES: usize = 2;
 
 /// What AcoustID said about the fingerprint, for the evaluation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
@@ -77,6 +86,11 @@ pub struct TrackResult {
     pub proposal: Option<Proposal>,
     /// What Discogs added to the best candidate, when it matched.
     pub enrichment: Option<Enrichment>,
+    /// The cover fetched for a file without artwork, for the store; the
+    /// proposal refers to it by hash. Not serialised: the bytes live in the
+    /// store's artwork table.
+    #[serde(skip)]
+    pub artwork: Option<FetchedImage>,
     /// Stage failures that did not stop the track (a service down, a
     /// fingerprint that could not be computed). Never contain a secret.
     pub warnings: Vec<String>,
@@ -146,12 +160,30 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
         ranked.iter().filter(|s| s.score < decide::REVIEW_THRESHOLD).map(|s| s.candidate.clone()).collect();
     let ranked = score::rank(&existing, duration_secs, resolved.into_iter().chain(below).collect());
 
-    // 5. Propose and decide. (Discogs enrichment and artwork join here.)
-    let enrichment: Option<Enrichment> = None;
-    let proposal = ranked
-        .first()
-        .filter(|b| b.score >= decide::REVIEW_THRESHOLD)
-        .map(|b| propose(&existing, &info.snapshot, &b.candidate, enrichment.as_ref(), None, settings.genre));
+    // 5. Enrich the winner from Discogs and, for a file without artwork,
+    //    fetch a cover; then propose and decide.
+    let best = ranked.first().filter(|b| b.score >= decide::REVIEW_THRESHOLD).map(|b| &b.candidate);
+    let chosen = best.and_then(|c| chosen_release(&current(&info.snapshot, Field::Album), &c.releases));
+    let (enrichment, discogs_image) = match (best, services.discogs) {
+        (Some(candidate), Some(discogs)) => match enrich(discogs, candidate, chosen) {
+            Ok(Some((enrichment, image))) => (Some(enrichment), image),
+            Ok(None) => (None, None),
+            Err(e) => {
+                warnings.push(format!("Discogs: {e}"));
+                (None, None)
+            }
+        },
+        _ => (None, None),
+    };
+    let artwork = if best.is_some() && !info.snapshot.has_artwork {
+        fetch_artwork(services, chosen, discogs_image.as_deref(), &mut warnings)
+    } else {
+        None
+    };
+    let proposal = best.map(|candidate| {
+        let artwork_ref = artwork.as_ref().map(artwork_ref);
+        propose(&existing, &info.snapshot, candidate, enrichment.as_ref(), artwork_ref, settings.genre)
+    });
     let fills_only_empty = proposal.as_ref().is_some_and(Proposal::fills_only_empty);
     let decision = decide::decide(ranked.first(), fills_only_empty, settings.auto_apply);
     Ok(TrackResult {
@@ -164,8 +196,137 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
         decision,
         proposal,
         enrichment,
+        artwork,
         warnings,
     })
+}
+
+/// Finds the identified track on Discogs: one search by artist and bare
+/// title (with the chosen release's label and catalog number when known),
+/// then up to [`MAX_DISCOGS_RELEASES`] releases opened, a catalog-number
+/// match first. A release counts only if its tracklist holds this track
+/// with an agreeing mix. Returns the enrichment and the release's primary
+/// image URI.
+fn enrich(
+    discogs: &DiscogsClient,
+    candidate: &Candidate,
+    chosen: Option<&ReleaseInfo>,
+) -> Result<Option<(Enrichment, Option<String>)>> {
+    let ours = score::candidate_mix(candidate);
+    let (track, _) = normalize::strip_featuring(&ours.base);
+    let artist = candidate.artists.first().cloned().unwrap_or_else(|| candidate.artist_credit.clone());
+    if artist.is_empty() || track.is_empty() {
+        return Ok(None);
+    }
+    let known = |pick: fn(&ReleaseInfo) -> &str| chosen.map(pick).filter(|v| !v.is_empty()).map(str::to_owned);
+    let catno = known(|r| &r.catalog_number);
+    let query = DiscogsQuery { artist, track, label: known(|r| &r.label), catno: catno.clone(), per_page: 10 };
+    let mut hits = discogs.search(&query)?;
+    if hits.is_empty() && (query.label.is_some() || query.catno.is_some()) {
+        // The label or catalog number may be spelled differently there.
+        hits = discogs.search(&DiscogsQuery { label: None, catno: None, ..query })?;
+    }
+    let squash = |c: &str| c.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
+    if let Some(catno) = catno.as_deref().map(squash).filter(|c| !c.is_empty()) {
+        hits.sort_by_key(|h| squash(&h.catno) != catno);
+    }
+    for hit in hits.iter().take(MAX_DISCOGS_RELEASES) {
+        let release = discogs.release(hit.release_id)?;
+        if holds_track(&release, &ours) {
+            return Ok(Some(enrichment_from(&release)));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a Discogs tracklist holds the track: the same base title and an
+/// agreeing mix (a remix is not the original on Discogs either).
+fn holds_track(release: &DiscogsRelease, ours: &mixname::ParsedTitle) -> bool {
+    release.tracklist.iter().any(|track| {
+        let theirs = mixname::parse_title(&track.title);
+        let theirs = match track.extra_artists.iter().find(|(_, role)| role.to_ascii_lowercase().contains("remix")) {
+            // A remixer credit names a remix the title may not.
+            Some((name, _)) if theirs.mix_text.is_empty() => {
+                mixname::ParsedTitle { mix: mixname::MixKind::Remix(name.clone()), mix_text: format!("{name} Remix"), ..theirs }
+            }
+            _ => theirs,
+        };
+        let (a, _) = normalize::strip_featuring(&ours.base);
+        let (b, _) = normalize::strip_featuring(&theirs.base);
+        normalize::similarity(&a, &b) >= 0.85
+            && matches!(mixname::agree(&ours.mix, &theirs.mix), mixname::MixAgreement::Same | mixname::MixAgreement::Compatible)
+    })
+}
+
+/// Label, catalog number, year, styles and the primary image of a Discogs
+/// release. "Not On Label" and a catalog number of "none" are Discogs's
+/// placeholders, not values.
+fn enrichment_from(release: &DiscogsRelease) -> (Enrichment, Option<String>) {
+    let label = release.labels.iter().find(|l| !l.name.to_ascii_lowercase().starts_with("not on label"));
+    let enrichment = Enrichment {
+        discogs_release_id: Some(release.id),
+        release_title: release.title.clone(),
+        label: label.map(|l| l.name.clone()).unwrap_or_default(),
+        catalog_number: label.map(|l| l.catno.clone()).filter(|c| !c.eq_ignore_ascii_case("none")).unwrap_or_default(),
+        year: release.year,
+        styles: release.styles.clone(),
+        genres: release.genres.clone(),
+    };
+    let image = release.images.iter().find(|i| i.primary).or_else(|| release.images.first()).map(|i| i.uri.clone());
+    (enrichment, image)
+}
+
+/// A cover for a file without one: Cover Art Archive for the chosen
+/// release, then its release group, then the Discogs release's image.
+/// Failures are warnings; no cover is simply no cover.
+fn fetch_artwork(
+    services: &Services<'_>,
+    chosen: Option<&ReleaseInfo>,
+    discogs_image: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<FetchedImage> {
+    let mut attempt = |what: &str, result: Result<Option<FetchedImage>>| match result {
+        Ok(image) => image,
+        Err(e) => {
+            warnings.push(format!("{what}: {e}"));
+            None
+        }
+    };
+    if let (Some(coverart), Some(release)) = (services.coverart, chosen) {
+        if !release.mbid.is_empty() {
+            if let Some(image) = attempt("Cover Art Archive", coverart.front(&release.mbid)) {
+                return Some(image);
+            }
+        }
+        if !release.release_group_mbid.is_empty() {
+            if let Some(image) = attempt("Cover Art Archive", coverart.front_of_group(&release.release_group_mbid)) {
+                return Some(image);
+            }
+        }
+    }
+    let (discogs, uri) = (services.discogs?, discogs_image?);
+    attempt("Discogs image", discogs.image(uri).map(Some))
+}
+
+/// How a fetched image is referred to in a proposal.
+fn artwork_ref(image: &FetchedImage) -> ArtworkRef {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(&image.bytes);
+    let source = if image.url.contains("discogs.com") {
+        crate::model::ArtworkSource::Discogs
+    } else {
+        crate::model::ArtworkSource::CoverArtArchive
+    };
+    ArtworkRef {
+        source,
+        url: image.url.clone(),
+        sha256: digest.iter().fold(String::with_capacity(64), |mut hex, b| {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+            hex
+        }),
+        mime: image.mime.clone(),
+        bytes: image.bytes.len() as u64,
+    }
 }
 
 fn summarise(matches: &[AcoustIdMatch]) -> FingerprintOutcome {
@@ -627,6 +788,60 @@ mod tests {
         let snap = snapshot(&[(Field::Genre, "TCON", crate::tags::UNREADABLE)]);
         let proposal = propose(&file(""), &snap, &candidate("x", "", &[]), Some(&enrichment), None, GenrePolicy::FillEmpty);
         assert_eq!(change_for(&proposal, Field::Genre), None);
+    }
+
+    fn discogs_release(tracks: &[(&str, &[(&str, &str)])], labels: &[(&str, &str)]) -> DiscogsRelease {
+        DiscogsRelease {
+            id: 9,
+            title: "Spirit EP".into(),
+            year: Some(2014),
+            released: "2014".into(),
+            artists: vec!["E&G".into()],
+            labels: labels
+                .iter()
+                .map(|(name, catno)| crate::discogs::DiscogsLabel { name: (*name).into(), catno: (*catno).into() })
+                .collect(),
+            styles: vec!["Progressive House".into()],
+            genres: vec!["Electronic".into()],
+            tracklist: tracks
+                .iter()
+                .map(|(title, extra)| crate::discogs::DiscogsTrack {
+                    position: "A1".into(),
+                    title: (*title).into(),
+                    duration_secs: None,
+                    artists: Vec::new(),
+                    extra_artists: extra.iter().map(|(n, r)| ((*n).to_owned(), (*r).to_owned())).collect(),
+                })
+                .collect(),
+            images: vec![
+                crate::discogs::DiscogsImage { primary: false, uri: "https://i.discogs.com/b.jpg".into(), width: 1, height: 1 },
+                crate::discogs::DiscogsImage { primary: true, uri: "https://i.discogs.com/a.jpg".into(), width: 1, height: 1 },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_discogs_release_counts_only_if_it_holds_this_version() {
+        let remix = mixname::parse_title("Spirit (Aerofoil Remix)");
+        let original = mixname::parse_title("Spirit (Original Mix)");
+        let titled = discogs_release(&[("Spirit (Aerofoil Remix)", &[])], &[]);
+        assert!(holds_track(&titled, &remix));
+        assert!(!holds_track(&titled, &original), "the remix is not the original on Discogs either");
+        // A remixer credit marks a plainly titled track as the remix.
+        let credited = discogs_release(&[("Spirit", &[("Aerofoil", "Remix")])], &[]);
+        assert!(holds_track(&credited, &remix));
+        assert!(!holds_track(&credited, &original));
+    }
+
+    #[test]
+    fn discogs_placeholders_are_not_values_and_the_primary_image_wins() {
+        let (enrichment, image) =
+            enrichment_from(&discogs_release(&[], &[("Not On Label (E&G Self-released)", "none"), ("Fraction", "FRA224")]));
+        assert_eq!((enrichment.label.as_str(), enrichment.catalog_number.as_str()), ("Fraction", "FRA224"));
+        assert_eq!(enrichment.release_title, "Spirit EP");
+        assert_eq!(image.as_deref(), Some("https://i.discogs.com/a.jpg"));
+        let (bare, _) = enrichment_from(&discogs_release(&[], &[("Self", "none")]));
+        assert_eq!(bare.catalog_number, "", "\"none\" is Discogs's placeholder");
     }
 
     #[test]

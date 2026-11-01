@@ -20,6 +20,8 @@ use std::sync::Arc;
 use rbl_identify::acoustid::AcoustIdClient;
 use rbl_identify::clock::{Clock, SystemClock};
 use rbl_identify::config::Config;
+use rbl_identify::coverart::CoverArtClient;
+use rbl_identify::discogs::DiscogsClient;
 use rbl_identify::musicbrainz::MusicBrainzClient;
 use rbl_identify::pipeline::{self, Services, Settings};
 use rbl_identify::ratelimit::Limiters;
@@ -106,7 +108,15 @@ fn run() -> Result<(), String> {
     let acoustid = AcoustIdClient::new(Arc::clone(&transport), Arc::clone(&clock), Arc::clone(&limiters.acoustid), config.acoustid_key.clone());
     let musicbrainz =
         MusicBrainzClient::new(Arc::clone(&transport), Arc::clone(&clock), Arc::clone(&limiters.musicbrainz), config.mb_user_agent.clone());
-    let services = Services { acoustid: &acoustid, musicbrainz: &musicbrainz };
+    // Discogs only with the user's personal token; without one, enrichment
+    // is skipped rather than failing every track.
+    let discogs = config.discogs_token.clone().map(|token| {
+        DiscogsClient::new(Arc::clone(&transport), Arc::clone(&clock), Arc::clone(&limiters.discogs), token, config.mb_user_agent.clone())
+    });
+    let coverart = CoverArtClient::live(Arc::clone(&clock), Arc::clone(&limiters.coverart), config.mb_user_agent.clone())
+        .map_err(|e| e.to_string())?;
+    let services =
+        Services { acoustid: &acoustid, musicbrainz: &musicbrainz, discogs: discogs.as_ref(), coverart: Some(&coverart) };
 
     let started = std::time::Instant::now();
     let mut results = Vec::new();
