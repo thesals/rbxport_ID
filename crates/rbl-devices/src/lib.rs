@@ -19,9 +19,16 @@ pub use mounts::MountWatcher;
 
 use std::path::{Path, PathBuf};
 
-/// Set to a `:`-separated list of directories to use those instead of the real
-/// volumes. Tests and `pnpm dev` use it; nothing else should.
+/// Set to a list of directories to use those instead of the real volumes,
+/// separated as `PATH` is: `:` on Unix, `;` on Windows, where `:` is part of
+/// a drive. Tests and `pnpm dev` use it; nothing else should.
 pub const FAKE_VOLUMES: &str = "RB_LITE_FAKE_VOLUMES";
+
+/// The directories [`FAKE_VOLUMES`] names, when it is set.
+fn fake_volumes() -> Option<Vec<PathBuf>> {
+    let fake = std::env::var_os(FAKE_VOLUMES)?;
+    Some(std::env::split_paths(&fake).filter(|path| !path.as_os_str().is_empty()).collect())
+}
 
 /// A volume an export could be written to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,13 +69,8 @@ pub struct DeviceExport {
 /// Lists the volumes worth offering as an export destination.
 #[must_use]
 pub fn list() -> Vec<Device> {
-    if let Some(fake) = std::env::var_os(FAKE_VOLUMES) {
-        return fake
-            .to_string_lossy()
-            .split(':')
-            .filter(|path| !path.is_empty())
-            .map(|path| fake_device(Path::new(path)))
-            .collect();
+    if let Some(fakes) = fake_volumes() {
+        return fakes.iter().map(|path| fake_device(path)).collect();
     }
 
     devices_from(&sysinfo::Disks::new_with_refreshed_list())
