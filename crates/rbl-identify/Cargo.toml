@@ -31,6 +31,10 @@ lofty = { version = "0.22", default-features = false }
 # NFKD decomposition to fold accents when comparing names. Already in the
 # lock through rbl-export and rbl-nfs.
 unicode-normalization = "0.1"
+# The identify store: this feature's own SQLite file (never rekordbox's
+# master.db). Exactly the variant every other workspace crate builds, so no
+# second SQLite is compiled; no key is ever set, so the file is plain SQLite.
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
 # SHA-256 of fetched artwork, so the store keeps one copy per image.
 # The 0.10.9 already in the lock.
 sha2 = "0.10"
