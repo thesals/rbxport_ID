@@ -21,7 +21,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 fn embed_manifest() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("windows/app-manifest.xml");
     println!("cargo:rerun-if-changed={}", manifest.display());
-    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+    // Executables only (not the cdylib), and without the UAC section the
+    // linker adds by default, so the result is exactly tauri-build's manifest.
+    for target in ["bins", "tests", "examples"] {
+        println!("cargo:rustc-link-arg-{target}=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-{target}=/MANIFESTUAC:NO");
+        println!("cargo:rustc-link-arg-{target}=/MANIFESTINPUT:{}", manifest.display());
+    }
     Ok(())
 }
