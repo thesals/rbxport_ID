@@ -6,7 +6,7 @@
 //! conflict caps it below the review threshold, and a candidate with no
 //! fingerprint behind it can never reach the auto-apply threshold.
 
-use crate::mixname::{agree, parse_candidate, parse_title, MixAgreement, ParsedTitle};
+use crate::mixname::{agree, parse_candidate, parse_title, MixAgreement, MixKind, ParsedTitle};
 use crate::model::{Candidate, ExistingTags, ScoreBreakdown, Scored};
 use crate::normalize::{artist_similarity, similarity, strip_featuring};
 
@@ -69,7 +69,10 @@ pub fn score(existing: &ExistingTags, file_duration_secs: f64, candidate: Candid
     let weights = DEFAULT_WEIGHTS;
     let (duration, duration_delta) = duration_score(file_duration_secs, candidate.length_ms);
     let file_title = parse_title(&existing.title);
-    let cand_title = parse_candidate(&candidate.title, &candidate.disambiguation);
+    let cand_title = with_remixers(
+        parse_candidate(&candidate.title, &candidate.disambiguation),
+        &candidate.remixers,
+    );
     let text = text_score(existing, &file_title, &candidate, &cand_title);
     let agreement = agree(&file_title.mix, &cand_title.mix);
     let mix = match agreement {
@@ -187,6 +190,26 @@ fn text_score(existing: &ExistingTags, file_title: &ParsedTitle, candidate: &Can
         (false, true) => title(),
         (false, false) => NEUTRAL,
     }
+}
+
+/// A recording with MusicBrainz remixer relationships is a remix even when
+/// its title does not say so: its mix becomes `Remix(<remixers joined by
+/// " & ">)`, unless the title or disambiguation already names a version
+/// (remix, named dub, edit, VIP), which is kept as more specific. The base
+/// title is left alone.
+fn with_remixers(mut parsed: ParsedTitle, remixers: &[String]) -> ParsedTitle {
+    let names: Vec<&str> = remixers.iter().map(|r| r.trim()).filter(|r| !r.is_empty()).collect();
+    let named_version = matches!(
+        parsed.mix,
+        MixKind::Remix(_) | MixKind::NamedDub(_) | MixKind::Edit(_) | MixKind::Vip
+    );
+    if names.is_empty() || named_version {
+        return parsed;
+    }
+    let name = names.join(" & ");
+    parsed.mix_text = format!("{name} Remix");
+    parsed.mix = MixKind::Remix(name);
+    parsed
 }
 
 /// An artist credit with names featured in the title appended.
@@ -329,6 +352,69 @@ mod tests {
         assert!((mix_of("The Music") - 0.8).abs() < f64::EPSILON);
         assert!((mix_of("The Music (Club Mix)") - 0.5).abs() < f64::EPSILON);
         assert!(mix_of("The Music (Radio Edit)").abs() < f64::EPSILON);
+    }
+
+    fn remixed(title: &str, remixers: &[&str]) -> Candidate {
+        let mut c = cand("m", "Artist", title, Some(300_000), Some(1.0));
+        c.remixers = remixers.iter().map(|r| (*r).to_owned()).collect();
+        c
+    }
+
+    #[test]
+    fn remixer_relationships_make_a_remix() {
+        // The title does not say remix, MusicBrainz does.
+        let s = score(&tags("Artist", "Choctaw Dub (Original Mix)"), FILE_SECS, remixed("Choctaw Dub", &["X"]));
+        assert!(s.score <= 0.49, "{s:?}");
+        assert_eq!(s.breakdown.rejected.as_deref(), Some("mix conflict: Original Mix vs X Remix"));
+        // A plain-titled remix matches the remix file.
+        let remix_file = tags("Artist", "Spirit (Aerofoil Remix)");
+        let s = score(&remix_file, FILE_SECS, remixed("Spirit", &["Aerofoil"]));
+        assert!((s.breakdown.mix - 1.0).abs() < f64::EPSILON, "{s:?}");
+        // A title that already names the remix keeps it.
+        let titled = score(&remix_file, FILE_SECS, remixed("Spirit (Aerofoil Remix)", &["Aerofoil"]));
+        let plain = score(&remix_file, FILE_SECS, remixed("Spirit (Aerofoil Remix)", &[]));
+        assert!((titled.score - plain.score).abs() < f64::EPSILON);
+        assert_eq!(titled.breakdown, plain.breakdown);
+        // ... even when the relationship credits someone else.
+        let s = score(&remix_file, FILE_SECS, remixed("Spirit (Aerofoil Remix)", &["Other Person"]));
+        assert!((s.breakdown.mix - 1.0).abs() < f64::EPSILON);
+        // Several remixers join into one name.
+        let pair = tags("Artist", "Spirit (A & B Remix)");
+        let s = score(&pair, FILE_SECS, remixed("Spirit", &["A", "B"]));
+        assert!((s.breakdown.mix - 1.0).abs() < f64::EPSILON, "{s:?}");
+        // A remixer relationship beats a generic cut in the title.
+        let s = score(&tags("Artist", "Spirit (Extended Mix)"), FILE_SECS, remixed("Spirit (Extended Mix)", &["X"]));
+        assert!(s.score <= 0.49, "{s:?}");
+        // A length cut of a remix is still the remix.
+        let s = score(&tags("Artist", "Spirit (Original Mix)"), FILE_SECS, remixed("Spirit (Radio Edit)", &["X"]));
+        assert!(s.score <= 0.49, "{s:?}");
+    }
+
+    #[test]
+    fn a_remix_behind_a_non_mix_group_is_still_a_remix() {
+        let original = tags("Artist", "Spirit (Original Mix)");
+        for title in [
+            "Spirit (Aerofoil Remix) (2014 Remaster)",
+            "Spirit (Aerofoil Remix) [Free Download]",
+            "Spirit (Aerofoil Remix) (Live)",
+            "Spirit (Aerofoil Remix) [Bonus Track]",
+            "Spirit - Aerofoil Remix - 2014 Remaster",
+        ] {
+            let s = score(&original, FILE_SECS, remixed(title, &[]));
+            assert!(s.score <= 0.49, "candidate {title}: {s:?}");
+            // And the other way round: the file is the buried remix.
+            let s = score(&tags("Artist", title), FILE_SECS, remixed("Spirit (Original Mix)", &[]));
+            assert!(s.score <= 0.49, "file {title}: {s:?}");
+        }
+    }
+
+    #[test]
+    fn album_version_reviews_but_never_auto_applies() {
+        let s = score(&music(), FILE_SECS, remixed("The Music (Album Version)", &[]));
+        assert!(s.score > 0.5 && s.score <= 0.91, "{s:?}");
+        let radio = tags("Artist", "The Music (Radio Edit)");
+        let s = score(&radio, FILE_SECS, remixed("The Music (Album Version)", &[]));
+        assert!(s.score <= 0.49, "{s:?}");
     }
 
     #[test]

@@ -25,6 +25,10 @@ pub enum MixKind {
     /// named radio edit such as `Tribal Radio Edit`.
     Radio,
     Club,
+    /// `Album Mix`/`Album Version`: often the original, sometimes an
+    /// album-only edit, so it behaves like `Club`: unknown against the
+    /// full-length kinds, a conflict with a radio edit.
+    Album,
     Dub,
     Instrumental,
     /// `VIP`, `VIP Mix`, `<Name> VIP`.
@@ -72,12 +76,17 @@ pub enum MixAgreement {
 
 /// Splits a title into base and mix.
 ///
-/// Only the end of the title is looked at: the last `(...)` or `[...]`
-/// group, or else a trailing ` - X` part, and only when it is a mix
-/// descriptor. Mix-like words elsewhere stay in the base (`Choctaw Dub
-/// (Original Mix)`, `Dub Stab!`). A trailing featuring group is skipped
-/// over, so `Song (Extended Mix) (feat. X)` gives base `Song (feat. X)`
-/// and `Extended`.
+/// Only trailing parts are looked at: `(...)`/`[...]` groups and ` - X`
+/// parts, from the end backwards. The first that is a mix descriptor wins;
+/// parts that are not (featuring, `(2014 Remaster)`, `[Free Download]`,
+/// `(Live)`) are stepped over and stay in the base, so `Song (Extended Mix)
+/// (feat. X)` gives base `Song (feat. X)` and `Extended`. Mix-like words
+/// outside those parts stay in the base (`Choctaw Dub (Original Mix)`,
+/// `Dub Stab!`).
+///
+/// Backstop: when no part is a descriptor but one mentions a remix, edit,
+/// dub or VIP (`(Remixed for Radio)`), the nearest such part becomes
+/// `Remix(<its text>)`, which conflicts with everything but itself.
 ///
 /// A length cut stacked on a named version (`Song - TC Remix - Radio Edit`,
 /// `Song (TC Remix) (Radio Edit)`) is that version: the remix wins, and the
@@ -86,7 +95,7 @@ pub fn parse_title(title: &str) -> ParsedTitle {
     let outer = parse_once(title);
     if !matches!(
         outer.mix,
-        MixKind::Original | MixKind::Extended | MixKind::Radio | MixKind::Club
+        MixKind::Original | MixKind::Extended | MixKind::Radio | MixKind::Club | MixKind::Album
     ) {
         return outer;
     }
@@ -103,27 +112,35 @@ pub fn parse_title(title: &str) -> ParsedTitle {
     outer
 }
 
+/// One pass of [`parse_title`]: the nearest trailing part that classifies.
 fn parse_once(title: &str) -> ParsedTitle {
     let title = collapse(title);
-    if let Some((before, inner)) = trailing_group(&title) {
-        if let Some(mix) = classify(inner) {
-            return parsed(before, mix, inner);
+    let mut rest: &str = &title;
+    // Parts stepped over, as written, in title order: they stay in the base.
+    let mut kept: Vec<&str> = Vec::new();
+    // The nearest part that mentions a version: (base without it, its text).
+    let mut fallback: Option<(String, &str)> = Option::None;
+    // Each step shortens `rest`, so this ends.
+    while let Some((before, part)) = trailing_group(rest).or_else(|| trailing_dash(rest)) {
+        let raw = rest.get(before.len()..).unwrap_or("").trim();
+        let base = if kept.is_empty() {
+            before.to_owned()
+        } else {
+            format!("{before} {}", kept.join(" "))
+        };
+        if let Some(mix) = classify(part) {
+            return parsed(&base, mix, part);
         }
-        if is_featuring(inner, true) {
-            let feat_group = title.get(before.len()..).unwrap_or("").trim();
-            let earlier = trailing_group(before)
-                .and_then(|(base, inner2)| classify(inner2).map(|mix| (base, inner2, mix)));
-            if let Some((base, inner2, mix)) = earlier {
-                return parsed(&format!("{base} {feat_group}"), mix, inner2);
-            }
+        if fallback.is_none() && !is_featuring(part) && mentions_version(part) {
+            fallback = Some((base, part));
         }
-        return unparsed(&title);
+        kept.insert(0, raw);
+        rest = before;
     }
-    let dashed = trailing_dash(&title).and_then(|(before, tail)| classify(tail).map(|mix| (before, tail, mix)));
-    if let Some((before, tail, mix)) = dashed {
-        return parsed(before, mix, tail);
+    match fallback {
+        Some((base, part)) => parsed(&base, MixKind::Remix(collapse(part)), part),
+        Option::None => unparsed(&title),
     }
-    unparsed(&title)
 }
 
 /// [`parse_title`] for a MusicBrainz recording: when the title carries no
@@ -157,7 +174,7 @@ pub fn parse_candidate(title: &str, disambiguation: &str) -> ParsedTitle {
 #[allow(clippy::match_same_arms)]
 pub fn agree(a: &MixKind, b: &MixKind) -> MixAgreement {
     use MixAgreement::{Compatible, Conflict, Same, Unknown};
-    use MixKind::{Club, Dub, Edit, Extended, Instrumental, NamedDub, None, Original, Other, Radio, Remix, Vip};
+    use MixKind::{Album, Club, Dub, Edit, Extended, Instrumental, NamedDub, None, Original, Other, Radio, Remix, Vip};
     match (a, b) {
         (Remix(x), Remix(y)) | (Edit(x), Edit(y)) | (NamedDub(x), NamedDub(y)) => {
             if same_name(x, y) {
@@ -178,11 +195,14 @@ pub fn agree(a: &MixKind, b: &MixKind) -> MixAgreement {
             }
         }
         (Other(_), _) | (_, Other(_)) => Conflict,
-        (None, None) | (Original, Original) | (Extended, Extended) | (Radio, Radio) | (Club, Club) => Same,
+        (None, None) | (Original, Original) | (Extended, Extended) | (Radio, Radio) | (Club, Club) | (Album, Album) => {
+            Same
+        }
         (Original | None, Extended) | (Extended | None, Original) | (Original | Extended, None) => Compatible,
-        (Radio, Original | Extended | Club) | (Original | Extended | Club, Radio) => Conflict,
+        (Radio, Original | Extended | Club | Album) | (Original | Extended | Club | Album, Radio) => Conflict,
         (Radio, None) | (None, Radio) => Unknown,
-        (Club, Original | Extended | None) | (Original | Extended | None, Club) => Unknown,
+        (Club | Album, Original | Extended | None) | (Original | Extended | None, Club | Album) => Unknown,
+        (Club, Album) | (Album, Club) => Unknown,
     }
 }
 
@@ -238,28 +258,39 @@ const GENERIC_WORDS: [&str; 12] = [
 // One arm per descriptor family, as for `agree`.
 #[allow(clippy::match_same_arms)]
 fn classify(text: &str) -> Option<MixKind> {
-    if is_featuring(text, false) {
+    if is_featuring(text) {
         return Option::None;
     }
-    // Each word as written, and lowercased without edge punctuation
-    // (`remix,` is `remix`); words that are only punctuation are dropped.
-    let pairs: Vec<(&str, String)> = text
-        .split_whitespace()
-        .filter_map(|w| {
-            let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
-            (!bare.is_empty()).then_some((w, bare))
-        })
-        .collect();
-    if pairs.is_empty() {
+    // Each word's byte offset in `text`, and the word lowercased without
+    // edge punctuation (`remix,` is `remix`). Words that are only
+    // punctuation (`&`, `-`) are left out of the matching but not out of
+    // names, which are sliced from `text` itself: `A & B Remix` is by `A & B`.
+    let mut starts: Vec<usize> = Vec::new();
+    let mut bare_words: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    for w in text.split_whitespace() {
+        let start = cursor + text.get(cursor..).and_then(|t| t.find(w)).unwrap_or(0);
+        cursor = start + w.len();
+        let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if !bare.is_empty() {
+            starts.push(start);
+            bare_words.push(bare);
+        }
+    }
+    if bare_words.is_empty() {
         return Option::None;
     }
-    let words: Vec<&str> = pairs.iter().map(|(w, _)| *w).collect();
-    let lower: Vec<&str> = pairs.iter().map(|(_, l)| l.as_str()).collect();
+    let lower: Vec<&str> = bare_words.iter().map(String::as_str).collect();
+    // The text before word `i`, and from word `i` on.
+    let up_to = |i: usize| text.get(..starts[i]).unwrap_or("");
+    let from = |i: usize| text.get(starts[i]..).unwrap_or("");
 
     let generic = match lower.as_slice() {
         ["original"] | ["original", "mix" | "version"] => Some(MixKind::Original),
-        // The album or main mix of a track is its original.
-        ["album" | "main", "mix" | "version"] => Some(MixKind::Original),
+        // The main mix of a track is its original.
+        ["main", "mix" | "version"] => Some(MixKind::Original),
+        // An album version may be the original or an album-only edit.
+        ["album", "mix" | "version"] => Some(MixKind::Album),
         // "Extended Edit" is the label's lengthened DJ version, not an
         // editor's re-edit, so it sits with Extended (and is therefore
         // compatible with an Original Mix).
@@ -282,20 +313,20 @@ fn classify(text: &str) -> Option<MixKind> {
     // Radio Edit` is TC's remix cut for radio, not the radio edit.
     if let Some(r) = lower.iter().rposition(|w| *w == "dub" || REMIX_WORDS.contains(w)) {
         let after = &lower[r + 1..];
-        let by_name = (after.first() == Some(&"by") && after.len() > 1).then(|| remixer(&words[r + 2..]));
+        let by_name = (after.first() == Some(&"by") && after.len() > 1).then(|| remixer(from(r + 2)));
         let before = &lower[..r];
         if lower[r] == "dub" {
             if by_name.is_none() && before.iter().all(|w| GENERIC_WORDS.contains(w)) {
                 return Some(MixKind::Dub);
             }
-            return Some(MixKind::NamedDub(by_name.unwrap_or_else(|| remixer(&words[..r]))));
+            return Some(MixKind::NamedDub(by_name.unwrap_or_else(|| remixer(up_to(r)))));
         }
-        return Some(MixKind::Remix(by_name.unwrap_or_else(|| remixer(&words[..r]))));
+        return Some(MixKind::Remix(by_name.unwrap_or_else(|| remixer(up_to(r)))));
     }
 
     // Everything before the last word, as written: the editor's or
     // remixer's name.
-    let name = || remixer(&words[..words.len() - 1]);
+    let name = || remixer(up_to(lower.len() - 1));
     let kind = match lower.as_slice() {
         // A named radio edit with no remix word: `Tribal Radio Edit`.
         [.., "radio", "edit" | "mix" | "version"] => MixKind::Radio,
@@ -331,12 +362,16 @@ fn same_name(a: &str, b: &str) -> bool {
     compact(a) == compact(b) || similarity(a, b) >= NAME_MATCH
 }
 
-/// The remixer from the words before `Remix`: drops a possessive (`TC's`),
-/// trailing commas and a trailing `Extended` (`Yan Oxygen Extended Remix`
-/// is the long cut of Yan Oxygen's remix, the same version for matching).
-fn remixer(words: &[&str]) -> String {
-    let mut words = words.to_vec();
-    if words.last().is_some_and(|w| w.eq_ignore_ascii_case("extended")) {
+/// The remixer from the text around `Remix`: drops trailing punctuation
+/// (`A & B -`), a possessive (`TC's`) and a trailing `Extended` (`Yan
+/// Oxygen Extended Remix` is the long cut of Yan Oxygen's remix, the same
+/// version for matching).
+fn remixer(text: &str) -> String {
+    let mut words: Vec<&str> = text.split_whitespace().collect();
+    while words
+        .last()
+        .is_some_and(|w| w.eq_ignore_ascii_case("extended") || !w.chars().any(char::is_alphanumeric))
+    {
         words.pop();
     }
     let joined = words.join(" ");
@@ -350,12 +385,12 @@ fn remixer(words: &[&str]) -> String {
     name
 }
 
-/// A group whose text starts with a featuring marker: not a mix. `with`
-/// counts only when asked: `parse_title` asks after [`classify`] has
-/// already failed, so `(With Love Remix)` is still a remix.
-fn is_featuring(text: &str, with_counts: bool) -> bool {
+/// A group whose text starts with a featuring marker: not a mix. `with` is
+/// not a marker here: `(with X)` is stepped over anyway because it does not
+/// classify, and `(With Love Remix)` must stay a remix.
+fn is_featuring(text: &str) -> bool {
     let first = text.split_whitespace().next().unwrap_or("").to_lowercase();
-    matches!(first.as_str(), "feat" | "feat." | "ft" | "ft." | "featuring") || (with_counts && first == "with")
+    matches!(first.as_str(), "feat" | "feat." | "ft" | "ft." | "featuring")
 }
 
 /// The last bracket group: (text before it, trimmed; text inside it).
@@ -500,7 +535,45 @@ mod tests {
         check("(Extended Mix)", "(Extended Mix)", MixKind::None, "");
         check("Unbalanced (Extended Mix", "Unbalanced (Extended Mix", MixKind::None, "");
         check("Radio", "Radio", MixKind::None, "");
+        check("Song (Live)", "Song (Live)", MixKind::None, "");
+        check("Song (Live) [Bonus Track]", "Song (Live) [Bonus Track]", MixKind::None, "");
         check("", "", MixKind::None, "");
+    }
+
+    const BURIED_REMIXES: [(&str, &str); 5] = [
+        ("Spirit (Aerofoil Remix) (2014 Remaster)", "Spirit (2014 Remaster)"),
+        ("Spirit (Aerofoil Remix) [Free Download]", "Spirit [Free Download]"),
+        ("Spirit (Aerofoil Remix) (Live)", "Spirit (Live)"),
+        ("Spirit (Aerofoil Remix) [Bonus Track]", "Spirit [Bonus Track]"),
+        ("Spirit - Aerofoil Remix - 2014 Remaster", "Spirit - 2014 Remaster"),
+    ];
+
+    #[test]
+    fn a_mix_behind_non_mix_parts_is_found() {
+        for (title, base) in BURIED_REMIXES {
+            check(title, base, remix("Aerofoil"), "Aerofoil Remix");
+            let p = parse_candidate(title, "");
+            assert_eq!(p.mix, remix("Aerofoil"), "{title}");
+        }
+        check(
+            "Song (Extended Mix) (feat. X) (2014 Remaster)",
+            "Song (feat. X) (2014 Remaster)",
+            MixKind::Extended,
+            "Extended Mix",
+        );
+    }
+
+    #[test]
+    fn a_part_mentioning_a_version_is_a_remix() {
+        check("Song (Remixed for Radio)", "Song", remix("Remixed for Radio"), "Remixed for Radio");
+        check(
+            "Song (2009 Edit for the reissue) (Live)",
+            "Song (Live)",
+            remix("2009 Edit for the reissue"),
+            "2009 Edit for the reissue",
+        );
+        // A featuring group never is.
+        check("Song (feat. DJ Edit)", "Song (feat. DJ Edit)", MixKind::None, "");
     }
 
     #[test]
@@ -523,6 +596,7 @@ mod tests {
             MixKind::Extended,
             MixKind::Radio,
             MixKind::Club,
+            MixKind::Album,
             MixKind::Dub,
             MixKind::Instrumental,
             MixKind::Vip,
@@ -549,7 +623,7 @@ mod tests {
     #[test]
     fn agree_matrix() {
         use MixAgreement::{Compatible, Conflict, Same, Unknown};
-        use MixKind::{Club, Dub, Extended, Instrumental, None, Original, Radio, Vip};
+        use MixKind::{Album, Club, Dub, Extended, Instrumental, None, Original, Radio, Vip};
         let other = |s: &str| MixKind::Other(s.to_owned());
         let edit = |s: &str| MixKind::Edit(s.to_owned());
         let cases = [
@@ -563,6 +637,16 @@ mod tests {
             (Club, Original, Unknown),
             (Club, Extended, Unknown),
             (Club, None, Unknown),
+            // An album version behaves like a club mix.
+            (Album, Original, Unknown),
+            (Album, Extended, Unknown),
+            (Album, None, Unknown),
+            (Album, Club, Unknown),
+            (Album, Radio, Conflict),
+            (Album, Album, Same),
+            (Album, remix("TC"), Conflict),
+            (Album, Dub, Conflict),
+            (Album, other("Vocal Mix"), Conflict),
             // The spec: a remix is never the original.
             (remix("TC"), Original, Conflict),
             (remix("TC"), Extended, Conflict),
@@ -641,7 +725,10 @@ mod tests {
         check("T (Vocal Mix)", "T", MixKind::Other("Vocal Mix".to_owned()), "Vocal Mix");
         check("T (Main Vocal Mix)", "T", MixKind::Other("Main Vocal Mix".to_owned()), "Main Vocal Mix");
         check("T (Acoustic Version)", "T", MixKind::Other("Acoustic Version".to_owned()), "Acoustic Version");
-        check("T (Album Version)", "T", MixKind::Original, "Album Version");
+        check("T (Album Version)", "T", MixKind::Album, "Album Version");
+        check("T (Album Mix)", "T", MixKind::Album, "Album Mix");
+        check("T (A & B Remix)", "T", remix("A & B"), "A & B Remix");
+        check("T (A & B Mix)", "T", remix("A & B"), "A & B Mix");
         check("T (Main Mix)", "T", MixKind::Original, "Main Mix");
         check("T (Original Extended Mix)", "T", MixKind::Extended, "Original Extended Mix");
         check("T (Vocal Dub)", "T", MixKind::Dub, "Vocal Dub");
