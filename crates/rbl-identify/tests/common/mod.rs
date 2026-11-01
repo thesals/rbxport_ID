@@ -21,11 +21,13 @@ pub fn path_and_query(url: &str) -> &str {
     rest.find('/').map_or("/", |i| &rest[i..])
 }
 
-/// Answers each request with the body registered for its path and query,
-/// and 404 for anything else. Keeps every request it saw.
+/// Answers each request with the body registered for its path and query
+/// (200, unless [`FakeTransport::route_status`] set another status), and
+/// 404 for anything else. Keeps every request it saw.
 #[derive(Default)]
 pub struct FakeTransport {
     bodies: HashMap<String, Vec<u8>>,
+    statuses: HashMap<String, u16>,
     pub requests: Mutex<Vec<Request>>,
 }
 
@@ -48,6 +50,13 @@ impl FakeTransport {
         self
     }
 
+    /// Replies to `path_and_query` with `status` and `body`.
+    #[must_use]
+    pub fn route_status(mut self, path_and_query: &str, status: u16, body: &[u8]) -> Self {
+        self.statuses.insert(path_and_query.to_owned(), status);
+        self.route_body(path_and_query, body)
+    }
+
     pub fn requests(&self) -> Vec<Request> {
         self.requests.lock().unwrap().clone()
     }
@@ -58,7 +67,10 @@ impl Transport for FakeTransport {
         self.requests.lock().unwrap().push(request.clone());
         let key = path_and_query(&request.url);
         Ok(match self.bodies.get(key) {
-            Some(body) => Response { status: 200, body: body.clone(), retry_after: None },
+            Some(body) => {
+                let status = self.statuses.get(key).copied().unwrap_or(200);
+                Response { status, body: body.clone(), retry_after: None }
+            }
             None => Response { status: 404, body: format!("no fixture for {key}").into_bytes(), retry_after: None },
         })
     }

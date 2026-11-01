@@ -1,0 +1,81 @@
+{
+  "id": 9000001,
+  "status": "Accepted",
+  "year": 2014,
+  "resource_url": "https://api.discogs.com/releases/9000001",
+  "uri": "https://www.discogs.com/release/9000001-Example-Artist-Example-Track",
+  "artists": [
+    {"name": "Example Artist (2)", "anv": "", "join": "vs.", "role": "", "tracks": "", "id": 9200001, "resource_url": "https://api.discogs.com/artists/9200001"},
+    {"name": "Second Example", "anv": "", "join": "", "role": "", "tracks": "", "id": 9200002, "resource_url": "https://api.discogs.com/artists/9200002"}
+  ],
+  "artists_sort": "Example Artist (2) vs. Second Example",
+  "labels": [
+    {"name": "Example Records", "catno": "EX001", "entity_type": "1", "entity_type_name": "Label", "id": 9300001, "resource_url": "https://api.discogs.com/labels/9300001"},
+    {"name": "Not On Label (Example Artist Self-released)", "catno": "none", "entity_type": "1", "entity_type_name": "Label", "id": 9300002, "resource_url": "https://api.discogs.com/labels/9300002"}
+  ],
+  "series": [],
+  "companies": [],
+  "formats": [{"name": "File", "qty": "4", "text": "", "descriptions": ["WAV", "EP"]}],
+  "data_quality": "Needs Vote",
+  "format_quantity": 4,
+  "date_added": "2014-06-03T01:02:03-07:00",
+  "date_changed": "2020-01-01T00:00:00-07:00",
+  "num_for_sale": 0,
+  "lowest_price": null,
+  "master_id": 9100001,
+  "master_url": "https://api.discogs.com/masters/9100001",
+  "title": "Example Track",
+  "country": "UK",
+  "released": "2014-06-02",
+  "notes": "Hand-written fixture; every name and ID is made up.",
+  "released_formatted": "02 Jun 2014",
+  "identifiers": [],
+  "videos": [],
+  "genres": ["Electronic"],
+  "styles": ["Progressive House", "Tech House"],
+  "tracklist": [
+    {"position": "", "type_": "heading", "title": "Original Mixes", "duration": ""},
+    {
+      "position": "1",
+      "type_": "track",
+      "title": "Example Track (Original Mix)",
+      "duration": "6:42"
+    },
+    {
+      "position": "2",
+      "type_": "track",
+      "title": "Example Track (Other Example Remix)",
+      "duration": "7:05",
+      "extraartists": [
+        {"name": "Other Example (3)", "anv": "", "join": "", "role": "Remix", "tracks": "", "id": 9200003, "resource_url": "https://api.discogs.com/artists/9200003"},
+        {"name": "Example Engineer", "anv": "", "join": "", "role": "Mastered By [Digital]", "tracks": "", "id": 9200004, "resource_url": "https://api.discogs.com/artists/9200004"}
+      ]
+    },
+    {"position": "", "type_": "heading", "title": "Bonus", "duration": ""},
+    {
+      "position": "",
+      "type_": "index",
+      "title": "Example Suite",
+      "duration": "",
+      "sub_tracks": [
+        {"position": "3a", "type_": "track", "title": "Part One", "duration": "1:02:03"},
+        {
+          "position": "3b",
+          "type_": "track",
+          "title": "Part Two",
+          "duration": "",
+          "artists": [{"name": "Guest Example (12)", "anv": "", "join": "", "role": "", "tracks": "", "id": 9200005, "resource_url": "https://api.discogs.com/artists/9200005"}]
+        }
+      ]
+    },
+    {"position": "4", "type_": "track", "title": "Example Track (Dub)", "duration": null, "extraartists": null}
+  ],
+  "extraartists": [],
+  "images": [
+    {"type": "secondary", "uri": "https://i.discogs.com/example/rs:fit/g:sm/q:90/h:600/w:600/back.jpeg", "resource_url": "https://i.discogs.com/example/rs:fit/g:sm/q:90/h:600/w:600/back.jpeg", "uri150": "https://i.discogs.com/example/rs:fit/g:sm/q:40/h:150/w:150/back.jpeg", "width": 600, "height": 600},
+    {"type": "primary", "uri": "https://i.discogs.com/example/rs:fit/g:sm/q:90/h:500/w:500/front.jpeg", "resource_url": "https://i.discogs.com/example/rs:fit/g:sm/q:90/h:500/w:500/front.jpeg", "uri150": "https://i.discogs.com/example/rs:fit/g:sm/q:40/h:150/w:150/front.jpeg", "width": 500, "height": 500}
+  ],
+  "thumb": "",
+  "estimated_weight": null,
+  "blocked_from_sale": false
+}

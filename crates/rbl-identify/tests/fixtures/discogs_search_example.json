@@ -1,0 +1,60 @@
+{
+  "pagination": {
+    "page": 1,
+    "pages": 1,
+    "per_page": 25,
+    "items": 4,
+    "urls": {}
+  },
+  "results": [
+    {
+      "country": "UK",
+      "year": "2014",
+      "format": ["File", "MP3", "WAV", "Single"],
+      "label": ["Example Records", "Example Distribution"],
+      "type": "release",
+      "genre": ["Electronic"],
+      "style": ["Progressive House", "Tech House"],
+      "id": 9000001,
+      "barcode": [],
+      "master_id": 9100001,
+      "master_url": "https://api.discogs.com/masters/9100001",
+      "uri": "/release/9000001-Example-Artist-Example-Track",
+      "catno": "EX001",
+      "title": "Example Artist (2) - Example Track",
+      "thumb": "",
+      "cover_image": "",
+      "resource_url": "https://api.discogs.com/releases/9000001",
+      "format_quantity": 1,
+      "formats": [{"name": "File", "qty": "1", "descriptions": ["MP3", "Single"]}]
+    },
+    {
+      "country": "Germany",
+      "year": "",
+      "format": ["Vinyl", "12\"", "33 ⅓ RPM"],
+      "label": null,
+      "type": "release",
+      "genre": ["Electronic"],
+      "style": null,
+      "id": 9000002,
+      "catno": "none",
+      "title": "Example Artist (2) - Example Track (Remixes)",
+      "country_code": null
+    },
+    {
+      "type": "master",
+      "id": 9100001,
+      "title": "Example Artist (2) - Example Track",
+      "year": "2014"
+    },
+    {
+      "type": "release",
+      "id": 9000003,
+      "title": "Various - Example Compilation",
+      "year": 2015,
+      "label": ["Not On Label"],
+      "catno": "",
+      "country": null
+    }
+  ]
+}
