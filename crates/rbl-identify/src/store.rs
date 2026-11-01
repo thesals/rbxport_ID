@@ -754,6 +754,17 @@ impl Store {
     pub fn set_state(&self, result: ResultId, state: ReviewState) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
         let from = current_state(&tx, result)?;
+        // While a write is open the result must stay Accepted: otherwise a
+        // file that was written could never be completed (complete_application
+        // needs Accepted) nor truthfully abandoned, and so never undone.
+        let track: TrackId = tx
+            .query_row("SELECT track_id FROM results WHERE id = ?1", [result], |r| r.get(0))
+            .map_err(|e| sql("read the result", &e))?;
+        if has_open_application(&tx, track)? {
+            return Err(IdentifyError::Store(format!(
+                "result {result}: a write is in progress; it must be completed or abandoned first"
+            )));
+        }
         if !from.may_become(state) {
             return Err(IdentifyError::Store(format!(
                 "result {result} cannot go from {} to {}",
@@ -1511,6 +1522,23 @@ mod tests {
         assert_eq!(stored_v1, v1);
         assert!(json.len() < 1_000, "no base64 in the JSON part ({} bytes)", json.len());
         assert_eq!(store.application_snapshot(app).unwrap(), Some(before));
+    }
+
+    #[test]
+    fn no_state_change_while_a_write_is_open() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, result) = reviewed(&store, "a.mp3", 0.8);
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let app = store.begin_application(result, &proposal().changes, None, &snapshot("Before"), None).unwrap();
+        for state in [ReviewState::Rejected, ReviewState::Pending] {
+            let err = store.set_state(result, state).unwrap_err().to_string();
+            assert!(err.contains("write is in progress"), "{state:?}: {err}");
+        }
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Accepted);
+        // Completing the write lifts it; undo then works as before.
+        let after = TrackKey { file_size: 2_000, modified_unix: 1_800_000_000, ..key("a.mp3") };
+        store.complete_application(app, &after).unwrap();
+        store.set_state(result, ReviewState::Undone).unwrap();
     }
 
     #[test]
