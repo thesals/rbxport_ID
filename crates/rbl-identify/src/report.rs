@@ -17,8 +17,9 @@ use serde::Serialize;
 use crate::decide;
 use crate::error::{IdentifyError, Result};
 use crate::mixname::{self, MixAgreement};
-use crate::model::{CandidateSource, Decision};
+use crate::model::{Candidate, CandidateSource, Decision};
 use crate::normalize;
+use crate::score;
 use crate::pipeline::TrackResult;
 
 /// Artist overlap needed for a match: credits are written differently
@@ -27,11 +28,23 @@ const ARTIST_MATCH: f64 = 0.7;
 const TITLE_MATCH: f64 = 0.85;
 
 /// One ground-truth row: what the track is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroundTruth {
     pub artist: String,
     /// The full title, mix included.
     pub title: String,
+    /// `mainstream` and `expect_unidentified`: yes/no, `None` when the cell
+    /// (or the column) is empty.
+    pub mainstream: Option<bool>,
+    pub expect_unidentified: Option<bool>,
+}
+
+fn yes_no(cell: &str) -> Option<bool> {
+    match cell.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" | "true" | "1" => Some(true),
+        "no" | "n" | "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -53,19 +66,31 @@ impl Verdict {
     }
 }
 
-/// Reads `ground_truth.csv`: the `file`, `artist` and `title` columns, keyed
-/// by `file`.
+/// Reads `ground_truth.csv`, keyed by `file`: the required `file`, `artist`
+/// and `title` columns, and the optional `mainstream` and
+/// `expect_unidentified` ones.
 pub fn load_ground_truth(path: &Path) -> Result<HashMap<String, GroundTruth>> {
     let text = std::fs::read_to_string(path)?;
     let rows = parse_csv(text.trim_start_matches('\u{feff}'));
     let mut rows = rows.into_iter();
     let header = rows.next().ok_or_else(|| malformed("empty file"))?;
-    let column = |name: &str| header.iter().position(|h| h == name).ok_or_else(|| malformed(&format!("no `{name}` column")));
+    let optional = |name: &str| header.iter().position(|h| h == name);
+    let column = |name: &str| optional(name).ok_or_else(|| malformed(&format!("no `{name}` column")));
     let (file, artist, title) = (column("file")?, column("artist")?, column("title")?);
+    let (mainstream, expect_unidentified) = (optional("mainstream"), optional("expect_unidentified"));
     let cell = |row: &[String], i: usize| row.get(i).cloned().unwrap_or_default();
+    let flag = |row: &[String], i: Option<usize>| i.and_then(|i| yes_no(&cell(row, i)));
     Ok(rows
         .filter(|row| row.iter().any(|c| !c.is_empty()))
-        .map(|row| (cell(&row, file), GroundTruth { artist: cell(&row, artist), title: cell(&row, title) }))
+        .map(|row| {
+            let truth = GroundTruth {
+                artist: cell(&row, artist),
+                title: cell(&row, title),
+                mainstream: flag(&row, mainstream),
+                expect_unidentified: flag(&row, expect_unidentified),
+            };
+            (cell(&row, file), truth)
+        })
         .collect())
 }
 
@@ -81,21 +106,22 @@ pub fn judge(result: &TrackResult, truth: Option<&GroundTruth>) -> Verdict {
         return Verdict::Unidentified;
     }
     let Some(best) = result.best() else { return Verdict::Unidentified };
-    if is_match(truth, &best.candidate.artist_credit, &best.candidate.title, &best.candidate.disambiguation) {
+    if is_match(truth, &best.candidate) {
         Verdict::Correct
     } else {
         Verdict::Wrong
     }
 }
 
-/// Artist, base title and mix all agree.
+/// Artist, base title and mix all agree, the candidate's mix taken as
+/// scoring sees it (remixers included).
 #[must_use]
-pub fn is_match(truth: &GroundTruth, artist: &str, title: &str, disambiguation: &str) -> bool {
+pub fn is_match(truth: &GroundTruth, candidate: &Candidate) -> bool {
     let ours = mixname::parse_title(&truth.title);
-    let theirs = mixname::parse_candidate(title, disambiguation);
+    let theirs = score::candidate_mix(candidate);
     let (our_base, _) = normalize::strip_featuring(&ours.base);
     let (their_base, _) = normalize::strip_featuring(&theirs.base);
-    normalize::artist_similarity(&truth.artist, artist) >= ARTIST_MATCH
+    normalize::artist_similarity(&truth.artist, &candidate.artist_credit) >= ARTIST_MATCH
         && normalize::similarity(&our_base, &their_base) >= TITLE_MATCH
         && matches!(mixname::agree(&ours.mix, &theirs.mix), MixAgreement::Same | MixAgreement::Compatible)
 }
@@ -119,11 +145,31 @@ pub struct Summary {
     /// Tracks AcoustID matched at all, and those it linked to a recording.
     pub acoustid_matched: usize,
     pub acoustid_with_recordings: usize,
+    /// Rows marked `mainstream=yes`, and those with a correct top candidate
+    /// (acceptance: ≥ 80%).
+    pub mainstream: usize,
+    pub mainstream_correct: usize,
+    /// Rows marked `expect_unidentified=yes`, and those that got a decision
+    /// other than unidentified anyway (acceptance: none).
+    pub expect_unidentified: usize,
+    pub expect_unidentified_proposed: usize,
 }
 
 impl Summary {
-    pub fn add(&mut self, result: &TrackResult, verdict: Verdict) {
+    pub fn add(&mut self, result: &TrackResult, verdict: Verdict, truth: Option<&GroundTruth>) {
         self.tracks += 1;
+        if truth.and_then(|t| t.mainstream) == Some(true) {
+            self.mainstream += 1;
+            if verdict == Verdict::Correct {
+                self.mainstream_correct += 1;
+            }
+        }
+        if truth.and_then(|t| t.expect_unidentified) == Some(true) {
+            self.expect_unidentified += 1;
+            if result.decision != Decision::Unidentified {
+                self.expect_unidentified_proposed += 1;
+            }
+        }
         match result.decision {
             Decision::AutoApply => self.auto_apply += 1,
             Decision::Review => self.review += 1,
@@ -169,6 +215,26 @@ impl Summary {
             pct(self.correct, self.tracks)
         );
         let _ = writeln!(out, "score >= {}: {} candidates, {} wrong (must be 0)", decide::AUTO_APPLY_THRESHOLD, self.strong, self.strong_wrong);
+        if self.mainstream == 0 {
+            let _ = writeln!(out, "mainstream correct: n/a (column not filled)");
+        } else {
+            let _ = writeln!(
+                out,
+                "mainstream correct: {} of {} ({:.0}%, must be >= 80%)",
+                self.mainstream_correct,
+                self.mainstream,
+                pct(self.mainstream_correct, self.mainstream)
+            );
+        }
+        if self.expect_unidentified == 0 {
+            let _ = writeln!(out, "expected-unidentified given a candidate: n/a (column not filled)");
+        } else {
+            let _ = writeln!(
+                out,
+                "expected-unidentified given a candidate: {} of {} (must be 0)",
+                self.expect_unidentified_proposed, self.expect_unidentified
+            );
+        }
         let _ = writeln!(
             out,
             "AcoustID: matched {} tracks, {} with a MusicBrainz recording; winner from the fingerprint on {}",
@@ -179,9 +245,11 @@ impl Summary {
 }
 
 /// The per-file CSV: the spec's columns first (file, top candidate, score,
-/// decision, ground-truth match), then the detail behind them.
+/// decision, ground-truth match), then the detail behind them. Files that
+/// could not be read get a `Failed` row with the error, so every file is
+/// listed.
 #[must_use]
-pub fn csv(rows: &[(String, &TrackResult, Verdict)]) -> String {
+pub fn csv(rows: &[(String, &TrackResult, Verdict)], failures: &[(String, String)]) -> String {
     let header = [
         "file", "top_candidate", "score", "decision", "ground_truth_match", "existing_artist", "existing_title", "top_source",
         "top_mbid", "acoustid", "duration", "text", "mix", "rejected", "acoustid_matches", "acoustid_best", "acoustid_recordings",
@@ -219,6 +287,15 @@ pub fn csv(rows: &[(String, &TrackResult, Verdict)]) -> String {
             ],
         );
     }
+    for (file, error) in failures {
+        let mut cells = vec![String::new(); header.len()];
+        cells[0].clone_from(file);
+        "Failed".clone_into(&mut cells[3]);
+        if let Some(last) = cells.last_mut() {
+            last.clone_from(error);
+        }
+        push_row(&mut out, cells);
+    }
     out
 }
 
@@ -228,12 +305,15 @@ fn push_row(out: &mut String, cells: impl IntoIterator<Item = String>) {
     out.push_str("\r\n");
 }
 
-/// RFC 4180: quote when the cell holds a comma, quote or line break.
+/// RFC 4180: quote when the cell holds a comma, quote or line break. Tag
+/// text comes from the files, so a cell Excel would run as a formula
+/// (`=`, `+`, `-`, `@`) is prefixed with `'`.
 fn quote(cell: &str) -> String {
+    let cell = if cell.starts_with(['=', '+', '-', '@']) { format!("'{cell}") } else { cell.to_owned() };
     if cell.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", cell.replace('"', "\"\""))
     } else {
-        cell.to_owned()
+        cell
     }
 }
 
@@ -296,20 +376,73 @@ mod tests {
         let path = dir.path().join("gt.csv");
         std::fs::write(&path, "\u{feff}file,x,artist,title\r\none.mp3,,Deepack,\"The Music (Extended Mix)\"\r\n").unwrap();
         let truth = load_ground_truth(&path).unwrap();
-        assert_eq!(truth["one.mp3"], GroundTruth { artist: "Deepack".into(), title: "The Music (Extended Mix)".into() });
+        assert_eq!(truth["one.mp3"], GroundTruth { artist: "Deepack".into(), title: "The Music (Extended Mix)".into(), ..GroundTruth::default() });
         std::fs::write(&path, "file,artist\r\n").unwrap();
         assert!(load_ground_truth(&path).unwrap_err().to_string().contains("title"));
     }
 
     #[test]
     fn a_remix_is_not_the_original_and_a_credit_spelling_is_forgiven() {
-        let truth = GroundTruth { artist: "Deepack".into(), title: "The Music (Extended Mix)".into() };
-        assert!(is_match(&truth, "Deepack", "The Music (Extended Mix)", ""));
-        assert!(is_match(&truth, "Deepack", "The Music", "extended mix"));
-        assert!(!is_match(&truth, "Deepack", "The Music (Radio Edit)", ""));
-        assert!(!is_match(&truth, "Deepack", "The Music (Someone Remix)", ""));
-        assert!(!is_match(&truth, "Someone Else", "The Music (Extended Mix)", ""));
-        let festa = GroundTruth { artist: "Mastiksoul, The Groove, Sing".into(), title: "Festa Feat The Groove (Original Mix)".into() };
-        assert!(is_match(&festa, "Mastiksoul feat. The Groove & Sing", "Festa", ""));
+        let truth = GroundTruth { artist: "Deepack".into(), title: "The Music (Extended Mix)".into(), ..GroundTruth::default() };
+        assert!(is_match(&truth, &cand("Deepack", "The Music (Extended Mix)", "", &[])));
+        assert!(is_match(&truth, &cand("Deepack", "The Music", "extended mix", &[])));
+        assert!(!is_match(&truth, &cand("Deepack", "The Music (Radio Edit)", "", &[])));
+        assert!(!is_match(&truth, &cand("Deepack", "The Music (Someone Remix)", "", &[])));
+        assert!(!is_match(&truth, &cand("Someone Else", "The Music (Extended Mix)", "", &[])));
+        let festa = GroundTruth { artist: "Mastiksoul, The Groove, Sing".into(), title: "Festa Feat The Groove (Original Mix)".into(), ..GroundTruth::default() };
+        assert!(is_match(&festa, &cand("Mastiksoul feat. The Groove & Sing", "Festa", "", &[])));
+    }
+
+    fn cand(artist: &str, title: &str, disambiguation: &str, remixers: &[&str]) -> Candidate {
+        Candidate {
+            recording_mbid: "m".into(),
+            artists: vec![artist.into()],
+            artist_credit: artist.into(),
+            title: title.into(),
+            disambiguation: disambiguation.into(),
+            remixers: remixers.iter().map(|r| (*r).to_owned()).collect(),
+            length_ms: None,
+            isrcs: Vec::new(),
+            genres: Vec::new(),
+            releases: Vec::new(),
+            acoustid_score: Some(1.0),
+            source: CandidateSource::Fingerprint,
+        }
+    }
+
+    #[test]
+    fn judging_sees_remixers_as_scoring_does() {
+        let original = GroundTruth { artist: "E&G".into(), title: "Spirit (Original Mix)".into(), ..GroundTruth::default() };
+        let remix = GroundTruth { artist: "E&G".into(), title: "Spirit (Aerofoil Remix)".into(), ..GroundTruth::default() };
+        let plain_titled_remix = cand("E&G", "Spirit", "", &["Aerofoil"]);
+        assert!(!is_match(&original, &plain_titled_remix), "a remix known only by its remixer is not the original");
+        assert!(is_match(&remix, &plain_titled_remix));
+    }
+
+    #[test]
+    fn the_optional_columns_are_read_as_yes_or_no() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gt.csv");
+        std::fs::write(&path, "file,artist,title,mainstream,expect_unidentified\r\na.mp3,A,T,yes,\r\nb.mp3,B,U,no,Yes\r\n").unwrap();
+        let truth = load_ground_truth(&path).unwrap();
+        assert_eq!((truth["a.mp3"].mainstream, truth["a.mp3"].expect_unidentified), (Some(true), None));
+        assert_eq!((truth["b.mp3"].mainstream, truth["b.mp3"].expect_unidentified), (Some(false), Some(true)));
+    }
+
+    #[test]
+    fn unfilled_acceptance_columns_report_not_applicable() {
+        let text = Summary::default().render();
+        assert!(text.contains("mainstream correct: n/a"), "{text}");
+        assert!(text.contains("expected-unidentified given a candidate: n/a"), "{text}");
+    }
+
+    #[test]
+    fn failed_files_get_a_row_and_formulas_are_neutralised() {
+        let out = csv(&[], &[("bad.mp3".into(), "=cmd|' /C calc'!A0".into())]);
+        let rows = parse_csv(out.trim_start_matches('\u{feff}'));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1][0], "bad.mp3");
+        assert_eq!(rows[1][3], "Failed");
+        assert!(rows[1].last().unwrap().starts_with("'="), "{:?}", rows[1]);
     }
 }
