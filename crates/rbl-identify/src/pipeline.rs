@@ -19,7 +19,10 @@ use crate::decide;
 use crate::error::Result;
 use crate::fingerprint;
 use crate::mixname;
-use crate::model::{Candidate, CandidateSource, Decision, ExistingTags, ReleaseInfo, Scored};
+use crate::model::{
+    ArtworkRef, Candidate, CandidateSource, Decision, Enrichment, ExistingTags, Field, FieldChange, Proposal, ReleaseInfo,
+    Scored, TagSnapshot,
+};
 use crate::musicbrainz::MusicBrainzClient;
 use crate::normalize;
 use crate::score;
@@ -37,6 +40,7 @@ pub const MAX_FULL_LOOKUPS: usize = 4;
 pub struct Settings {
     /// Off by default, as the spec requires.
     pub auto_apply: bool,
+    pub genre: GenrePolicy,
 }
 
 /// The services a run talks to.
@@ -66,8 +70,13 @@ pub struct TrackResult {
     /// Ranked, best first.
     pub candidates: Vec<Scored>,
     pub decision: Decision,
-    /// The tags the best candidate proposes, when one is worth reviewing.
-    pub proposed: Option<ExistingTags>,
+    /// The file's exact original values, for the store and undo.
+    pub snapshot: TagSnapshot,
+    /// What the best candidate would change, field by field, when one is
+    /// worth reviewing.
+    pub proposal: Option<Proposal>,
+    /// What Discogs added to the best candidate, when it matched.
+    pub enrichment: Option<Enrichment>,
     /// Stage failures that did not stop the track (a service down, a
     /// fingerprint that could not be computed). Never contain a secret.
     pub warnings: Vec<String>,
@@ -137,18 +146,24 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
         ranked.iter().filter(|s| s.score < decide::REVIEW_THRESHOLD).map(|s| s.candidate.clone()).collect();
     let ranked = score::rank(&existing, duration_secs, resolved.into_iter().chain(below).collect());
 
-    // 5. Decide.
-    let proposed = ranked.first().filter(|b| b.score >= decide::REVIEW_THRESHOLD).map(|b| propose(&existing, &b.candidate));
-    let fills_only_empty = proposed.as_ref().is_some_and(|p| decide::fills_only_empty(&existing, p));
+    // 5. Propose and decide. (Discogs enrichment and artwork join here.)
+    let enrichment: Option<Enrichment> = None;
+    let proposal = ranked
+        .first()
+        .filter(|b| b.score >= decide::REVIEW_THRESHOLD)
+        .map(|b| propose(&existing, &info.snapshot, &b.candidate, enrichment.as_ref(), None, settings.genre));
+    let fills_only_empty = proposal.as_ref().is_some_and(Proposal::fills_only_empty);
     let decision = decide::decide(ranked.first(), fills_only_empty, settings.auto_apply);
     Ok(TrackResult {
         path: path.to_owned(),
         existing,
+        snapshot: info.snapshot,
         duration_secs,
         fingerprint: outcome,
         candidates: ranked,
         decision,
-        proposed,
+        proposal,
+        enrichment,
         warnings,
     })
 }
@@ -206,34 +221,102 @@ fn from_acoustid(score: f64, recording: &AcoustIdRecording) -> Candidate {
     }
 }
 
-/// The tags a candidate proposes. Only fields the candidate knows are
-/// proposed; the rest keep the file's values. Genre is left alone in
-/// Phase 1 (Discogs styles fill it in Phase 2), and key, BPM and analysis
-/// are never touched by identification at all.
+/// How Discogs styles reach the Genre tag. Key, BPM and analysis are never
+/// touched by identification whatever the policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum GenrePolicy {
+    /// The spec's default: styles joined with "; " fill an empty Genre; a
+    /// genre the user set is left alone.
+    #[default]
+    FillEmpty,
+    /// Styles replace whatever Genre holds.
+    Replace,
+    /// Genre is never proposed.
+    Never,
+}
+
+/// What a candidate (and Discogs, when it matched) would change, field by
+/// field, against the file's exact current values. Only fields that differ
+/// are listed. Artwork is proposed only for a file without any.
+///
+/// When the MusicBrainz release ID changes, Picard's release-bound IDs
+/// already in the file (release track, album artist) are proposed for
+/// clearing, so the file never carries IDs that contradict each other.
 #[must_use]
-pub fn propose(existing: &ExistingTags, candidate: &Candidate) -> ExistingTags {
-    let mut proposed = existing.clone();
-    if !candidate.artist_credit.is_empty() {
-        proposed.artist.clone_from(&candidate.artist_credit);
+pub fn propose(
+    existing: &ExistingTags,
+    snapshot: &TagSnapshot,
+    candidate: &Candidate,
+    enrichment: Option<&Enrichment>,
+    artwork: Option<ArtworkRef>,
+    genre: GenrePolicy,
+) -> Proposal {
+    let release = preferred_release(&candidate.releases);
+    let enriched = |pick: fn(&Enrichment) -> &str| enrichment.map(pick).filter(|v| !v.is_empty()).map(str::to_owned);
+    let release_text = |pick: fn(&ReleaseInfo) -> &str| release.map(pick).filter(|v| !v.is_empty()).map(str::to_owned);
+    let year = release
+        .and_then(|r| r.date.get(..4))
+        .map(str::to_owned)
+        .or_else(|| enrichment.and_then(|e| e.year).map(|y| y.to_string()));
+    let styles = enrichment.map(|e| e.styles.join("; ")).filter(|s| !s.is_empty());
+    let genre = match genre {
+        GenrePolicy::FillEmpty => styles.filter(|_| existing.genre.trim().is_empty()),
+        GenrePolicy::Replace => styles,
+        GenrePolicy::Never => None,
+    };
+
+    let mut wanted: Vec<(Field, Option<String>)> = vec![
+        (Field::Artist, Some(candidate.artist_credit.clone()).filter(|v| !v.is_empty())),
+        (Field::Title, Some(proposed_title(existing, candidate)).filter(|v| !v.is_empty())),
+        (Field::Album, release_text(|r| &r.title)),
+        // Discogs is the better source for label and catalog number: Beatport
+        // releases are thinly documented in MusicBrainz.
+        (Field::Label, enriched(|e| &e.label).or_else(|| release_text(|r| &r.label))),
+        (Field::CatalogNumber, enriched(|e| &e.catalog_number).or_else(|| release_text(|r| &r.catalog_number))),
+        (Field::Year, year),
+        (Field::Isrc, candidate.isrcs.first().cloned()),
+        (Field::Genre, genre),
+        (Field::MbRecordingId, Some(candidate.recording_mbid.clone()).filter(|v| !v.is_empty())),
+        (Field::MbReleaseId, release_text(|r| &r.mbid)),
+        (Field::MbReleaseGroupId, release_text(|r| &r.release_group_mbid)),
+        (Field::DiscogsReleaseId, enrichment.and_then(|e| e.discogs_release_id).map(|id| id.to_string())),
+    ];
+    let new_release = wanted.iter().find(|(f, _)| *f == Field::MbReleaseId).and_then(|(_, v)| v.clone());
+    if new_release.is_some_and(|new| new != current(snapshot, Field::MbReleaseId)) {
+        wanted.push((Field::MbReleaseTrackId, Some(String::new())));
+        wanted.push((Field::MbAlbumArtistId, Some(String::new())));
     }
-    if !candidate.title.is_empty() {
-        proposed.title = proposed_title(existing, candidate);
+
+    let changes = wanted
+        .into_iter()
+        .filter_map(|(field, proposed)| {
+            let proposed = proposed?;
+            let current = current(snapshot, field);
+            (!same_value(field, &current, &proposed)).then_some(FieldChange { field, current, proposed })
+        })
+        .collect();
+    Proposal::new(changes, artwork, snapshot.has_artwork)
+}
+
+/// A field's current value as the review screen shows it: every value of
+/// every frame holding it, joined with "; ". Empty when absent.
+fn current(snapshot: &TagSnapshot, field: Field) -> String {
+    snapshot
+        .values
+        .get(&field)
+        .map(|frames| frames.iter().flat_map(|f| f.values.iter().map(String::as_str)).collect::<Vec<_>>().join("; "))
+        .unwrap_or_default()
+}
+
+/// Whether a proposal would change nothing that matters: whitespace aside,
+/// and for Year only the year itself (`2010-00-00` is 2010). Clearing an
+/// already absent field is no change either.
+fn same_value(field: Field, current: &str, proposed: &str) -> bool {
+    let (current, proposed) = (current.trim(), proposed.trim());
+    match field {
+        Field::Year => current.get(..4).unwrap_or(current) == proposed.get(..4).unwrap_or(proposed),
+        _ => current == proposed,
     }
-    if let Some(release) = preferred_release(&candidate.releases) {
-        if !release.title.is_empty() {
-            proposed.album.clone_from(&release.title);
-        }
-        if !release.label.is_empty() {
-            proposed.label.clone_from(&release.label);
-        }
-        if let Some(year) = release.date.get(..4).and_then(|y| y.parse().ok()) {
-            proposed.year = Some(year);
-        }
-    }
-    if let Some(isrc) = candidate.isrcs.first() {
-        proposed.isrc.clone_from(isrc);
-    }
-    proposed
 }
 
 /// `Title (Mix)`, the mix taken as scoring saw it (remixers included):
@@ -330,6 +413,83 @@ mod tests {
 
     fn file(title: &str) -> ExistingTags {
         ExistingTags { title: title.into(), ..ExistingTags::default() }
+    }
+
+    fn snapshot(fields: &[(Field, &str, &str)]) -> TagSnapshot {
+        let mut snap = TagSnapshot::default();
+        for (field, frame, value) in fields {
+            snap.values.entry(*field).or_default().push(crate::model::FrameValues {
+                frame: (*frame).to_owned(),
+                values: vec![(*value).to_owned()],
+            });
+        }
+        snap
+    }
+
+    fn with_release(mut c: Candidate, mbid: &str, date: &str) -> Candidate {
+        c.releases = vec![ReleaseInfo { mbid: mbid.into(), title: "Album".into(), date: date.into(), ..ReleaseInfo::default() }];
+        c
+    }
+
+    fn change_for(proposal: &Proposal, field: Field) -> Option<&FieldChange> {
+        proposal.changes.iter().find(|c| c.field == field)
+    }
+
+    #[test]
+    fn an_unparseable_present_year_is_never_an_empty_fill() {
+        // What tags::read records for the test set's TDRC "2010-00-00".
+        let snap = snapshot(&[(Field::Year, "TDRC", "2010-00-00")]);
+        let same = propose(&file(""), &snap, &with_release(candidate("x", "", &[]), "", "2010"), None, None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&same, Field::Year), None, "the same year is no change");
+        let other = propose(&file(""), &snap, &with_release(candidate("x", "", &[]), "", "2011"), None, None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&other, Field::Year).unwrap().current, "2010-00-00");
+        assert!(!other.fills_only_empty());
+    }
+
+    #[test]
+    fn a_new_release_clears_stale_release_bound_picard_ids() {
+        let snap = snapshot(&[
+            (Field::MbReleaseId, "TXXX:MusicBrainz Album Id", "old-release"),
+            (Field::MbReleaseTrackId, "TXXX:MusicBrainz Release Track Id", "old-track"),
+        ]);
+        let proposal =
+            propose(&file(""), &snap, &with_release(candidate("x", "", &[]), "new-release", ""), None, None, GenrePolicy::FillEmpty);
+        let cleared = change_for(&proposal, Field::MbReleaseTrackId).unwrap();
+        assert_eq!((cleared.current.as_str(), cleared.proposed.as_str()), ("old-track", ""));
+        assert_eq!(change_for(&proposal, Field::MbAlbumArtistId), None, "an absent ID needs no clearing");
+        // The same release: nothing to clear.
+        let same =
+            propose(&file(""), &snap, &with_release(candidate("x", "", &[]), "old-release", ""), None, None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&same, Field::MbReleaseTrackId), None);
+    }
+
+    #[test]
+    fn styles_fill_only_an_empty_genre_by_default() {
+        let enrichment = Enrichment { styles: vec!["Tech House".into(), "Minimal".into()], ..Enrichment::default() };
+        let c = candidate("x", "", &[]);
+        let set = ExistingTags { genre: "House".into(), ..ExistingTags::default() };
+        let kept = propose(&set, &snapshot(&[(Field::Genre, "TCON", "House")]), &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&kept, Field::Genre), None);
+        let filled = propose(&file(""), &TagSnapshot::default(), &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&filled, Field::Genre).unwrap().proposed, "Tech House; Minimal");
+        let replaced = propose(&set, &snapshot(&[(Field::Genre, "TCON", "House")]), &c, Some(&enrichment), None, GenrePolicy::Replace);
+        assert_eq!(change_for(&replaced, Field::Genre).unwrap().proposed, "Tech House; Minimal");
+    }
+
+    #[test]
+    fn discogs_label_and_catalog_number_win_and_unchanged_fields_are_left_out() {
+        let enrichment = Enrichment {
+            discogs_release_id: Some(42),
+            label: "Fraction Records".into(),
+            catalog_number: "FRA224".into(),
+            ..Enrichment::default()
+        };
+        let snap = snapshot(&[(Field::Artist, "TPE1", "E&G"), (Field::CatalogNumber, "TXXX:Catalog #", "")]);
+        let proposal = propose(&file(""), &snap, &candidate("Spirit", "", &[]), Some(&enrichment), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&proposal, Field::Artist), None, "the same artist is not a change");
+        assert_eq!(change_for(&proposal, Field::Label).unwrap().proposed, "Fraction Records");
+        assert_eq!(change_for(&proposal, Field::CatalogNumber).unwrap().proposed, "FRA224");
+        assert_eq!(change_for(&proposal, Field::DiscogsReleaseId).unwrap().proposed, "42");
     }
 
     #[test]
