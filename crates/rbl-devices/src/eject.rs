@@ -123,7 +123,7 @@ fn platform_eject(path: &Path) -> io::Result<()> {
                 0,
                 std::ptr::null_mut(),
                 0,
-                &mut returned,
+                &raw mut returned,
                 std::ptr::null_mut(),
             )
         };
