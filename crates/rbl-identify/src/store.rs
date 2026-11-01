@@ -4,15 +4,22 @@
 //! It is never rekordbox's `master.db`: [`Store::open`] refuses a file that
 //! is not an identify store, and nothing here knows a passphrase.
 //!
-//! The heart of it is undo. Every write to a file is recorded with the
-//! tags the file had just before it ([`Store::record_applied`] requires
-//! that `before` snapshot), so undoing a write restores exactly what that
-//! write replaced ([`Store::application_snapshot`]), hand edits made between
-//! two writes included. The track's ORIGINAL tags are the before-snapshot of
-//! its earliest write ([`Store::original_snapshot`]). Snapshots are
-//! immutable: triggers make the database itself refuse any UPDATE, DELETE or
-//! second INSERT of one, and the applications they belong to cannot be
-//! changed or deleted either.
+//! The heart of it is undo. Every write to a file is recorded in two steps
+//! around the write itself: [`Store::begin_application`] commits what will
+//! be written together with the tags the file has just before it (the
+//! `before` snapshot) BEFORE the file is touched, and
+//! [`Store::complete_application`] or [`Store::abandon_application`] records
+//! how it ended. A crash or a full disk between the two leaves an open
+//! application whose before-state is already safe ([`Store::open_applications`]
+//! lists them for reconciliation), never a write that cannot be undone.
+//! Undoing a write restores exactly what that write replaced
+//! ([`Store::application_snapshot`]), hand edits made between two writes
+//! included. The track's ORIGINAL tags are the before-snapshot of its
+//! earliest written application ([`Store::original_snapshot`]).
+//!
+//! Applications, their snapshots and their outcomes are insert-only:
+//! triggers make the database itself refuse any UPDATE, DELETE or second
+//! INSERT of one.
 //!
 //! Snapshots are taken only for writes, not for every track scanned: the raw
 //! ID3 block includes embedded artwork, and a whole library of those would
@@ -84,35 +91,62 @@ CREATE TABLE results (
 CREATE UNIQUE INDEX results_one_current ON results(track_id) WHERE is_current = 1;
 CREATE INDEX results_current_state ON results(state, score) WHERE is_current = 1;
 
--- Each time a result's changes were written to the file: exactly what was
--- written (the user may have unticked fields). A re-apply after an undo adds
--- a row rather than replacing one.
+-- Each write of a result's changes, begun before the file is touched:
+-- exactly what is to be written (the user may have unticked fields). How it
+-- ended is in application_outcomes; none yet means it is still open. A
+-- re-apply after an undo adds a row rather than replacing one.
 CREATE TABLE applications (
     id            INTEGER PRIMARY KEY,
     result_id     INTEGER NOT NULL REFERENCES results(id),
     -- Vec<FieldChange>, JSON.
     changes_json  TEXT    NOT NULL,
-    -- ArtworkRef, JSON; NULL when no artwork was written.
+    -- ArtworkRef, JSON; NULL when no artwork is written.
     artwork_json  TEXT,
-    -- The file right after the write, so a later change by something else
-    -- can be told apart before undoing.
-    file_size_after      INTEGER NOT NULL,
-    modified_unix_after  INTEGER NOT NULL,
     -- The library side of the change (rekordbox content ID and previous
     -- values), JSON the store keeps without reading. NULL when none.
     library_snapshot     TEXT,
-    applied_unix  INTEGER NOT NULL
+    begun_unix    INTEGER NOT NULL
 );
 CREATE INDEX applications_result ON applications(result_id);
 -- What was written, and so what undo works from, is never rewritten.
 CREATE TRIGGER applications_never_update BEFORE UPDATE ON applications
-BEGIN SELECT RAISE(ABORT, 'an applied change is a permanent record'); END;
+BEGIN SELECT RAISE(ABORT, 'an application is a permanent record'); END;
 CREATE TRIGGER applications_never_delete BEFORE DELETE ON applications
-BEGIN SELECT RAISE(ABORT, 'an applied change is a permanent record'); END;
+BEGIN SELECT RAISE(ABORT, 'an application is a permanent record'); END;
+-- INSERT OR REPLACE deletes the old row without firing DELETE triggers
+-- (unless recursive_triggers is on), so these insert-only tables refuse a
+-- second insert of a key here, whatever its conflict clause.
+CREATE TRIGGER applications_never_replace BEFORE INSERT ON applications
+WHEN EXISTS (SELECT 1 FROM applications WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'an application is a permanent record'); END;
 
--- The file's tags just before each write: what undoing that write restores.
--- One row per application, inserted with it, never updated or deleted. The
--- track's original tags are the snapshot of its earliest application.
+-- How an application ended: 'written' (the file now holds the changes) or
+-- 'abandoned' (the file was left unchanged or put back). One row each,
+-- never updated or deleted.
+CREATE TABLE application_outcomes (
+    application_id       INTEGER PRIMARY KEY REFERENCES applications(id),
+    outcome              TEXT    NOT NULL CHECK (outcome IN ('written', 'abandoned')),
+    -- The file right after a write, so a later change by something else can
+    -- be told apart before undoing. NULL when abandoned.
+    file_size_after      INTEGER,
+    modified_unix_after  INTEGER,
+    -- Why it was abandoned. NULL when written.
+    reason               TEXT,
+    completed_unix       INTEGER NOT NULL,
+    CHECK ((outcome = 'written') = (file_size_after IS NOT NULL AND modified_unix_after IS NOT NULL))
+);
+CREATE TRIGGER application_outcomes_never_update BEFORE UPDATE ON application_outcomes
+BEGIN SELECT RAISE(ABORT, 'an application outcome is a permanent record'); END;
+CREATE TRIGGER application_outcomes_never_delete BEFORE DELETE ON application_outcomes
+BEGIN SELECT RAISE(ABORT, 'an application outcome is a permanent record'); END;
+CREATE TRIGGER application_outcomes_never_replace BEFORE INSERT ON application_outcomes
+WHEN EXISTS (SELECT 1 FROM application_outcomes WHERE application_id = NEW.application_id)
+BEGIN SELECT RAISE(ABORT, 'an application outcome is a permanent record'); END;
+
+-- The file's tags just before each write, committed with the application
+-- before the file is touched: what undoing that write restores. One row per
+-- application, never updated or deleted. The track's original tags are the
+-- snapshot of its earliest written application.
 CREATE TABLE application_snapshots (
     application_id INTEGER PRIMARY KEY REFERENCES applications(id),
     -- TagSnapshot without raw_id3 (format, values, has_artwork), JSON.
@@ -128,9 +162,6 @@ CREATE TRIGGER application_snapshots_never_update BEFORE UPDATE ON application_s
 BEGIN SELECT RAISE(ABORT, 'a tag snapshot is immutable'); END;
 CREATE TRIGGER application_snapshots_never_delete BEFORE DELETE ON application_snapshots
 BEGIN SELECT RAISE(ABORT, 'a tag snapshot is immutable'); END;
--- INSERT OR REPLACE deletes the old row without firing DELETE triggers
--- (unless recursive_triggers is on), so a second insert for an application
--- is refused here, whatever its conflict clause.
 CREATE TRIGGER application_snapshots_never_replace BEFORE INSERT ON application_snapshots
 WHEN EXISTS (SELECT 1 FROM application_snapshots WHERE application_id = NEW.application_id)
 BEGIN SELECT RAISE(ABORT, 'a tag snapshot is immutable'); END;
@@ -173,7 +204,7 @@ pub struct TrackKey {
 /// | from          | to                                            |
 /// |---------------|-----------------------------------------------|
 /// | `Pending`     | `Accepted`, `Rejected`                        |
-/// | `Accepted`    | `Pending`, `Rejected`; `Applied` or `AutoApplied` only through [`Store::record_applied`] |
+/// | `Accepted`    | `Pending`, `Rejected`; `Applied` or `AutoApplied` only through [`Store::complete_application`] |
 /// | `Rejected`    | `Pending`                                     |
 /// | `Applied`     | `Undone`                                      |
 /// | `AutoApplied` | `Undone`                                      |
@@ -184,7 +215,7 @@ pub struct TrackKey {
 /// track's current result changes state.
 ///
 /// A result the decision marked for auto-apply starts `Accepted`, like one
-/// the user accepted; `record_applied` then makes it `AutoApplied` (the
+/// the user accepted; `complete_application` then makes it `AutoApplied` (the
 /// stored decision tells the two apart). So a write that fails leaves it
 /// `Accepted` with nothing recorded, and `Applied`/`AutoApplied` exist only
 /// with the record of what was written.
@@ -233,7 +264,7 @@ impl ReviewState {
 
     /// Whether [`Store::set_state`] may move a result from `self` to `to`.
     /// `Applied` and `AutoApplied` are never reached this way: only
-    /// [`Store::record_applied`], which records what was written, sets them.
+    /// [`Store::complete_application`], which records the write, sets them.
     #[must_use]
     pub fn may_become(self, to: Self) -> bool {
         use ReviewState::{Accepted, Applied, AutoApplied, Pending, Rejected, Undone};
@@ -325,20 +356,105 @@ pub struct QueueItem {
 /// Discogs enrichment and the warnings.
 pub type ResultDetail = (QueueItem, Vec<Scored>, Option<Enrichment>, Vec<String>);
 
-/// One time a result's changes were written.
+/// One write of a result's changes, from [`Store::begin_application`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Application {
     pub id: ApplicationId,
-    /// Exactly what was written.
+    pub result: ResultId,
+    /// The file it writes, as the track is keyed.
+    pub path: String,
+    /// Exactly what is (or was) written.
     pub changes: Vec<FieldChange>,
     pub artwork: Option<ArtworkRef>,
-    /// The file right after the write: a different size or time later means
-    /// something else changed it since, and undo must not blindly restore.
-    pub file_after: TrackKey,
     /// The library side of the change (rekordbox content ID and previous
     /// values), JSON the store keeps without reading.
     pub library_snapshot: Option<String>,
-    pub applied_unix: i64,
+    pub begun_unix: i64,
+    /// `None` while the application is open.
+    pub outcome: Option<Outcome>,
+}
+
+/// How an application ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    /// The file holds the changes. `file_after` is the file right after the
+    /// write: a different size or time later means something else changed
+    /// it since, and undo must not blindly restore.
+    Written { file_after: TrackKey, completed_unix: i64 },
+    /// The file was left unchanged or put back.
+    Abandoned { reason: String, completed_unix: i64 },
+}
+
+/// The columns [`application_row`] reads, from `applications a`,
+/// `results r`, `tracks t` and `application_outcomes o` (left joined).
+const APPLICATION_COLUMNS: &str = "a.id, a.result_id, t.path, a.changes_json, a.artwork_json, a.library_snapshot, \
+     a.begun_unix, o.outcome, o.file_size_after, o.modified_unix_after, o.reason, o.completed_unix";
+const APPLICATION_FROM: &str = "applications a JOIN results r ON r.id = a.result_id JOIN tracks t ON t.id = r.track_id \
+     LEFT JOIN application_outcomes o ON o.application_id = a.id";
+
+/// An application row as stored, before its text is decoded.
+struct RawApplication {
+    id: ApplicationId,
+    result: ResultId,
+    path: String,
+    changes: String,
+    artwork: Option<String>,
+    library_snapshot: Option<String>,
+    begun_unix: i64,
+    outcome: Option<String>,
+    file_size_after: Option<i64>,
+    modified_unix_after: Option<i64>,
+    reason: Option<String>,
+    completed_unix: Option<i64>,
+}
+
+fn application_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawApplication> {
+    Ok(RawApplication {
+        id: row.get(0)?,
+        result: row.get(1)?,
+        path: row.get(2)?,
+        changes: row.get(3)?,
+        artwork: row.get(4)?,
+        library_snapshot: row.get(5)?,
+        begun_unix: row.get(6)?,
+        outcome: row.get(7)?,
+        file_size_after: row.get(8)?,
+        modified_unix_after: row.get(9)?,
+        reason: row.get(10)?,
+        completed_unix: row.get(11)?,
+    })
+}
+
+impl RawApplication {
+    fn decode(self) -> Result<Application> {
+        let corrupt = || IdentifyError::Store("an application outcome in the store is incomplete".to_owned());
+        let outcome = match self.outcome.as_deref() {
+            None => None,
+            Some("written") => Some(Outcome::Written {
+                file_after: TrackKey {
+                    path: self.path.clone(),
+                    file_size: self.file_size_after.and_then(|n| u64::try_from(n).ok()).ok_or_else(corrupt)?,
+                    modified_unix: self.modified_unix_after.ok_or_else(corrupt)?,
+                },
+                completed_unix: self.completed_unix.ok_or_else(corrupt)?,
+            }),
+            Some("abandoned") => Some(Outcome::Abandoned {
+                reason: self.reason.unwrap_or_default(),
+                completed_unix: self.completed_unix.ok_or_else(corrupt)?,
+            }),
+            Some(_) => return Err(IdentifyError::Store("unknown application outcome in the store".to_owned())),
+        };
+        Ok(Application {
+            id: self.id,
+            result: self.result,
+            path: self.path,
+            changes: from_json(&self.changes, "applied changes")?,
+            artwork: self.artwork.as_deref().map(|a| from_json(a, "artwork")).transpose()?,
+            library_snapshot: self.library_snapshot,
+            begun_unix: self.begun_unix,
+            outcome,
+        })
+    }
 }
 
 const QUEUE_COLUMNS: &str = "t.id, r.id, t.path, r.state, r.decision, r.score, t.existing_json, r.proposal_json, r.updated_unix";
@@ -490,7 +606,7 @@ impl Store {
 impl Store {
     /// Records a track as just read: inserts it, or updates its latest
     /// size, time, duration, fingerprint and tags. Takes no snapshot: those
-    /// belong to writes ([`Store::record_applied`]).
+    /// belong to writes ([`Store::begin_application`]).
     pub fn upsert_track(
         &self,
         key: &TrackKey,
@@ -526,10 +642,11 @@ impl Store {
     }
 
     /// The track's ORIGINAL tags: the before-snapshot of its earliest
-    /// recorded write, exactly as taken. `None` until it has been written.
-    /// Later writes, undos and re-identifications never change it; this is
-    /// the "restore original" path, while undoing one write restores
-    /// [`Store::application_snapshot`].
+    /// application with outcome written, exactly as taken. `None` until one
+    /// has been written; an open or abandoned application does not count
+    /// (the file may never have changed). Later writes, undos and
+    /// re-identifications never change it; this is the "restore original"
+    /// path, while undoing one write restores [`Store::application_snapshot`].
     pub fn original_snapshot(&self, id: TrackId) -> Result<Option<TagSnapshot>> {
         read_snapshot(
             &self.conn,
@@ -537,13 +654,16 @@ impl Store {
              FROM application_snapshots s
              JOIN applications a ON a.id = s.application_id
              JOIN results r ON r.id = a.result_id
+             JOIN application_outcomes o ON o.application_id = a.id AND o.outcome = 'written'
              WHERE r.track_id = ?1 ORDER BY a.id LIMIT 1",
             id,
         )
     }
 
-    /// The file's tags just before this write, exactly as taken: what undoing
-    /// it restores.
+    /// The file's tags just before this application, exactly as taken: what
+    /// undoing it restores, and what reconciling an open one compares
+    /// against. Available from [`Store::begin_application`] on, whatever the
+    /// outcome.
     pub fn application_snapshot(&self, application: ApplicationId) -> Result<Option<TagSnapshot>> {
         read_snapshot(
             &self.conn,
@@ -563,11 +683,11 @@ impl Store {
 
     /// Stores a new identification of a track as its current result; the
     /// previous one stays as history. Starts `Pending`; `Unidentified` for
-    /// that decision; `Accepted` for `AutoApply`, which [`Store::record_applied`]
-    /// turns into `AutoApplied` once written. A track whose current result has
+    /// that decision; `Accepted` for `AutoApply`, which
+    /// [`Store::complete_application`] turns into `AutoApplied` once written. A track whose current result has
     /// been applied (`Applied` or `AutoApplied`) keeps it unless
     /// `allow_replacing_applied`: replacing it would hide the undo for tags
-    /// already written.
+    /// already written. Refused while the track has an open application.
     #[allow(clippy::too_many_arguments)] // the contract's shape
     pub fn save_result(
         &self,
@@ -590,6 +710,11 @@ impl Store {
             .query_row("SELECT state FROM results WHERE track_id = ?1 AND is_current = 1", [id], |r| r.get(0))
             .optional()
             .map_err(|e| sql("read the current result", &e))?;
+        if has_open_application(&tx, id)? {
+            return Err(IdentifyError::Store(format!(
+                "track {id} has a write in progress; complete or abandon it before identifying again"
+            )));
+        }
         if let Some(state) = current.as_deref().map(ReviewState::parse).transpose()? {
             if state.is_applied() && !allow_replacing_applied {
                 return Err(IdentifyError::Store(format!(
@@ -640,31 +765,27 @@ impl Store {
         tx.commit().map_err(|e| sql("commit the state", &e))
     }
 
-    /// Records that `applied` (exactly what was written; the user may have
-    /// unticked some of the proposal) and `artwork` went into the file, which
-    /// had the tags in `before` just before the write (what undoing it will
-    /// restore) and now has the size and time in `file_after`. A write can
-    /// never be recorded without its before-state. A `raw_id3` part that is
-    /// not unpadded standard base64 is refused, storing nothing, since it
-    /// could not be given back identical. Only an `Accepted` result
-    /// can be applied. It becomes `AutoApplied` when its stored decision is
-    /// `AutoApply` and this is its first write; otherwise `Applied` (a user
-    /// accepted it, or re-accepted it after an undo, which is a review).
-    /// `library_snapshot` is the library side of the change, kept as given
-    /// for undo.
-    pub fn record_applied(
+    /// Step one of a write, before the file is touched: commits what will be
+    /// written (`applied`, exactly; the user may have unticked some of the
+    /// proposal, and `artwork`), the file's tags right now (`before`, what
+    /// undoing the write will restore) and the library side of the change.
+    /// The result stays `Accepted` until [`Store::complete_application`].
+    ///
+    /// Refused unless the result is its track's current one and `Accepted`,
+    /// and while the track has another application open. A `raw_id3` part
+    /// that is not unpadded standard base64 is refused, storing nothing,
+    /// since it could not be given back identical.
+    pub fn begin_application(
         &self,
         result: ResultId,
         applied: &[FieldChange],
         artwork: Option<&ArtworkRef>,
         before: &TagSnapshot,
-        file_after: &TrackKey,
         library_snapshot: Option<&str>,
     ) -> Result<ApplicationId> {
         let before = EncodedSnapshot::new(before)?;
         let changes = to_json(applied, "applied changes")?;
         let artwork = artwork.map(|a| to_json(a, "artwork")).transpose()?;
-        let size = file_size(file_after.file_size)?;
         let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
         let from = current_state(&tx, result)?;
         if from != ReviewState::Accepted {
@@ -673,32 +794,24 @@ impl Store {
                 from.as_str()
             )));
         }
-        let decision: String = tx
-            .query_row("SELECT decision FROM results WHERE id = ?1", [result], |r| r.get(0))
-            .map_err(|e| sql("read the result's decision", &e))?;
-        let auto = parse_decision(&decision)? == Decision::AutoApply && !has_application(&tx, result)?;
-        let to = if auto { ReviewState::AutoApplied } else { ReviewState::Applied };
-        let (path, track): (String, TrackId) = tx
-            .query_row(
-                "SELECT t.path, t.id FROM results r JOIN tracks t ON t.id = r.track_id WHERE r.id = ?1",
-                [result],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+        let track: TrackId = tx
+            .query_row("SELECT track_id FROM results WHERE id = ?1", [result], |r| r.get(0))
             .map_err(|e| sql("find the result's track", &e))?;
-        if path != file_after.path {
-            return Err(IdentifyError::Store(format!("result {result} belongs to another file than the one written")));
+        if has_open_application(&tx, track)? {
+            return Err(IdentifyError::Store(format!(
+                "track {track} already has a write in progress; complete or abandon it first"
+            )));
         }
         let now = now_unix();
         let application: ApplicationId = tx
             .query_row(
-                "INSERT INTO applications (result_id, changes_json, artwork_json, file_size_after,
-                                           modified_unix_after, library_snapshot, applied_unix)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO applications (result_id, changes_json, artwork_json, library_snapshot, begun_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  RETURNING id",
-                params![result, changes, artwork, size, file_after.modified_unix, library_snapshot, now],
+                params![result, changes, artwork, library_snapshot, now],
                 |r| r.get(0),
             )
-            .map_err(|e| sql("record the applied changes", &e))?;
+            .map_err(|e| sql("record the application", &e))?;
         tx.execute(
             "INSERT INTO application_snapshots (application_id, snapshot_json, has_raw_id3, raw_id3_v2, raw_id3_v1,
                                                 taken_unix)
@@ -706,54 +819,118 @@ impl Store {
             params![application, before.text, before.has_raw, before.v2, before.v1, now],
         )
         .map_err(|e| sql("record the tag snapshot", &e))?;
-        // The file on disk is now the written one; the next scan must not
-        // read it as a change by someone else.
+        tx.commit().map_err(|e| sql("commit the application", &e))?;
+        Ok(application)
+    }
+
+    /// Step two of a write that succeeded: the file now holds the changes
+    /// and has the size and time in `file_after`. The result becomes
+    /// `AutoApplied` when its stored decision is `AutoApply` and this is its
+    /// first written application, otherwise `Applied` (a user accepted it,
+    /// or re-accepted it after an undo, which is a review). The track takes
+    /// the new size and time, so the next scan does not read the write as
+    /// someone else's change.
+    pub fn complete_application(&self, id: ApplicationId, file_after: &TrackKey) -> Result<()> {
+        let size = file_size(file_after.file_size)?;
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let (result, track, path) = open_application(&tx, id)?;
+        if path != file_after.path {
+            return Err(IdentifyError::Store(format!("application {id} belongs to another file than the one written")));
+        }
+        let from = current_state(&tx, result)?;
+        if from != ReviewState::Accepted {
+            return Err(IdentifyError::Store(format!("result {result} is {}, not accepted", from.as_str())));
+        }
+        let decision: String = tx
+            .query_row("SELECT decision FROM results WHERE id = ?1", [result], |r| r.get(0))
+            .map_err(|e| sql("read the result's decision", &e))?;
+        let auto = parse_decision(&decision)? == Decision::AutoApply && !has_written_application(&tx, result)?;
+        let to = if auto { ReviewState::AutoApplied } else { ReviewState::Applied };
+        tx.execute(
+            "INSERT INTO application_outcomes (application_id, outcome, file_size_after, modified_unix_after,
+                                               completed_unix)
+             VALUES (?1, 'written', ?2, ?3, ?4)",
+            params![id, size, file_after.modified_unix, now_unix()],
+        )
+        .map_err(|e| sql("record the outcome", &e))?;
         tx.execute(
             "UPDATE tracks SET file_size = ?2, modified_unix = ?3 WHERE id = ?1",
             params![track, size, file_after.modified_unix],
         )
         .map_err(|e| sql("update the track", &e))?;
         set_state_unchecked(&tx, result, to)?;
-        tx.commit().map_err(|e| sql("commit the applied changes", &e))?;
-        Ok(application)
+        tx.commit().map_err(|e| sql("commit the outcome", &e))
     }
 
-    /// What was last written for a result; empty when nothing was.
+    /// Step two of a write that did not happen: the file was left unchanged
+    /// (or has been put back to the before-snapshot). The result stays
+    /// `Accepted`; the application is kept, as a record, but never counts
+    /// for undo or the original snapshot.
+    pub fn abandon_application(&self, id: ApplicationId, reason: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        open_application(&tx, id)?;
+        tx.execute(
+            "INSERT INTO application_outcomes (application_id, outcome, reason, completed_unix)
+             VALUES (?1, 'abandoned', ?2, ?3)",
+            params![id, reason, now_unix()],
+        )
+        .map_err(|e| sql("record the outcome", &e))?;
+        tx.commit().map_err(|e| sql("commit the outcome", &e))
+    }
+
+    /// Applications begun but neither completed nor abandoned, oldest first:
+    /// writes interrupted by a crash, a full disk or a lost volume.
+    ///
+    /// The job must reconcile each before writing anything else (Phase 3/4,
+    /// on startup):
+    ///
+    /// 1. Read the file's tags now.
+    /// 2. If they equal the before-snapshot ([`Store::application_snapshot`])
+    ///    the write never happened: [`Store::abandon_application`].
+    /// 3. If they hold every planned change (`changes`, `artwork`) and are
+    ///    otherwise the before-snapshot, the write happened:
+    ///    [`Store::complete_application`] with the file's current size and
+    ///    time.
+    /// 4. Anything else (a partial write, or the file changed since): put
+    ///    the before-snapshot back, then abandon; if that is impossible, leave
+    ///    the application open and tell the user. Never guess.
+    pub fn open_applications(&self) -> Result<Vec<Application>> {
+        let query = format!("SELECT {APPLICATION_COLUMNS} FROM {APPLICATION_FROM} WHERE o.application_id IS NULL ORDER BY a.id");
+        self.applications(&query, [])
+    }
+
+    /// What the last written application of a result wrote; empty when
+    /// nothing was.
     pub fn applied_changes(&self, result: ResultId) -> Result<Vec<FieldChange>> {
         Ok(self.last_application(result)?.map(|a| a.changes).unwrap_or_default())
     }
 
-    /// The last write recorded for a result, with the file's state after it.
-    /// Undoing it restores [`Store::application_snapshot`] of its `id`.
+    /// The last application of a result with outcome written: what undo
+    /// works from (restore [`Store::application_snapshot`] of its `id`, after
+    /// checking the file still matches its `file_after`). Open and abandoned
+    /// applications are ignored.
     pub fn last_application(&self, result: ResultId) -> Result<Option<Application>> {
-        type Row = (ApplicationId, String, Option<String>, String, i64, i64, Option<String>, i64);
-        let row: Option<Row> = self
-            .conn
-            .query_row(
-                "SELECT a.id, a.changes_json, a.artwork_json, t.path, a.file_size_after, a.modified_unix_after,
-                        a.library_snapshot, a.applied_unix
-                 FROM applications a JOIN results r ON r.id = a.result_id JOIN tracks t ON t.id = r.track_id
-                 WHERE a.result_id = ?1 ORDER BY a.id DESC LIMIT 1",
-                [result],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
-            )
-            .optional()
-            .map_err(|e| sql("read the applied changes", &e))?;
-        let Some((id, changes, artwork, path, size, modified_unix, library_snapshot, applied_unix)) = row else {
-            return Ok(None);
-        };
-        Ok(Some(Application {
-            id,
-            changes: from_json(&changes, "applied changes")?,
-            artwork: artwork.as_deref().map(|a| from_json(a, "artwork")).transpose()?,
-            file_after: TrackKey {
-                path,
-                file_size: u64::try_from(size).map_err(|_| IdentifyError::Store("negative file size".to_owned()))?,
-                modified_unix,
-            },
-            library_snapshot,
-            applied_unix,
-        }))
+        let query = format!(
+            "SELECT {APPLICATION_COLUMNS} FROM {APPLICATION_FROM}
+             WHERE a.result_id = ?1 AND o.outcome = 'written' ORDER BY a.id DESC LIMIT 1"
+        );
+        Ok(self.applications(&query, [result])?.pop())
+    }
+
+    /// One application, whatever its outcome.
+    pub fn application(&self, id: ApplicationId) -> Result<Option<Application>> {
+        let query = format!("SELECT {APPLICATION_COLUMNS} FROM {APPLICATION_FROM} WHERE a.id = ?1");
+        Ok(self.applications(&query, [id])?.pop())
+    }
+
+    fn applications<P: rusqlite::Params>(&self, query: &str, params: P) -> Result<Vec<Application>> {
+        let mut stmt = self.conn.prepare(query).map_err(|e| sql("read the applications", &e))?;
+        let rows = stmt
+            .query_map(params, application_row)
+            .map_err(|e| sql("read the applications", &e))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| sql("read the applications", &e))?;
+        rows.into_iter().map(RawApplication::decode).collect()
     }
 
     /// A page of current results, best score first (no score last), then
@@ -880,11 +1057,52 @@ fn set_state_unchecked(conn: &Connection, result: ResultId, state: ReviewState) 
     Ok(())
 }
 
-fn has_application(conn: &Connection, result: ResultId) -> Result<bool> {
-    conn.query_row("SELECT 1 FROM applications WHERE result_id = ?1 LIMIT 1", [result], |_| Ok(()))
+fn has_written_application(conn: &Connection, result: ResultId) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM applications a JOIN application_outcomes o ON o.application_id = a.id
+         WHERE a.result_id = ?1 AND o.outcome = 'written' LIMIT 1",
+        [result],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+    .map_err(|e| sql("read the applications", &e))
+}
+
+/// Whether any application for the track is still open.
+fn has_open_application(conn: &Connection, track: TrackId) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM applications a JOIN results r ON r.id = a.result_id
+         WHERE r.track_id = ?1
+           AND NOT EXISTS (SELECT 1 FROM application_outcomes o WHERE o.application_id = a.id)
+         LIMIT 1",
+        [track],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+    .map_err(|e| sql("read the applications", &e))
+}
+
+/// An application that exists and has no outcome yet: its result, track and
+/// path.
+fn open_application(conn: &Connection, id: ApplicationId) -> Result<(ResultId, TrackId, String)> {
+    let row: Option<(ResultId, TrackId, String, bool)> = conn
+        .query_row(
+            "SELECT a.result_id, t.id, t.path,
+                    EXISTS (SELECT 1 FROM application_outcomes o WHERE o.application_id = a.id)
+             FROM applications a JOIN results r ON r.id = a.result_id JOIN tracks t ON t.id = r.track_id
+             WHERE a.id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()
-        .map(|r| r.is_some())
-        .map_err(|e| sql("read the applied changes", &e))
+        .map_err(|e| sql("read the application", &e))?;
+    match row {
+        None => Err(IdentifyError::Store(format!("no application {id}"))),
+        Some((.., true)) => Err(IdentifyError::Store(format!("application {id} already has an outcome"))),
+        Some((result, track, path, false)) => Ok((result, track, path)),
+    }
 }
 
 fn file_size(size: u64) -> Result<i64> {
@@ -1101,7 +1319,7 @@ mod tests {
         store.set_state(result, ReviewState::Accepted).unwrap();
         let path = store.result(result).unwrap().unwrap().0.path;
         let after = TrackKey { path, file_size: 2_000, modified_unix: 1_800_000_000 };
-        store.record_applied(result, &proposal().changes, None, &snapshot("T"), &after, None).unwrap();
+        record_applied(store, result, &proposal().changes, None, &snapshot("T"), &after, None).unwrap();
     }
 
     #[test]
@@ -1136,6 +1354,22 @@ mod tests {
         assert_eq!(store.track_id("b.mp3").unwrap(), None);
     }
 
+    /// Begins and completes a write in one go: the old one-step shape, for
+    /// tests about everything but the two steps.
+    fn record_applied(
+        store: &Store,
+        result: ResultId,
+        applied: &[FieldChange],
+        artwork: Option<&ArtworkRef>,
+        before: &TagSnapshot,
+        file_after: &TrackKey,
+        library_snapshot: Option<&str>,
+    ) -> Result<ApplicationId> {
+        let app = store.begin_application(result, applied, artwork, before, library_snapshot)?;
+        store.complete_application(app, file_after)?;
+        Ok(app)
+    }
+
     /// Accepts `result` and records a write whose before-state is `before`.
     fn write(store: &Store, result: ResultId, before: &TagSnapshot) -> ApplicationId {
         if store.result(result).unwrap().unwrap().0.state != ReviewState::Accepted {
@@ -1143,7 +1377,7 @@ mod tests {
         }
         let path = store.result(result).unwrap().unwrap().0.path;
         let after = TrackKey { path, file_size: 2_000, modified_unix: 1_800_000_000 };
-        store.record_applied(result, &proposal().changes, None, before, &after, None).unwrap()
+        record_applied(store, result, &proposal().changes, None, before, &after, None).unwrap()
     }
 
     #[test]
@@ -1248,7 +1482,7 @@ mod tests {
         store.set_state(result, ReviewState::Accepted).unwrap();
         for bad in ["not base64!", "SUQz==" /* padded */] {
             let before = TagSnapshot { raw_id3: Some(RawId3 { v2: Some(bad.into()), v1: None }), ..snapshot("x") };
-            assert!(store.record_applied(result, &[], None, &before, &key("a.mp3"), None).is_err(), "{bad}");
+            assert!(record_applied(&store, result, &[], None, &before, &key("a.mp3"), None).is_err(), "{bad}");
         }
         // Nothing half-stored: no application, state unchanged.
         assert_eq!(store.last_application(result).unwrap(), None);
@@ -1331,7 +1565,7 @@ mod tests {
             }
         }
         assert!(!Unidentified.may_become(Pending));
-        assert!(!Accepted.may_become(Applied), "only record_applied reaches Applied");
+        assert!(!Accepted.may_become(Applied), "only complete_application reaches Applied");
     }
 
     #[test]
@@ -1354,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn record_applied_keeps_exactly_what_was_written() {
+    fn an_application_keeps_exactly_what_was_written() {
         let store = Store::open_in_memory().unwrap();
         let (_, result) = reviewed(&store, "a.mp3", 0.8);
         let written = vec![FieldChange { field: Field::Label, current: String::new(), proposed: "Defected".into() }];
@@ -1362,23 +1596,122 @@ mod tests {
         let after = TrackKey { file_size: 2_048, modified_unix: 1_800_000_123, ..key("a.mp3") };
 
         // Not before it is accepted.
-        assert!(store.record_applied(result, &written, art.as_ref(), &snapshot("T"), &after, None).is_err());
+        assert!(store.begin_application(result, &written, art.as_ref(), &snapshot("T"), None).is_err());
         store.set_state(result, ReviewState::Accepted).unwrap();
-        // Not for another file.
+        let app = store
+            .begin_application(result, &written, art.as_ref(), &snapshot("T"), Some(r#"{"content_id":7}"#))
+            .unwrap();
+        // Not completed for another file; that changes nothing.
         let other = TrackKey { path: "b.mp3".into(), ..after.clone() };
-        assert!(store.record_applied(result, &written, art.as_ref(), &snapshot("T"), &other, None).is_err());
+        assert!(store.complete_application(app, &other).is_err());
+        assert_eq!(store.application(app).unwrap().unwrap().outcome, None);
 
-        store.record_applied(result, &written, art.as_ref(), &snapshot("T"), &after, Some(r#"{"content_id":7}"#)).unwrap();
+        store.complete_application(app, &after).unwrap();
         assert_eq!(store.applied_changes(result).unwrap(), written);
         let application = store.last_application(result).unwrap().unwrap();
+        assert_eq!((application.id, application.result, application.path.as_str()), (app, result, "a.mp3"));
         assert_eq!(application.artwork, art);
-        assert_eq!(application.file_after, after);
         assert_eq!(application.library_snapshot.as_deref(), Some(r#"{"content_id":7}"#));
-        assert!(application.applied_unix > 0);
+        assert!(application.begun_unix > 0);
+        let Some(Outcome::Written { file_after, completed_unix }) = application.outcome else {
+            panic!("not written: {:?}", application.outcome);
+        };
+        assert_eq!(file_after, after);
+        assert!(completed_unix > 0);
         assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Applied);
-        // Applied twice is refused.
-        assert!(store.record_applied(result, &written, None, &snapshot("T"), &after, None).is_err());
+        // The track takes the file's new size and time.
+        let (size, modified): (i64, i64) = store
+            .conn
+            .query_row("SELECT file_size, modified_unix FROM tracks WHERE path = 'a.mp3'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((size, modified), (2_048, 1_800_000_123));
+        // Completed twice, or begun again once applied: refused.
+        assert!(store.complete_application(app, &after).is_err());
+        assert!(store.abandon_application(app, "late").is_err());
+        assert!(store.begin_application(result, &written, None, &snapshot("T"), None).is_err());
         assert_eq!(store.applied_changes(9_999).unwrap(), Vec::new());
+        assert!(store.complete_application(9_999, &after).is_err());
+    }
+
+    #[test]
+    fn a_begun_application_is_safe_before_the_file_is_touched() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, result) = reviewed(&store, "a.mp3", 0.8);
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let before = snapshot("Before");
+        let app = store.begin_application(result, &proposal().changes, None, &before, None).unwrap();
+
+        // The process could die here: the before-state is already stored.
+        assert_eq!(store.application_snapshot(app).unwrap(), Some(before));
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Accepted);
+        assert_eq!(store.count(Filter::Applied).unwrap(), 0);
+        assert_eq!(store.last_application(result).unwrap(), None, "not undoable: nothing written");
+        assert_eq!(store.original_snapshot(track).unwrap(), None);
+        let open = store.open_applications().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!((open[0].id, open[0].outcome.as_ref()), (app, None));
+        assert_eq!(open[0].changes, proposal().changes);
+
+        // One write in flight per track; no re-identification under it.
+        assert!(store.begin_application(result, &proposal().changes, None, &snapshot("x"), None).is_err());
+        assert!(store.save_result(track, Decision::Review, &[], None, None, &[], true).is_err());
+
+        store.complete_application(app, &key("a.mp3")).unwrap();
+        assert_eq!(store.open_applications().unwrap(), Vec::new());
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Applied);
+        assert_eq!(store.last_application(result).unwrap().unwrap().id, app);
+        assert_eq!(store.original_snapshot(track).unwrap(), Some(snapshot("Before")));
+    }
+
+    #[test]
+    fn an_abandoned_application_never_counts_for_undo() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, result) = reviewed(&store, "a.mp3", 0.8);
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let abandoned = store.begin_application(result, &proposal().changes, None, &snapshot("Never"), None).unwrap();
+        store.abandon_application(abandoned, "disk full").unwrap();
+
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Accepted);
+        assert_eq!(store.open_applications().unwrap(), Vec::new());
+        assert_eq!(store.last_application(result).unwrap(), None);
+        assert_eq!(store.original_snapshot(track).unwrap(), None);
+        let record = store.application(abandoned).unwrap().unwrap();
+        assert!(matches!(record.outcome, Some(Outcome::Abandoned { ref reason, .. }) if reason == "disk full"));
+        assert!(store.complete_application(abandoned, &key("a.mp3")).is_err(), "an outcome is final");
+
+        // A retry is a new application; only it counts.
+        let retried = store.begin_application(result, &proposal().changes, None, &snapshot("Real"), None).unwrap();
+        store.complete_application(retried, &key("a.mp3")).unwrap();
+        assert_eq!(store.last_application(result).unwrap().unwrap().id, retried);
+        assert_eq!(store.original_snapshot(track).unwrap(), Some(snapshot("Real")));
+        // The abandoned one's snapshot is kept, but nothing points undo at it.
+        assert_eq!(store.application_snapshot(abandoned).unwrap(), Some(snapshot("Never")));
+    }
+
+    #[test]
+    fn outcomes_and_applications_are_insert_only() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, result) = reviewed(&store, "a.mp3", 0.8);
+        let app = write(&store, result, &snapshot("T"));
+        for statement in [
+            "UPDATE application_outcomes SET outcome = 'abandoned', file_size_after = NULL, modified_unix_after = NULL",
+            "DELETE FROM application_outcomes",
+            "INSERT INTO application_outcomes (application_id, outcome, reason, completed_unix)
+             SELECT application_id, 'abandoned', 'x', 0 FROM application_outcomes",
+            "INSERT OR REPLACE INTO application_outcomes (application_id, outcome, reason, completed_unix)
+             SELECT application_id, 'abandoned', 'x', 0 FROM application_outcomes",
+            "INSERT OR IGNORE INTO application_outcomes (application_id, outcome, reason, completed_unix)
+             SELECT application_id, 'abandoned', 'x', 0 FROM application_outcomes",
+            "INSERT OR REPLACE INTO applications (id, result_id, changes_json, begun_unix)
+             SELECT id, result_id, '[]', 0 FROM applications",
+        ] {
+            let err = store.conn.execute(statement, []).unwrap_err();
+            assert!(err.to_string().contains("permanent record"), "{statement}: {err}");
+        }
+        assert!(matches!(store.application(app).unwrap().unwrap().outcome, Some(Outcome::Written { .. })));
+        assert_eq!(store.applied_changes(result).unwrap(), proposal().changes);
     }
 
     #[test]
@@ -1391,7 +1724,7 @@ mod tests {
             s.conn.query_row("SELECT COUNT(*) FROM applications", [], |r| r.get(0)).unwrap()
         };
 
-        // The write failed, so record_applied never ran: still Accepted,
+        // The write failed before it began: still Accepted,
         // nothing recorded, not in the undoable list.
         assert_eq!(state(&store), ReviewState::Accepted);
         assert_eq!(applications(&store), 0);
@@ -1399,17 +1732,17 @@ mod tests {
         // set_state cannot fake it.
         assert!(store.set_state(result, ReviewState::AutoApplied).is_err());
 
-        store.record_applied(result, &proposal().changes, None, &snapshot("T"), &key("a.mp3"), None).unwrap();
+        record_applied(&store, result, &proposal().changes, None, &snapshot("T"), &key("a.mp3"), None).unwrap();
         assert_eq!(state(&store), ReviewState::AutoApplied);
         assert_eq!(applications(&store), 1);
         assert_eq!(store.count(Filter::Applied).unwrap(), 1);
-        assert!(store.record_applied(result, &proposal().changes, None, &snapshot("T"), &key("a.mp3"), None).is_err());
+        assert!(record_applied(&store, result, &proposal().changes, None, &snapshot("T"), &key("a.mp3"), None).is_err());
 
         // Undone and re-accepted by the user: a review, so Applied.
         store.set_state(result, ReviewState::Undone).unwrap();
         store.set_state(result, ReviewState::Pending).unwrap();
         store.set_state(result, ReviewState::Accepted).unwrap();
-        store.record_applied(result, &proposal().changes, None, &snapshot("T"), &key("a.mp3"), None).unwrap();
+        record_applied(&store, result, &proposal().changes, None, &snapshot("T"), &key("a.mp3"), None).unwrap();
         assert_eq!(state(&store), ReviewState::Applied);
     }
 
@@ -1428,7 +1761,7 @@ mod tests {
         apply(&store, r1);
         let t2 = store.upsert_track(&key("b.mp3"), 1.0, None, &tags("T")).unwrap();
         let r2 = store.save_result(t2, Decision::AutoApply, &[scored("T", 0.95)], None, None, &[], false).unwrap();
-        store.record_applied(r2, &proposal().changes, None, &snapshot("T"), &key("b.mp3"), None).unwrap();
+        record_applied(&store, r2, &proposal().changes, None, &snapshot("T"), &key("b.mp3"), None).unwrap();
         let t3 = store.upsert_track(&key("c.mp3"), 1.0, None, &tags("T")).unwrap();
         store.save_result(t3, Decision::AutoApply, &[], None, None, &[], false).unwrap();
         let orphans: i64 = store
@@ -1453,7 +1786,7 @@ mod tests {
         store.set_state(result, ReviewState::Pending).unwrap();
         store.set_state(result, ReviewState::Accepted).unwrap();
         let only_label = &proposal().changes[..1];
-        store.record_applied(result, only_label, None, &snapshot("T"), &key("a.mp3"), None).unwrap();
+        record_applied(&store, result, only_label, None, &snapshot("T"), &key("a.mp3"), None).unwrap();
         assert_eq!(store.applied_changes(result).unwrap(), only_label);
         let n: i64 = store.conn.query_row("SELECT COUNT(*) FROM applications", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2);
@@ -1473,7 +1806,7 @@ mod tests {
         // AutoApplied is applied too; an auto-apply not yet written is not.
         let t2 = store.upsert_track(&key("b.mp3"), 1.0, None, &tags("T")).unwrap();
         let r2 = store.save_result(t2, Decision::AutoApply, &[], None, None, &[], false).unwrap();
-        store.record_applied(r2, &proposal().changes, None, &snapshot("T"), &key("b.mp3"), None).unwrap();
+        record_applied(&store, r2, &proposal().changes, None, &snapshot("T"), &key("b.mp3"), None).unwrap();
         assert!(store.save_result(t2, Decision::Review, &[], None, None, &[], false).is_err());
         let t4 = store.upsert_track(&key("d.mp3"), 1.0, None, &tags("T")).unwrap();
         store.save_result(t4, Decision::AutoApply, &[], None, None, &[], false).unwrap();
@@ -1497,7 +1830,7 @@ mod tests {
         apply(&store, r);
         let auto = store.upsert_track(&key("f.mp3"), 1.0, None, &tags("T")).unwrap();
         let r = store.save_result(auto, Decision::AutoApply, &[scored("F", 0.95)], None, None, &[], false).unwrap();
-        store.record_applied(r, &proposal().changes, None, &snapshot("T"), &key("f.mp3"), None).unwrap();
+        record_applied(&store, r, &proposal().changes, None, &snapshot("T"), &key("f.mp3"), None).unwrap();
         // A track with no result is not in the queue.
         store.upsert_track(&key("g.mp3"), 1.0, None, &tags("T")).unwrap();
 
@@ -1600,7 +1933,7 @@ mod tests {
         let (_, result) = reviewed(&store, secret_path, 0.8);
         let errors = [
             store.set_state(result, ReviewState::Undone).unwrap_err(),
-            store.record_applied(result, &[], None, &snapshot("T"), &key(secret_path), Some("SECRET-LIB")).unwrap_err(),
+            record_applied(&store, result, &[], None, &snapshot("T"), &key(secret_path), Some("SECRET-LIB")).unwrap_err(),
         ];
         for err in errors {
             let text = err.to_string();

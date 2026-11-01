@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use rbl_identify::IdentifyError;
 use rbl_identify::model::{Decision, ExistingTags, Field, FieldChange, FrameValues, RawId3, TagSnapshot};
-use rbl_identify::store::{Filter, ReviewState, SCHEMA_VERSION, Store, TrackKey};
+use rbl_identify::store::{Filter, Outcome, ReviewState, SCHEMA_VERSION, Store, TrackKey};
 
 fn key(path: &str) -> TrackKey {
     TrackKey { path: path.to_owned(), file_size: 4_096, modified_unix: 1_700_000_000 }
@@ -37,7 +37,8 @@ fn a_store_survives_closing_and_reopening() {
         let track = store.upsert_track(&key(path), 220.5, Some("AQAB"), &tags).unwrap();
         let result = store.save_result(track, Decision::Review, &[], None, None, &["w".into()], false).unwrap();
         store.set_state(result, ReviewState::Accepted).unwrap();
-        let application = store.record_applied(result, &changes, None, &snapshot(), &after, Some("{}")).unwrap();
+        let application = store.begin_application(result, &changes, None, &snapshot(), Some("{}")).unwrap();
+        store.complete_application(application, &after).unwrap();
         let art = store.put_artwork(b"\xff\xd8jpeg", "image/jpeg").unwrap();
         (track, result, application, art)
     };
@@ -53,7 +54,9 @@ fn a_store_survives_closing_and_reopening() {
     assert_eq!(store.original_snapshot(track).unwrap(), Some(snapshot()));
     assert_eq!(store.application_snapshot(application).unwrap(), Some(snapshot()));
     let last = store.last_application(result).unwrap().unwrap();
-    assert_eq!((last.id, last.changes, last.file_after), (application, changes, after));
+    assert_eq!((last.id, last.changes), (application, changes));
+    assert!(matches!(last.outcome, Some(Outcome::Written { file_after, .. }) if file_after == after));
+    assert_eq!(store.open_applications().unwrap(), Vec::new());
     let items = store.list(Filter::Applied, 0, 10).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!((items[0].result, items[0].state, items[0].path.as_str()), (result, ReviewState::Applied, path));
