@@ -3,12 +3,13 @@
 //!
 //! ```text
 //! cargo run --release -p rbl-identify --example dry_run -- <folder>
-//!     [--ground-truth <folder>/ground_truth.csv] [--out <folder>/identify_report.csv]
+//!     [--ground-truth <folder>/ground_truth.csv] [--out target/identify/identify_report.csv]
 //!     [--env .env.identify] [--limit N]
 //! ```
 //!
-//! Read-only: files are decoded and their tags read, nothing is written
-//! but the report. Makes live requests to AcoustID and MusicBrainz under
+//! Read-only: files are decoded and their tags read, and nothing is
+//! written into the folder; the report goes to `target/identify/` unless
+//! `--out` says otherwise. Makes live requests to AcoustID and MusicBrainz under
 //! the crate's rate limits (about 2–8 s per track, mostly MusicBrainz's
 //! 1 request per second). Progress and the summary go to stderr.
 #![allow(clippy::print_stderr, reason = "a command-line tool reporting progress")]
@@ -53,7 +54,8 @@ fn args() -> Result<Args, String> {
     let folder = folder.ok_or("usage: dry_run <folder> [--ground-truth csv] [--out csv] [--env file] [--limit N]")?;
     Ok(Args {
         ground_truth: ground_truth.unwrap_or_else(|| folder.join("ground_truth.csv")),
-        out: out.unwrap_or_else(|| folder.join("identify_report.csv")),
+        // Never into the test-set folder, which must stay untouched.
+        out: out.unwrap_or_else(|| PathBuf::from("target").join("identify").join("identify_report.csv")),
         env: env.unwrap_or_else(|| PathBuf::from(".env.identify")),
         folder,
         limit,
@@ -108,13 +110,14 @@ fn run() -> Result<(), String> {
 
     let started = std::time::Instant::now();
     let mut results = Vec::new();
+    let mut failures = Vec::new();
     let mut summary = Summary::default();
     for (i, path) in files.iter().enumerate() {
         let name = path.strip_prefix(&args.folder).unwrap_or(path).to_string_lossy().replace('\\', "/");
         match pipeline::identify(path, &services, Settings::default()) {
             Ok(result) => {
                 let verdict = report::judge(&result, truth.get(&name));
-                summary.add(&result, verdict);
+                summary.add(&result, verdict, truth.get(&name));
                 eprintln!(
                     "[{}/{}] {:?} {:<12} {:.2}  {}",
                     i + 1,
@@ -130,12 +133,16 @@ fn run() -> Result<(), String> {
                 summary.tracks += 1;
                 summary.failed += 1;
                 eprintln!("[{}/{}] FAILED {name}: {e}", i + 1, files.len());
+                failures.push((name, e.to_string()));
             }
         }
     }
 
+    if let Some(dir) = args.out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
     let rows: Vec<(String, &pipeline::TrackResult, Verdict)> = results.iter().map(|(n, r, v)| (n.clone(), r, *v)).collect();
-    std::fs::write(&args.out, report::csv(&rows)).map_err(|e| format!("{}: {e}", args.out.display()))?;
+    std::fs::write(&args.out, report::csv(&rows, &failures)).map_err(|e| format!("{}: {e}", args.out.display()))?;
     let text = format!("{}elapsed {:.0} s\n", summary.render(), started.elapsed().as_secs_f64());
     let summary_path = args.out.with_extension("summary.txt");
     std::fs::write(&summary_path, &text).map_err(|e| format!("{}: {e}", summary_path.display()))?;
