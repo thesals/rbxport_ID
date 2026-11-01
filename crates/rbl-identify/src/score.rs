@@ -1,2 +1,397 @@
 //! Scoring a candidate against the file: AcoustID score, duration, text
-//! similarity and mix agreement. (Phase 1: being implemented.)
+//! similarity and mix agreement.
+//!
+//! Each factor is in `0..=1` and the total is their weighted sum, with hard
+//! rules on top: a duration more than 10 s off rejects the candidate, a mix
+//! conflict caps it below the review threshold, and a candidate with no
+//! fingerprint behind it can never reach the auto-apply threshold.
+
+use crate::mixname::{agree, parse_candidate, parse_title, MixAgreement, ParsedTitle};
+use crate::model::{Candidate, ExistingTags, ScoreBreakdown, Scored};
+use crate::normalize::{artist_similarity, similarity, strip_featuring};
+
+/// How much each factor contributes. They sum to 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Weights {
+    pub acoustid: f64,
+    pub duration: f64,
+    pub text: f64,
+    pub mix: f64,
+}
+
+pub const DEFAULT_WEIGHTS: Weights = Weights {
+    acoustid: 0.45,
+    duration: 0.20,
+    text: 0.25,
+    mix: 0.10,
+};
+
+/// Within this many seconds the duration scores 1.0.
+const DURATION_EXACT_SECS: f64 = 2.0;
+/// Beyond this many seconds the candidate is rejected outright.
+const DURATION_REJECT_SECS: f64 = 10.0;
+/// A mix conflict caps the total here, under the 0.5 review threshold.
+const MIX_CONFLICT_CAP: f64 = 0.49;
+/// The ceiling for a candidate without an AcoustID score.
+const TEXT_ONLY_CAP: f64 = 0.90;
+/// Score for a factor with nothing to compare.
+const NEUTRAL: f64 = 0.5;
+
+/// Scores one candidate against the file's tags and duration.
+///
+/// - **duration**: unknown on either side → 0.5; |Δ| ≤ 2 s → 1.0; falling
+///   linearly to 0.0 at 10 s; beyond 10 s the candidate is rejected with a
+///   total of 0.0.
+/// - **text**: 0.4 × [`artist_similarity`] + 0.6 × title [`similarity`],
+///   on titles with featuring clauses and mix descriptors removed. Featured
+///   artists found in either title join that side's artist credit, so
+///   `Festa Feat The Groove` by `Mastiksoul` matches a `Mastiksoul feat.
+///   The Groove` credit. With only one of artist or title tagged, that one
+///   alone; with neither, 0.5.
+/// - **mix**: [`agree`] on the file's and the candidate's mix: Same 1.0,
+///   Compatible 0.8, Unknown 0.5, Conflict 0.0. A conflict also caps the
+///   total at 0.49, so a remix can never be proposed for the original.
+/// - **acoustid**: the AcoustID score as is.
+///
+/// Design decision: a text-search candidate (no AcoustID score) is scored
+/// over the other three factors with their weights renormalised, and its
+/// total is capped at 0.90. Matching text and duration alone is not proof
+/// enough to change tags unattended, so such a candidate can reach review
+/// but never the 0.92 auto-apply threshold.
+///
+/// The duration rejection takes precedence over the mix cap; a cap or
+/// rejection that changed the total is explained in `breakdown.rejected`.
+pub fn score(existing: &ExistingTags, file_duration_secs: f64, candidate: Candidate) -> Scored {
+    let weights = DEFAULT_WEIGHTS;
+    let (duration, duration_delta) = duration_score(file_duration_secs, candidate.length_ms);
+    let file_title = parse_title(&existing.title);
+    let cand_title = parse_candidate(&candidate.title, &candidate.disambiguation);
+    let text = text_score(existing, &file_title, &candidate, &cand_title);
+    let agreement = agree(&file_title.mix, &cand_title.mix);
+    let mix = match agreement {
+        MixAgreement::Same => 1.0,
+        MixAgreement::Compatible => 0.8,
+        MixAgreement::Unknown => NEUTRAL,
+        MixAgreement::Conflict => 0.0,
+    };
+    let acoustid = candidate.acoustid_score.map(unit);
+
+    let others = weights.duration * duration + weights.text * text + weights.mix * mix;
+    let mut total = acoustid.map_or_else(
+        || others / (weights.duration + weights.text + weights.mix),
+        |a| weights.acoustid * a + others,
+    );
+    total = unit(total);
+
+    let mut rejected = None;
+    if let Some(delta) = duration_delta.filter(|d| *d > DURATION_REJECT_SECS) {
+        total = 0.0;
+        rejected = Some(format!("duration differs by {delta:.1} s"));
+    } else if agreement == MixAgreement::Conflict {
+        total = total.min(MIX_CONFLICT_CAP);
+        rejected = Some(format!(
+            "mix conflict: {} vs {}",
+            mix_label(&file_title),
+            mix_label(&cand_title)
+        ));
+    } else if acoustid.is_none() && total > TEXT_ONLY_CAP {
+        total = TEXT_ONLY_CAP;
+        rejected = Some("text search only: capped at 0.90".to_owned());
+    }
+
+    Scored {
+        candidate,
+        score: total,
+        breakdown: ScoreBreakdown {
+            acoustid,
+            duration,
+            text,
+            mix,
+            rejected,
+        },
+    }
+}
+
+/// Scores every candidate and orders them best first.
+///
+/// Ties are broken by recording MBID, ascending, so the order never depends
+/// on the order the services answered in. When a recording appears more
+/// than once (a fingerprint and a text-search hit, say), the higher-scoring
+/// copy is kept; on an exact tie, the earlier one.
+pub fn rank(existing: &ExistingTags, file_duration_secs: f64, candidates: Vec<Candidate>) -> Vec<Scored> {
+    let mut scored: Vec<Scored> = candidates
+        .into_iter()
+        .map(|c| score(existing, file_duration_secs, c))
+        .collect();
+    // Stable: equal copies of one recording keep their input order.
+    scored.sort_by(|a, b| {
+        a.candidate
+            .recording_mbid
+            .cmp(&b.candidate.recording_mbid)
+            .then(b.score.total_cmp(&a.score))
+    });
+    scored.dedup_by(|later, kept| later.candidate.recording_mbid == kept.candidate.recording_mbid);
+    scored.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.candidate.recording_mbid.cmp(&b.candidate.recording_mbid))
+    });
+    scored
+}
+
+/// The duration factor and, when both durations are known, |Δ| in seconds.
+fn duration_score(file_secs: f64, length_ms: Option<u32>) -> (f64, Option<f64>) {
+    let Some(ms) = length_ms else {
+        return (NEUTRAL, None);
+    };
+    if !file_secs.is_finite() || file_secs <= 0.0 {
+        return (NEUTRAL, None);
+    }
+    let delta = (file_secs - f64::from(ms) / 1000.0).abs();
+    let factor = if delta <= DURATION_EXACT_SECS {
+        1.0
+    } else if delta > DURATION_REJECT_SECS {
+        0.0
+    } else {
+        1.0 - (delta - DURATION_EXACT_SECS) / (DURATION_REJECT_SECS - DURATION_EXACT_SECS)
+    };
+    (factor, Some(delta))
+}
+
+fn text_score(existing: &ExistingTags, file_title: &ParsedTitle, candidate: &Candidate, cand_title: &ParsedTitle) -> f64 {
+    let (file_base, file_feat) = strip_featuring(&file_title.base);
+    let (cand_base, cand_feat) = strip_featuring(&cand_title.base);
+    let has_artist = !existing.artist.trim().is_empty();
+    let has_title = !file_base.is_empty();
+    let artist = || {
+        artist_similarity(
+            &with_featured(&existing.artist, &file_feat),
+            &with_featured(&candidate.artist_credit, &cand_feat),
+        )
+    };
+    let title = || similarity(&file_base, &cand_base);
+    match (has_artist, has_title) {
+        (true, true) => 0.4 * artist() + 0.6 * title(),
+        (true, false) => artist(),
+        (false, true) => title(),
+        (false, false) => NEUTRAL,
+    }
+}
+
+/// An artist credit with names featured in the title appended.
+fn with_featured(credit: &str, featured: &[String]) -> String {
+    if featured.is_empty() {
+        return credit.to_owned();
+    }
+    format!("{credit}, {}", featured.join(", "))
+}
+
+fn mix_label(parsed: &ParsedTitle) -> &str {
+    if parsed.mix_text.is_empty() {
+        "no mix"
+    } else {
+        &parsed.mix_text
+    }
+}
+
+/// Clamps to `0..=1`; anything not a number counts as 0.
+fn unit(x: f64) -> f64 {
+    if x.is_nan() {
+        0.0
+    } else {
+        x.clamp(0.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::model::CandidateSource;
+
+    fn tags(artist: &str, title: &str) -> ExistingTags {
+        ExistingTags {
+            artist: artist.to_owned(),
+            title: title.to_owned(),
+            ..ExistingTags::default()
+        }
+    }
+
+    fn cand(mbid: &str, artist: &str, title: &str, length_ms: Option<u32>, acoustid: Option<f64>) -> Candidate {
+        Candidate {
+            recording_mbid: mbid.to_owned(),
+            artists: vec![artist.to_owned()],
+            artist_credit: artist.to_owned(),
+            title: title.to_owned(),
+            disambiguation: String::new(),
+            remixers: Vec::new(),
+            length_ms,
+            isrcs: Vec::new(),
+            genres: Vec::new(),
+            releases: Vec::new(),
+            acoustid_score: acoustid,
+            source: if acoustid.is_some() {
+                CandidateSource::Fingerprint
+            } else {
+                CandidateSource::TextSearch
+            },
+        }
+    }
+
+    const FILE_SECS: f64 = 300.0;
+
+    fn music() -> ExistingTags {
+        tags("Armin van Buuren", "The Music (Extended Mix)")
+    }
+
+    /// A good candidate whose recording lasts `ms`, against a 300 s file.
+    fn with_length(ms: u32) -> Scored {
+        score(&music(), FILE_SECS, cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(ms), Some(0.95)))
+    }
+
+    #[test]
+    fn duration_boundaries() {
+        let at2 = with_length(302_000);
+        assert!((at2.breakdown.duration - 1.0).abs() < 1e-9);
+        let just_over = with_length(302_010);
+        assert!(just_over.breakdown.duration < 1.0 && just_over.breakdown.duration > 0.99);
+        let at10 = with_length(310_000);
+        assert!(at10.breakdown.duration.abs() < 1e-9);
+        assert!(at10.breakdown.rejected.is_none());
+        assert!(at10.score > 0.5);
+        let over = with_length(310_010);
+        assert!(over.score.abs() < f64::EPSILON);
+        assert_eq!(over.breakdown.rejected.as_deref(), Some("duration differs by 10.0 s"));
+        // Shorter counts the same as longer.
+        assert!((with_length(294_000).breakdown.duration - 0.5).abs() < 1e-9);
+        assert!(with_length(289_500).score.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unknown_duration_is_neutral() {
+        let s = score(&music(), FILE_SECS, cand("m", "Armin van Buuren", "The Music (Extended Mix)", None, Some(0.95)));
+        assert!((s.breakdown.duration - 0.5).abs() < f64::EPSILON);
+        let s = score(&music(), 0.0, cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(1), Some(0.95)));
+        assert!((s.breakdown.duration - 0.5).abs() < f64::EPSILON);
+        assert!(s.breakdown.rejected.is_none());
+    }
+
+    #[test]
+    fn strong_fingerprint_match_reaches_auto_apply() {
+        let s = score(
+            &music(),
+            FILE_SECS,
+            cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(300_500), Some(0.97)),
+        );
+        assert!(s.score >= 0.92, "{s:?}");
+        assert!(s.breakdown.rejected.is_none());
+        assert_eq!(s.breakdown.acoustid, Some(0.97));
+        assert!((s.breakdown.mix - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn remix_candidate_for_an_original_mix_file_is_capped() {
+        let file = tags("Sander van Doorn", "End of Life (Original Mix)");
+        let s = score(
+            &file,
+            FILE_SECS,
+            cand("m", "Sander van Doorn", "End of Life (TC Remix)", Some(300_000), Some(1.0)),
+        );
+        assert!(s.score <= 0.49, "{s:?}");
+        assert!(s.breakdown.mix.abs() < f64::EPSILON);
+        assert_eq!(
+            s.breakdown.rejected.as_deref(),
+            Some("mix conflict: Original Mix vs TC Remix")
+        );
+        // Through the disambiguation as well.
+        let mut c = cand("m", "Sander van Doorn", "End of Life", Some(300_000), Some(1.0));
+        c.disambiguation = "TC remix".to_owned();
+        assert!(score(&file, FILE_SECS, c).score <= 0.49);
+    }
+
+    #[test]
+    fn mix_factor_values() {
+        let file = music();
+        let mix_of = |title: &str| score(&file, FILE_SECS, cand("m", "Armin van Buuren", title, Some(300_000), Some(0.9))).breakdown.mix;
+        assert!((mix_of("The Music (Extended Mix)") - 1.0).abs() < f64::EPSILON);
+        assert!((mix_of("The Music (Original Mix)") - 0.8).abs() < f64::EPSILON);
+        assert!((mix_of("The Music") - 0.8).abs() < f64::EPSILON);
+        assert!((mix_of("The Music (Club Mix)") - 0.5).abs() < f64::EPSILON);
+        assert!(mix_of("The Music (Radio Edit)").abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn text_only_candidate_is_capped_below_auto_apply() {
+        let s = score(
+            &music(),
+            FILE_SECS,
+            cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(300_000), None),
+        );
+        assert!((s.score - 0.90).abs() < f64::EPSILON, "{s:?}");
+        assert!(s.breakdown.acoustid.is_none());
+        assert_eq!(s.breakdown.rejected.as_deref(), Some("text search only: capped at 0.90"));
+        // Below the cap nothing is noted.
+        let weak = score(
+            &music(),
+            FILE_SECS,
+            cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(306_000), None),
+        );
+        assert!(weak.score < 0.90 && weak.score > 0.5, "{weak:?}");
+        assert!(weak.breakdown.rejected.is_none());
+    }
+
+    #[test]
+    fn empty_tags_give_neutral_text() {
+        let s = score(
+            &ExistingTags::default(),
+            FILE_SECS,
+            cand("m", "Anyone", "Anything (Extended Mix)", Some(300_000), Some(0.9)),
+        );
+        assert!((s.breakdown.text - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn text_uses_what_is_tagged() {
+        let c = || cand("m", "Mastiksoul feat. The Groove", "Festa (Original Mix)", Some(300_000), Some(0.9));
+        // Featured artist from the file's title joins its credit.
+        let full = score(&tags("Mastiksoul", "Festa Feat The Groove"), FILE_SECS, c());
+        assert!((full.breakdown.text - 1.0).abs() < 1e-9, "{full:?}");
+        let artist_only = score(&tags("Mastiksoul", ""), FILE_SECS, c());
+        assert!(artist_only.breakdown.text > 0.6 && artist_only.breakdown.text < 1.0);
+        let title_only = score(&tags("", "Festa"), FILE_SECS, c());
+        assert!((title_only.breakdown.text - 1.0).abs() < 1e-9);
+        let wrong = score(&tags("Deadmau5", "Strobe"), FILE_SECS, c());
+        assert!(wrong.breakdown.text < 0.3, "{wrong:?}");
+    }
+
+    #[test]
+    fn scores_stay_in_range() {
+        let s = score(&music(), FILE_SECS, cand("m", "x", "y", Some(300_000), Some(f64::NAN)));
+        assert!((0.0..=1.0).contains(&s.score));
+        let s = score(&music(), FILE_SECS, cand("m", "x", "y", Some(300_000), Some(7.0)));
+        assert!((0.0..=1.0).contains(&s.score));
+    }
+
+    #[test]
+    fn rank_orders_breaks_ties_and_dedupes() {
+        let file = music();
+        let good = |mbid: &str| cand(mbid, "Armin van Buuren", "The Music (Extended Mix)", Some(300_000), Some(0.95));
+        let ranked = rank(
+            &file,
+            FILE_SECS,
+            vec![
+                cand("a-weak", "Someone", "Else", Some(300_000), Some(0.2)),
+                good("c-tie"),
+                good("b-tie"),
+                // The same recording again, found by text search: lower.
+                cand("b-tie", "Armin van Buuren", "The Music (Extended Mix)", Some(300_000), None),
+                cand("d-remix", "Armin van Buuren", "The Music (TC Remix)", Some(300_000), Some(0.99)),
+            ],
+        );
+        let order: Vec<&str> = ranked.iter().map(|s| s.candidate.recording_mbid.as_str()).collect();
+        assert_eq!(order, ["b-tie", "c-tie", "d-remix", "a-weak"]);
+        // The fingerprint copy of b-tie survived, not the text-search one.
+        assert_eq!(ranked[0].candidate.source, CandidateSource::Fingerprint);
+        assert_eq!(rank(&file, FILE_SECS, Vec::new()).len(), 0);
+    }
+}
