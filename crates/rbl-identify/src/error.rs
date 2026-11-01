@@ -21,6 +21,9 @@ pub enum IdentifyError {
     /// The service's own error object (AcoustID `status: error`).
     #[error("{service}: {message}")]
     Service { service: &'static str, message: String },
+    /// The identify store (its own SQLite file, never rekordbox's).
+    #[error("identify store: {0}")]
+    Store(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
