@@ -2,12 +2,12 @@
 //! browse-menu names a player reads — to see whether order or visibility is
 //! encoded there. READ-ONLY.
 //!
-//! `cargo run -p rbl-pdb --example columns -- <export.pdb>`
+//! `cargo run -p rbl-pdb --example pdb_columns -- <export.pdb>`
 #![allow(clippy::pedantic, clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 
 fn main() {
     let Some(path) = std::env::args().nth(1) else {
-        println!("usage: columns <export.pdb>");
+        println!("usage: pdb_columns <export.pdb>");
         return;
     };
     let bytes = std::fs::read(&path).expect("read");

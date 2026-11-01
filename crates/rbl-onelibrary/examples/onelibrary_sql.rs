@@ -1,7 +1,7 @@
 //! READ-ONLY: runs one SELECT against a stick's `exportLibrary.db` and
 //! prints the rows pipe-separated.
 //!
-//! `cargo run -q -p rbl-onelibrary --example sql -- <exportLibrary.db> "SELECT * FROM sort"`
+//! `cargo run -q -p rbl-onelibrary --example onelibrary_sql -- <exportLibrary.db> "SELECT * FROM sort"`
 #![allow(clippy::pedantic, clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 
 fn main() {

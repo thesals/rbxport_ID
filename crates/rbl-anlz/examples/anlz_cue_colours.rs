@@ -5,14 +5,14 @@
 //! files. A USB export's `PCO2` tags are the last place a colour could be
 //! recorded outside the binary — a player has to draw them from something.
 //!
-//! `cargo run -p rbl-anlz --example cue_colours -- <USBANLZ dir>`
+//! `cargo run -p rbl-anlz --example anlz_cue_colours -- <USBANLZ dir>`
 #![allow(clippy::pedantic, clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
 
 fn main() {
     let Some(root) = std::env::args().nth(1).map(PathBuf::from) else {
-        println!("usage: cue_colours <USBANLZ directory>");
+        println!("usage: anlz_cue_colours <USBANLZ directory>");
         return;
     };
 
