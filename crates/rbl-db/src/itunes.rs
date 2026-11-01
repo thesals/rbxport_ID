@@ -382,11 +382,12 @@ mod tests {
     #[test]
     fn candidate_paths_cover_music_app_and_itunes() {
         let paths = candidate_library_paths(Path::new("/Users/me/Music"));
+        // Compared as paths, not strings: `join` uses `\` on Windows.
         assert_eq!(
-            paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            paths,
             vec![
-                "/Users/me/Music/Music/Library.xml".to_owned(),
-                "/Users/me/Music/iTunes/iTunes Music Library.xml".to_owned(),
+                PathBuf::from("/Users/me/Music/Music/Library.xml"),
+                PathBuf::from("/Users/me/Music/iTunes/iTunes Music Library.xml"),
             ]
         );
     }
