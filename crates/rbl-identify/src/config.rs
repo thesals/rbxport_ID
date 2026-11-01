@@ -50,9 +50,16 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| IdentifyError::Config(format!("cannot read {}: {e}", path.display())))?;
+        Self::from_text(&text, |key| std::env::var(key).ok())
+    }
+
+    /// Parses `.env.identify` text; `env` wins over the file when it has a
+    /// non-empty value. Split from [`Config::load`] so tests need not read
+    /// the real environment.
+    pub fn from_text(text: &str, env: impl Fn(&str) -> Option<String>) -> Result<Self> {
         // Notepad saves UTF-8 with a BOM, which `trim` does not remove.
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
-        Self::from_lookup(|key| std::env::var(key).ok().filter(|v| !v.is_empty()).or_else(|| file_value(&text, key)))
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        Self::from_lookup(|key| env(key).filter(|v| !v.is_empty()).or_else(|| file_value(text, key)))
     }
 
     /// Builds a config from any key lookup; `load` and tests both use it.
@@ -122,12 +129,13 @@ mod tests {
 
     #[test]
     fn a_file_saved_with_a_bom_and_inline_comments_loads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".env.identify");
-        std::fs::write(&path, "\u{feff}ACOUSTID_API_KEY=abc # the key\r\nMB_USER_AGENT=\"ua 1.0 # not a comment\"\r\n").unwrap();
-        let config = Config::load(&path).unwrap();
+        // The real environment is never consulted: it may hold a real key.
+        let text = "\u{feff}ACOUSTID_API_KEY=abc # the key\r\nMB_USER_AGENT=\"ua 1.0 # not a comment\"\r\n";
+        let config = Config::from_text(text, |_| None).unwrap();
         assert_eq!(config.acoustid_key.expose(), "abc");
         assert_eq!(config.mb_user_agent, "ua 1.0 # not a comment");
+        let overridden = Config::from_text(text, |k| (k == "ACOUSTID_API_KEY").then(|| "env".to_owned())).unwrap();
+        assert_eq!(overridden.acoustid_key.expose(), "env");
     }
 
     #[test]
