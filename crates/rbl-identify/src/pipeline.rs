@@ -313,9 +313,8 @@ fn chosen_release<'a>(current_album: &str, releases: &'a [ReleaseInfo]) -> Optio
     if !album.is_empty() {
         if let Some(matching) = releases
             .iter()
-            .filter(|r| !r.title.is_empty())
+            .filter(|r| same_title(album, &r.title))
             .map(|r| (normalize::similarity(album, &r.title), r))
-            .filter(|(s, _)| *s >= ALBUM_MATCH)
             .max_by(|a, b| a.0.total_cmp(&b.0))
         {
             return Some(matching.1);
@@ -338,7 +337,23 @@ fn same_release(release: &ReleaseInfo, discogs: &Enrichment) -> bool {
         return ours == theirs;
     }
     let year = release.date.get(..4).and_then(|y| y.parse::<u16>().ok());
-    normalize::similarity(&release.title, &discogs.release_title) >= ALBUM_MATCH && year.is_some() && year == discogs.year
+    same_title(&release.title, &discogs.release_title) && year.is_some() && year == discogs.year
+}
+
+/// Two release titles name the same release: close as text, and with the
+/// same numbers. Edit distance alone makes "CLR Best Of 2014" and "2015",
+/// or "Vol. 1" and "Vol. 2", look alike.
+fn same_title(a: &str, b: &str) -> bool {
+    let numbers = |title: &str| {
+        let mut found: Vec<String> = normalize::normalize(title)
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|run| !run.is_empty())
+            .map(|run| run.trim_start_matches('0').to_owned())
+            .collect();
+        found.sort();
+        found
+    };
+    !a.trim().is_empty() && normalize::similarity(a, b) >= ALBUM_MATCH && numbers(a) == numbers(b)
 }
 
 /// A field's current value as the review screen shows it: every value of
@@ -564,6 +579,20 @@ mod tests {
             assert_eq!(change_for(&proposal, field), None, "{field:?} stays the compilation's");
         }
         assert_eq!(change_for(&proposal, Field::MbReleaseId).unwrap().proposed, "annual");
+    }
+
+    #[test]
+    fn a_compilation_from_another_year_is_not_the_files_release() {
+        let mut c = candidate("x", "", &[]);
+        c.releases = vec![
+            full_release("clr2015", "CLR Best Of 2015", "2015-12-01", "CLR", "CLR-2015", &["Compilation"]),
+            full_release("single", "Nadsat", "2014-03-01", "CLR", "CLR-090", &[]),
+        ];
+        let snap = snapshot(&[(Field::Album, "TALB", "CLR Best Of 2014")]);
+        let proposal = propose(&file(""), &snap, &c, None, None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&proposal, Field::MbReleaseId).unwrap().proposed, "single", "the fallback, not 2015");
+        assert!(same_title("Trance Nation Vol. 01", "Trance Nation Vol 1"), "leading zeros and punctuation aside");
+        assert!(!same_title("Trance Nation Vol. 1", "Trance Nation Vol. 2"));
     }
 
     #[test]
