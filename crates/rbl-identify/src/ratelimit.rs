@@ -35,6 +35,9 @@ impl Rate {
     pub const MUSICBRAINZ: Rate = Rate { count: 1, per: Duration::from_secs(1) };
     /// Discogs, authenticated: 60 requests per minute.
     pub const DISCOGS: Rate = Rate { count: 60, per: Duration::from_secs(60) };
+    /// Cover Art Archive: it publishes no hard limit but asks clients to be
+    /// polite; one request per second, MusicBrainz's own rate.
+    pub const COVERART: Rate = Rate { count: 1, per: Duration::from_secs(1) };
 }
 
 /// Retries after a 429 or 503 before giving up.
@@ -61,6 +64,7 @@ pub struct Limiters {
     pub acoustid: Arc<RateLimiter>,
     pub musicbrainz: Arc<RateLimiter>,
     pub discogs: Arc<RateLimiter>,
+    pub coverart: Arc<RateLimiter>,
 }
 
 impl Limiters {
@@ -69,7 +73,8 @@ impl Limiters {
         Self {
             acoustid: Arc::new(RateLimiter::new(Rate::ACOUSTID, clock.clone())),
             musicbrainz: Arc::new(RateLimiter::new(Rate::MUSICBRAINZ, clock.clone())),
-            discogs: Arc::new(RateLimiter::new(Rate::DISCOGS, clock)),
+            discogs: Arc::new(RateLimiter::new(Rate::DISCOGS, clock.clone())),
+            coverart: Arc::new(RateLimiter::new(Rate::COVERART, clock)),
         }
     }
 }
@@ -223,6 +228,24 @@ mod tests {
     }
 
     #[test]
+    fn cover_art_archive_spaces_requests_a_second_apart() {
+        let (clock, limiter) = limiter(Rate::COVERART);
+        let starts = starts(&clock, &limiter, 3);
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(starts, [ms(0), ms(1050), ms(2100)]);
+        assert_within(Rate::COVERART, &starts);
+    }
+
+    #[test]
+    fn coverart_and_musicbrainz_budgets_are_separate() {
+        let clock = Arc::new(ManualClock::new());
+        let limiters = Limiters::new(clock.clone());
+        limiters.musicbrainz.acquire();
+        limiters.coverart.acquire();
+        assert_eq!(clock.sleeps(), Vec::<Duration>::new());
+    }
+
+    #[test]
     fn time_spent_elsewhere_counts_toward_the_wait() {
         let (clock, limiter) = limiter(Rate::MUSICBRAINZ);
         limiter.acquire();
@@ -322,6 +345,7 @@ mod tests {
         assert_eq!(limiters.acoustid.rate(), Rate::ACOUSTID);
         assert_eq!(limiters.musicbrainz.rate(), Rate::MUSICBRAINZ);
         assert_eq!(limiters.discogs.rate(), Rate::DISCOGS);
+        assert_eq!(limiters.coverart.rate(), Rate::COVERART);
         // Two holders of one Limiters wait on the same MusicBrainz budget.
         limiters.musicbrainz.acquire();
         other_handle.musicbrainz.acquire();
