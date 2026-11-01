@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::Clock;
 use crate::config::Secret;
 use crate::error::{IdentifyError, Result};
-use crate::ratelimit::{self, Rate, RateLimiter};
+use crate::ratelimit::{self, RateLimiter};
 use crate::transport::{Request, Transport};
 
 const SERVICE: &str = "acoustid";
@@ -57,34 +57,27 @@ pub struct AcoustIdReleaseGroup {
     pub secondary_types: Vec<String>,
 }
 
-/// Looks fingerprints up on AcoustID, at most 3 requests per second.
+/// Looks fingerprints up on AcoustID, at most 3 requests per second. The
+/// endpoint is fixed: the key goes to [`LOOKUP_URL`] and nowhere else.
 pub struct AcoustIdClient {
     transport: Arc<dyn Transport>,
-    limiter: RateLimiter,
+    limiter: Arc<RateLimiter>,
     clock: Arc<dyn Clock>,
     key: Secret,
-    endpoint: String,
 }
 
 impl std::fmt::Debug for AcoustIdClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcoustIdClient").field("endpoint", &self.endpoint).finish_non_exhaustive()
+        f.debug_struct("AcoustIdClient").field("limiter", &self.limiter).finish_non_exhaustive()
     }
 }
 
 impl AcoustIdClient {
-    pub fn new(transport: Arc<dyn Transport>, clock: Arc<dyn Clock>, key: Secret) -> Self {
-        let limiter = RateLimiter::new(Rate::ACOUSTID, clock.clone());
-        Self { transport, limiter, clock, key, endpoint: LOOKUP_URL.to_owned() }
-    }
-
-    /// Points the client at another lookup URL, for tests against a local
-    /// server. Production code has no reason to call this: the key goes
-    /// wherever the endpoint is.
-    #[must_use]
-    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.endpoint = endpoint.into();
-        self
+    /// `limiter` must be the process's AcoustID limiter
+    /// ([`ratelimit::Limiters::acoustid`]), shared with every other AcoustID
+    /// client, so that together they stay within the rate.
+    pub fn new(transport: Arc<dyn Transport>, clock: Arc<dyn Clock>, limiter: Arc<RateLimiter>, key: Secret) -> Self {
+        Self { transport, limiter, clock, key }
     }
 
     /// Looks up a compressed, base64 fingerprint of a file `duration_secs`
@@ -92,7 +85,7 @@ impl AcoustIdClient {
     pub fn lookup(&self, fingerprint: &str, duration_secs: u32) -> Result<Vec<AcoustIdMatch>> {
         let duration = duration_secs.to_string();
         let request = Request::post_form(
-            &self.endpoint,
+            LOOKUP_URL,
             &[
                 ("client", self.key.expose()),
                 ("duration", &duration),

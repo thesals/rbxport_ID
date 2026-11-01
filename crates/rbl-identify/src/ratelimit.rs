@@ -8,6 +8,10 @@
 //! literally. So each limiter remembers the start times of the last `count`
 //! requests and holds a new one until the oldest of them is `per` old. Its
 //! burst-then-wait behaviour is the bucket's; only the edge case differs.
+//! Each window is also [`SAFETY_MARGIN`] longer than the service's, so a
+//! request never arrives exactly on the boundary.
+//!
+//! Build one [`Limiters`] per process and share it between clients.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -39,6 +43,36 @@ pub const MAX_RETRIES: u32 = 3;
 /// The first backoff when the service sends no `Retry-After`; it doubles
 /// on each retry (1 s, 2 s, 4 s).
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
+
+/// The longest `Retry-After` honoured. A longer one gives up at once rather
+/// than hold a worker thread for minutes.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Added to every window: a request admitted exactly `per` after the one it
+/// replaces can still land inside the service's window (MusicBrainz answers
+/// 503 at exactly 1 req/s), so each slot opens this much later.
+pub const SAFETY_MARGIN: Duration = Duration::from_millis(50);
+
+/// The per-process limiters, one per service. Every client of a service
+/// must share that service's limiter: the services count per client IP, so
+/// two clients with a limiter each would together exceed the rate.
+#[derive(Debug, Clone)]
+pub struct Limiters {
+    pub acoustid: Arc<RateLimiter>,
+    pub musicbrainz: Arc<RateLimiter>,
+    pub discogs: Arc<RateLimiter>,
+}
+
+impl Limiters {
+    /// Create once per process and hand the same `Limiters` to every client.
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            acoustid: Arc::new(RateLimiter::new(Rate::ACOUSTID, clock.clone())),
+            musicbrainz: Arc::new(RateLimiter::new(Rate::MUSICBRAINZ, clock.clone())),
+            discogs: Arc::new(RateLimiter::new(Rate::DISCOGS, clock)),
+        }
+    }
+}
 
 /// Holds callers so that no more than `rate.count` requests start in any
 /// window of `rate.per`. Thread-safe; callers are served in the order they
@@ -79,7 +113,7 @@ impl RateLimiter {
             // concurrent caller queues behind it rather than racing for it.
             let slot = if full {
                 let oldest = recent.pop_front().unwrap_or(now);
-                now.max(oldest + self.rate.per)
+                now.max(oldest + self.rate.per + SAFETY_MARGIN)
             } else {
                 now
             };
@@ -96,9 +130,10 @@ impl RateLimiter {
 ///
 /// A 2xx response is returned. A 429 or 503 is retried up to
 /// [`MAX_RETRIES`] times, after the service's `Retry-After` or else an
-/// exponential backoff from [`BACKOFF_BASE`]; after that, and for every other
-/// status, the result is [`IdentifyError::Status`]. Transport failures are
-/// returned as they are, without a retry.
+/// exponential backoff from [`BACKOFF_BASE`]; after that, for a
+/// `Retry-After` beyond [`MAX_RETRY_AFTER`], and for every other status, the
+/// result is [`IdentifyError::Status`]. Transport failures are returned as
+/// they are, without a retry.
 pub fn send(
     transport: &dyn Transport,
     limiter: &RateLimiter,
@@ -112,7 +147,9 @@ pub fn send(
         let response = transport.send(service, request)?;
         match response.status {
             200..=299 => return Ok(response),
-            status @ (429 | 503) if retries < MAX_RETRIES => {
+            status @ (429 | 503)
+                if retries < MAX_RETRIES && response.retry_after.is_none_or(|wait| wait <= MAX_RETRY_AFTER) =>
+            {
                 let wait = response.retry_after.unwrap_or(BACKOFF_BASE * 2u32.pow(retries));
                 retries += 1;
                 // No URL here: it can carry a key.
@@ -161,8 +198,8 @@ mod tests {
         let (clock, limiter) = limiter(Rate::ACOUSTID);
         let starts = starts(&clock, &limiter, 7);
         let ms = |n| Duration::from_millis(n);
-        assert_eq!(starts, [ms(0), ms(0), ms(0), ms(1000), ms(1000), ms(1000), ms(2000)]);
-        assert_eq!(clock.sleeps(), [ms(1000), ms(1000)]);
+        assert_eq!(starts, [ms(0), ms(0), ms(0), ms(1050), ms(1050), ms(1050), ms(2100)]);
+        assert_eq!(clock.sleeps(), [ms(1050), ms(1050)]);
         assert_within(Rate::ACOUSTID, &starts);
     }
 
@@ -170,9 +207,9 @@ mod tests {
     fn musicbrainz_spaces_requests_a_second_apart() {
         let (clock, limiter) = limiter(Rate::MUSICBRAINZ);
         let starts = starts(&clock, &limiter, 4);
-        let s = Duration::from_secs;
-        assert_eq!(starts, [s(0), s(1), s(2), s(3)]);
-        assert!(clock.sleeps().iter().sum::<Duration>() >= s(3));
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(starts, [ms(0), ms(1050), ms(2100), ms(3150)]);
+        assert!(clock.sleeps().iter().sum::<Duration>() >= Duration::from_secs(3));
     }
 
     #[test]
@@ -180,8 +217,8 @@ mod tests {
         let (clock, limiter) = limiter(Rate::DISCOGS);
         let starts = starts(&clock, &limiter, 121);
         assert!(starts[..60].iter().all(Duration::is_zero));
-        assert!(starts[60..120].iter().all(|s| *s == Duration::from_secs(60)));
-        assert_eq!(starts[120], Duration::from_secs(120));
+        assert!(starts[60..120].iter().all(|s| *s == Duration::from_millis(60_050)));
+        assert_eq!(starts[120], Duration::from_millis(120_100));
         assert_within(Rate::DISCOGS, &starts);
     }
 
@@ -191,7 +228,7 @@ mod tests {
         limiter.acquire();
         clock.advance(Duration::from_millis(400));
         limiter.acquire();
-        assert_eq!(clock.sleeps(), [Duration::from_millis(600)]);
+        assert_eq!(clock.sleeps(), [Duration::from_millis(650)]);
         clock.advance(Duration::from_secs(5));
         limiter.acquire();
         assert_eq!(clock.sleeps().len(), 1, "an idle limiter does not wait");
@@ -215,11 +252,11 @@ mod tests {
             handle.join().unwrap();
         }
         // 12 requests at 3 per second: the last three cannot start before
-        // 3 s. (The manual clock adds up every thread's sleeps, so later is
+        // 3 s plus three margins. (The manual clock adds up every thread's sleeps, so later is
         // possible here; earlier never is.)
         let reserved: Vec<Duration> = limiter.recent.lock().unwrap().iter().copied().collect();
         assert_eq!(reserved.len(), 3);
-        assert!(reserved.iter().all(|s| *s >= Duration::from_secs(3)), "{reserved:?}");
+        assert!(reserved.iter().all(|s| *s >= Duration::from_millis(3150)), "{reserved:?}");
     }
 
     /// Answers with the given statuses in turn, then 200.
@@ -263,6 +300,35 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_after_up_to_a_minute_is_waited_out() {
+        let (result, sleeps, _) = run(&[(503, Some(MAX_RETRY_AFTER))]);
+        assert_eq!(result.unwrap().status, 200);
+        assert_eq!(sleeps, [MAX_RETRY_AFTER]);
+    }
+
+    #[test]
+    fn a_longer_retry_after_gives_up_at_once() {
+        let (result, sleeps, sent) = run(&[(429, Some(Duration::from_secs(61)))]);
+        assert!(matches!(result, Err(IdentifyError::Status { service: "test", status: 429 })));
+        assert_eq!(sleeps, Vec::<Duration>::new());
+        assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn limiters_are_shared_not_copied() {
+        let clock = Arc::new(ManualClock::new());
+        let limiters = Limiters::new(clock.clone());
+        let other_handle = limiters.clone();
+        assert_eq!(limiters.acoustid.rate(), Rate::ACOUSTID);
+        assert_eq!(limiters.musicbrainz.rate(), Rate::MUSICBRAINZ);
+        assert_eq!(limiters.discogs.rate(), Rate::DISCOGS);
+        // Two holders of one Limiters wait on the same MusicBrainz budget.
+        limiters.musicbrainz.acquire();
+        other_handle.musicbrainz.acquire();
+        assert_eq!(clock.sleeps(), [Duration::from_millis(1050)]);
+    }
+
+    #[test]
     fn without_retry_after_the_backoff_doubles() {
         let (result, sleeps, sent) = run(&[(503, None), (429, None), (503, None)]);
         assert_eq!(result.unwrap().status, 200);
@@ -293,7 +359,8 @@ mod tests {
         let limiter = RateLimiter::new(Rate::MUSICBRAINZ, clock.clone());
         let transport = Scripted::new(&[(503, Some(Duration::ZERO))]);
         send(&transport, &limiter, &*clock, "test", &Request::get("https://example.invalid/")).unwrap();
-        // The retry came 0 s after the 503, so the limiter held it for 1 s.
-        assert_eq!(clock.sleeps(), [Duration::ZERO, Duration::from_secs(1)]);
+        // The retry came 0 s after the 503, so the limiter held it for a
+        // second and the margin.
+        assert_eq!(clock.sleeps(), [Duration::ZERO, Duration::from_millis(1050)]);
     }
 }

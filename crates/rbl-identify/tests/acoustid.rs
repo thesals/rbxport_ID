@@ -12,12 +12,15 @@ use rbl_identify::IdentifyError;
 use rbl_identify::acoustid::{AcoustIdClient, AcoustIdReleaseGroup, LOOKUP_URL};
 use rbl_identify::clock::ManualClock;
 use rbl_identify::config::Secret;
+use rbl_identify::ratelimit::Limiters;
 use rbl_identify::transport::Method;
 
 const KEY: &str = "fake-key-Xy12";
 
 fn client(transport: Arc<FakeTransport>) -> AcoustIdClient {
-    AcoustIdClient::new(transport, Arc::new(ManualClock::new()), Secret::new(KEY))
+    let clock = Arc::new(ManualClock::new());
+    let limiters = Limiters::new(clock.clone());
+    AcoustIdClient::new(transport, clock, limiters.acoustid, Secret::new(KEY))
 }
 
 #[test]
