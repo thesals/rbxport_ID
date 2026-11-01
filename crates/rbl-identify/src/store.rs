@@ -144,9 +144,14 @@ pub type TrackId = i64;
 /// An identification result's row id in the store.
 pub type ResultId = i64;
 
-/// Which file a track is, and the state it was in when read. The path is
-/// stored exactly as given (no normalisation): callers must pass the same
-/// spelling every time. Size and modification time tell a changed file.
+/// Which file a track is, and the state it was in when read. Size and
+/// modification time tell a changed file.
+///
+/// The path is the key and is stored exactly as given: no case folding, no
+/// slash or `\\?\` normalisation, no resolving. `C:\Music\a.mp3` and
+/// `c:/music/A.mp3` are two tracks to the store. The caller (the Phase 3
+/// job) canonicalises paths before they get here, so one file always has
+/// one spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackKey {
     pub path: String,
@@ -161,7 +166,7 @@ pub struct TrackKey {
 /// | from          | to                                            |
 /// |---------------|-----------------------------------------------|
 /// | `Pending`     | `Accepted`, `Rejected`                        |
-/// | `Accepted`    | `Pending`, `Rejected`; `Applied` only through [`Store::record_applied`] |
+/// | `Accepted`    | `Pending`, `Rejected`; `Applied` or `AutoApplied` only through [`Store::record_applied`] |
 /// | `Rejected`    | `Pending`                                     |
 /// | `Applied`     | `Undone`                                      |
 /// | `AutoApplied` | `Undone`                                      |
@@ -170,6 +175,12 @@ pub struct TrackKey {
 ///
 /// Everything else, including a state to itself, is refused. Only a
 /// track's current result changes state.
+///
+/// A result the decision marked for auto-apply starts `Accepted`, like one
+/// the user accepted; `record_applied` then makes it `AutoApplied` (the
+/// stored decision tells the two apart). So a write that fails leaves it
+/// `Accepted` with nothing recorded, and `Applied`/`AutoApplied` exist only
+/// with the record of what was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReviewState {
     /// No candidate was good enough; nothing to review.
@@ -181,7 +192,8 @@ pub enum ReviewState {
     Rejected,
     /// Written to the file, after review.
     Applied,
-    /// Taken by auto-apply: empty fields only, user opted in.
+    /// Written to the file by auto-apply (empty fields only, user opted
+    /// in), without review.
     AutoApplied,
     /// Was applied, and the original tags were put back.
     Undone,
@@ -213,8 +225,8 @@ impl ReviewState {
     }
 
     /// Whether [`Store::set_state`] may move a result from `self` to `to`.
-    /// `Applied` is never reached this way: only [`Store::record_applied`],
-    /// which records what was written, may set it.
+    /// `Applied` and `AutoApplied` are never reached this way: only
+    /// [`Store::record_applied`], which records what was written, sets them.
     #[must_use]
     pub fn may_become(self, to: Self) -> bool {
         use ReviewState::{Accepted, Applied, AutoApplied, Pending, Rejected, Undone};
@@ -237,7 +249,8 @@ impl ReviewState {
 /// The state a fresh result starts in.
 fn initial_state(decision: Decision) -> ReviewState {
     match decision {
-        Decision::AutoApply => ReviewState::AutoApplied,
+        // Not AutoApplied yet: nothing has been written.
+        Decision::AutoApply => ReviewState::Accepted,
         Decision::Review => ReviewState::Pending,
         Decision::Unidentified => ReviewState::Unidentified,
     }
@@ -567,8 +580,9 @@ impl Store {
     }
 
     /// Stores a new identification of a track as its current result; the
-    /// previous one stays as history. Starts `Pending`, or `Unidentified` /
-    /// `AutoApplied` for those decisions. A track whose current result has
+    /// previous one stays as history. Starts `Pending`; `Unidentified` for
+    /// that decision; `Accepted` for `AutoApply`, which [`Store::record_applied`]
+    /// turns into `AutoApplied` once written. A track whose current result has
     /// been applied (`Applied` or `AutoApplied`) keeps it unless
     /// `allow_replacing_applied`: replacing it would hide the undo for tags
     /// already written.
@@ -646,10 +660,12 @@ impl Store {
 
     /// Records that `applied` (exactly what was written; the user may have
     /// unticked some of the proposal) and `artwork` went into the file, which
-    /// now has the size and time in `file_after`. An `Accepted` result
-    /// becomes `Applied`; an `AutoApplied` one, not written yet, stays
-    /// `AutoApplied`. `library_snapshot` is the library side of the change,
-    /// kept as given for undo.
+    /// now has the size and time in `file_after`. Only an `Accepted` result
+    /// can be applied. It becomes `AutoApplied` when its stored decision is
+    /// `AutoApply` and this is its first write; otherwise `Applied` (a user
+    /// accepted it, or re-accepted it after an undo, which is a review).
+    /// `library_snapshot` is the library side of the change, kept as given
+    /// for undo.
     pub fn record_applied(
         &self,
         result: ResultId,
@@ -663,16 +679,17 @@ impl Store {
         let size = file_size(file_after.file_size)?;
         let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
         let from = current_state(&tx, result)?;
-        let to = match from {
-            ReviewState::Accepted => ReviewState::Applied,
-            ReviewState::AutoApplied if !has_application(&tx, result)? => ReviewState::AutoApplied,
-            _ => {
-                return Err(IdentifyError::Store(format!(
-                    "result {result} is {}; only an accepted (or not yet written auto-applied) result can be applied",
-                    from.as_str()
-                )));
-            }
-        };
+        if from != ReviewState::Accepted {
+            return Err(IdentifyError::Store(format!(
+                "result {result} is {}; only an accepted result can be applied",
+                from.as_str()
+            )));
+        }
+        let decision: String = tx
+            .query_row("SELECT decision FROM results WHERE id = ?1", [result], |r| r.get(0))
+            .map_err(|e| sql("read the result's decision", &e))?;
+        let auto = parse_decision(&decision)? == Decision::AutoApply && !has_application(&tx, result)?;
+        let to = if auto { ReviewState::AutoApplied } else { ReviewState::Applied };
         let (path, track): (String, TrackId) = tx
             .query_row(
                 "SELECT t.path, t.id FROM results r JOIN tracks t ON t.id = r.track_id WHERE r.id = ?1",
@@ -1144,6 +1161,7 @@ mod tests {
         store.record_applied(second, &proposal().changes, None, &after, None).unwrap();
         let third = store.save_result(track, Decision::AutoApply, &[], None, None, &[], true).unwrap();
         assert!(!store.save_original_snapshot(track, &snapshot("Later")).unwrap());
+        store.record_applied(third, &proposal().changes, None, &after, None).unwrap();
         store.set_state(third, ReviewState::Undone).unwrap();
 
         assert_eq!(store.original_snapshot(track).unwrap(), Some(original));
@@ -1229,7 +1247,8 @@ mod tests {
         for (path, decision, state) in [
             ("a", Decision::Review, ReviewState::Pending),
             ("b", Decision::Unidentified, ReviewState::Unidentified),
-            ("c", Decision::AutoApply, ReviewState::AutoApplied),
+            // Not AutoApplied before anything is written.
+            ("c", Decision::AutoApply, ReviewState::Accepted),
         ] {
             let track = store.upsert_track(&key(path), 1.0, None, &tags("T")).unwrap();
             let id = store.save_result(track, decision, &[], None, None, &[], false).unwrap();
@@ -1311,14 +1330,69 @@ mod tests {
     }
 
     #[test]
-    fn an_auto_applied_result_is_recorded_once_and_stays_auto_applied() {
+    fn an_auto_apply_result_becomes_auto_applied_only_once_written() {
         let store = Store::open_in_memory().unwrap();
         let track = store.upsert_track(&key("a.mp3"), 1.0, None, &tags("T")).unwrap();
-        store.save_original_snapshot(track, &snapshot("T")).unwrap();
         let result = store.save_result(track, Decision::AutoApply, &[scored("T", 0.95)], None, None, &[], false).unwrap();
-        store.record_applied(result, &proposal().changes, None, &key("a.mp3"), None).unwrap();
-        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::AutoApplied);
+        let state = |s: &Store| s.result(result).unwrap().unwrap().0.state;
+        let applications = |s: &Store| -> i64 {
+            s.conn.query_row("SELECT COUNT(*) FROM applications", [], |r| r.get(0)).unwrap()
+        };
+
+        // The write failed (here: no snapshot was taken, so it is refused):
+        // still Accepted, nothing recorded, not in the undoable list.
         assert!(store.record_applied(result, &proposal().changes, None, &key("a.mp3"), None).is_err());
+        assert_eq!(state(&store), ReviewState::Accepted);
+        assert_eq!(applications(&store), 0);
+        assert_eq!(store.count(Filter::Applied).unwrap(), 0);
+        // set_state cannot fake it.
+        assert!(store.set_state(result, ReviewState::AutoApplied).is_err());
+
+        store.save_original_snapshot(track, &snapshot("T")).unwrap();
+        store.record_applied(result, &proposal().changes, None, &key("a.mp3"), None).unwrap();
+        assert_eq!(state(&store), ReviewState::AutoApplied);
+        assert_eq!(applications(&store), 1);
+        assert_eq!(store.count(Filter::Applied).unwrap(), 1);
+        assert!(store.record_applied(result, &proposal().changes, None, &key("a.mp3"), None).is_err());
+
+        // Undone and re-accepted by the user: a review, so Applied.
+        store.set_state(result, ReviewState::Undone).unwrap();
+        store.set_state(result, ReviewState::Pending).unwrap();
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        store.record_applied(result, &proposal().changes, None, &key("a.mp3"), None).unwrap();
+        assert_eq!(state(&store), ReviewState::Applied);
+    }
+
+    #[test]
+    fn a_user_accepted_result_becomes_applied() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, result) = reviewed(&store, "a.mp3", 0.95);
+        apply(&store, track, result);
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Applied);
+    }
+
+    #[test]
+    fn applied_states_only_ever_exist_with_an_application_record() {
+        let store = Store::open_in_memory().unwrap();
+        let (t1, r1) = reviewed(&store, "a.mp3", 0.9);
+        apply(&store, t1, r1);
+        let t2 = store.upsert_track(&key("b.mp3"), 1.0, None, &tags("T")).unwrap();
+        store.save_original_snapshot(t2, &snapshot("T")).unwrap();
+        let r2 = store.save_result(t2, Decision::AutoApply, &[scored("T", 0.95)], None, None, &[], false).unwrap();
+        store.record_applied(r2, &proposal().changes, None, &key("b.mp3"), None).unwrap();
+        let t3 = store.upsert_track(&key("c.mp3"), 1.0, None, &tags("T")).unwrap();
+        store.save_result(t3, Decision::AutoApply, &[], None, None, &[], false).unwrap();
+        let orphans: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM results r WHERE r.state IN ('Applied', 'AutoApplied')
+                 AND NOT EXISTS (SELECT 1 FROM applications a WHERE a.result_id = r.id)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+        assert_eq!(store.count(Filter::Applied).unwrap(), 2);
     }
 
     #[test]
@@ -1347,10 +1421,15 @@ mod tests {
         let newer = store.save_result(track, Decision::Review, &[], None, None, &[], true).unwrap();
         assert_eq!(store.list(Filter::All, 0, 10).unwrap()[0].result, newer);
 
-        // AutoApplied is applied too.
+        // AutoApplied is applied too; an auto-apply not yet written is not.
         let t2 = store.upsert_track(&key("b.mp3"), 1.0, None, &tags("T")).unwrap();
-        store.save_result(t2, Decision::AutoApply, &[], None, None, &[], false).unwrap();
+        store.save_original_snapshot(t2, &snapshot("T")).unwrap();
+        let r2 = store.save_result(t2, Decision::AutoApply, &[], None, None, &[], false).unwrap();
+        store.record_applied(r2, &proposal().changes, None, &key("b.mp3"), None).unwrap();
         assert!(store.save_result(t2, Decision::Review, &[], None, None, &[], false).is_err());
+        let t4 = store.upsert_track(&key("d.mp3"), 1.0, None, &tags("T")).unwrap();
+        store.save_result(t4, Decision::AutoApply, &[], None, None, &[], false).unwrap();
+        store.save_result(t4, Decision::Review, &[], None, None, &[], false).unwrap();
         // An undone one may be replaced.
         let (t3, r3) = reviewed(&store, "c.mp3", 0.8);
         apply(&store, t3, r3);
@@ -1369,7 +1448,9 @@ mod tests {
         let (t, r) = reviewed(&store, "e.mp3", 0.6);
         apply(&store, t, r);
         let auto = store.upsert_track(&key("f.mp3"), 1.0, None, &tags("T")).unwrap();
-        store.save_result(auto, Decision::AutoApply, &[scored("F", 0.95)], None, None, &[], false).unwrap();
+        store.save_original_snapshot(auto, &snapshot("T")).unwrap();
+        let r = store.save_result(auto, Decision::AutoApply, &[scored("F", 0.95)], None, None, &[], false).unwrap();
+        store.record_applied(r, &proposal().changes, None, &key("f.mp3"), None).unwrap();
         // A track with no result is not in the queue.
         store.upsert_track(&key("g.mp3"), 1.0, None, &tags("T")).unwrap();
 
