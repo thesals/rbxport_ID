@@ -2,12 +2,15 @@
 //! title, and deciding whether two mixes are the same recording.
 //!
 //! The spec is explicit that a remix and the original are never the same
-//! track, so [`agree`] treats any named version (remix, edit, dub, VIP,
-//! instrumental) against anything else as a conflict.
+//! track, so [`agree`] treats any named version (remix, edit, named dub,
+//! dub, VIP, instrumental, or unrecognised mix text) against anything else
+//! as a conflict. When in doubt a descriptor is read as a remix: wrongly
+//! rejecting a right candidate costs a review, wrongly accepting a remix
+//! mis-tags a file.
 
 use serde::Serialize;
 
-use crate::normalize::{NAME_MATCH, similarity};
+use crate::normalize::{normalize, similarity, NAME_MATCH};
 
 /// What kind of version a title names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -26,12 +29,19 @@ pub enum MixKind {
     Instrumental,
     /// `VIP`, `VIP Mix`, `<Name> VIP`.
     Vip,
-    /// A remixer's version, holding the remixer as written: `TC`. Also
-    /// `<Name> Dub`, `<Name> Rework` and `<Name> Bootleg`.
+    /// A remixer's version, holding the remixer as written: `TC`. Every
+    /// remix word counts (`Rework`, `Bootleg`, `Refix`, `Flip`, ...), as does
+    /// `<Name> Mix`/`<Name> Version` when the name is not a generic word,
+    /// and a remix's radio edit (`TC Remix Radio Edit`). Empty when the
+    /// descriptor names no one.
     Remix(String),
+    /// `<Name> Dub`: a remixer's dub, a different recording from the same
+    /// remixer's `<Name> Remix`.
+    NamedDub(String),
     /// An editor's version, holding the editor as written.
     Edit(String),
-    /// Mix text this module does not recognise, as written: `Acoustic Mix`.
+    /// A generic mix this module has no kind for, as written: `Acoustic
+    /// Mix`, `Vocal Mix`, `Clean Edit`.
     Other(String),
 }
 
@@ -68,13 +78,38 @@ pub enum MixAgreement {
 /// (Original Mix)`, `Dub Stab!`). A trailing featuring group is skipped
 /// over, so `Song (Extended Mix) (feat. X)` gives base `Song (feat. X)`
 /// and `Extended`.
+///
+/// A length cut stacked on a named version (`Song - TC Remix - Radio Edit`,
+/// `Song (TC Remix) (Radio Edit)`) is that version: the remix wins, and the
+/// mix text joins both (`TC Remix Radio Edit`).
 pub fn parse_title(title: &str) -> ParsedTitle {
+    let outer = parse_once(title);
+    if !matches!(
+        outer.mix,
+        MixKind::Original | MixKind::Extended | MixKind::Radio | MixKind::Club
+    ) {
+        return outer;
+    }
+    let inner = parse_once(&outer.base);
+    if matches!(
+        inner.mix,
+        MixKind::Remix(_) | MixKind::NamedDub(_) | MixKind::Edit(_) | MixKind::Vip | MixKind::Dub | MixKind::Instrumental
+    ) {
+        return ParsedTitle {
+            mix_text: format!("{} {}", inner.mix_text, outer.mix_text),
+            ..inner
+        };
+    }
+    outer
+}
+
+fn parse_once(title: &str) -> ParsedTitle {
     let title = collapse(title);
     if let Some((before, inner)) = trailing_group(&title) {
         if let Some(mix) = classify(inner) {
             return parsed(before, mix, inner);
         }
-        if is_featuring(inner) {
+        if is_featuring(inner, true) {
             let feat_group = title.get(before.len()..).unwrap_or("").trim();
             let earlier = trailing_group(before)
                 .and_then(|(base, inner2)| classify(inner2).map(|mix| (base, inner2, mix)));
@@ -93,47 +128,56 @@ pub fn parse_title(title: &str) -> ParsedTitle {
 
 /// [`parse_title`] for a MusicBrainz recording: when the title carries no
 /// mix, a disambiguation that is a mix descriptor (`extended mix`, `radio
-/// edit`, `X remix`) supplies it.
+/// edit`, `X remix`, `remix by X`) supplies it.
+///
+/// A disambiguation that is not a descriptor but mentions a remix, edit,
+/// dub or VIP anywhere (`2008 edit for the reissue`) is taken as a remix
+/// named by the whole text, so it conflicts with everything but itself.
 pub fn parse_candidate(title: &str, disambiguation: &str) -> ParsedTitle {
     let mut parsed = parse_title(title);
-    if parsed.mix == MixKind::None {
-        if let Some(mix) = classify(disambiguation) {
-            parsed.mix = mix;
-            parsed.mix_text = collapse(disambiguation);
-        }
+    if parsed.mix != MixKind::None {
+        return parsed;
+    }
+    let text = collapse(disambiguation);
+    let mix = classify(&text).or_else(|| mentions_version(&text).then(|| MixKind::Remix(text.clone())));
+    if let Some(mix) = mix {
+        parsed.mix = mix;
+        parsed.mix_text = text;
     }
     parsed
 }
 
 /// Whether two mixes are the same recording. Symmetric.
 ///
-/// Remix and edit names (and `Other` text) are compared with
-/// [`similarity`] ≥ 0.85.
+/// Remixer and editor names are equal when they match ignoring spaces and
+/// dots (`TC` and `T.C.`) or have [`similarity`] ≥ 0.85; `Other` text is
+/// compared by similarity. A generic `Other` mix (`Vocal Mix`) conflicts
+/// with every other kind: it is a different recording from the original.
 // One arm per rule reads as the rule table; merging equal bodies would not.
 #[allow(clippy::match_same_arms)]
 pub fn agree(a: &MixKind, b: &MixKind) -> MixAgreement {
     use MixAgreement::{Compatible, Conflict, Same, Unknown};
-    use MixKind::{Club, Dub, Edit, Extended, Instrumental, None, Original, Other, Radio, Remix, Vip};
+    use MixKind::{Club, Dub, Edit, Extended, Instrumental, NamedDub, None, Original, Other, Radio, Remix, Vip};
     match (a, b) {
-        (Remix(x), Remix(y)) | (Edit(x), Edit(y)) => {
-            if similarity(x, y) >= NAME_MATCH {
+        (Remix(x), Remix(y)) | (Edit(x), Edit(y)) | (NamedDub(x), NamedDub(y)) => {
+            if same_name(x, y) {
                 Same
             } else {
                 Conflict
             }
         }
         // Never treat a remix and the original as the same track.
-        (Remix(_) | Edit(_), _) | (_, Remix(_) | Edit(_)) => Conflict,
+        (Remix(_) | Edit(_) | NamedDub(_), _) | (_, Remix(_) | Edit(_) | NamedDub(_)) => Conflict,
         (Dub, Dub) | (Instrumental, Instrumental) | (Vip, Vip) => Same,
         (Dub | Instrumental | Vip, _) | (_, Dub | Instrumental | Vip) => Conflict,
         (Other(x), Other(y)) => {
             if similarity(x, y) >= NAME_MATCH {
                 Same
             } else {
-                Unknown
+                Conflict
             }
         }
-        (Other(_), _) | (_, Other(_)) => Unknown,
+        (Other(_), _) | (_, Other(_)) => Conflict,
         (None, None) | (Original, Original) | (Extended, Extended) | (Radio, Radio) | (Club, Club) => Same,
         (Original | None, Extended) | (Extended | None, Original) | (Original | Extended, None) => Compatible,
         (Radio, Original | Extended | Club) | (Original | Extended | Club, Radio) => Conflict,
@@ -154,53 +198,149 @@ pub fn format_title(base: &str, mix_text: &str) -> String {
     }
 }
 
+/// Words that make a descriptor a remixer's version.
+const REMIX_WORDS: [&str; 14] = [
+    "remix",
+    "rmx",
+    "re-mix",
+    "rework",
+    "re-work",
+    "bootleg",
+    "refix",
+    "remode",
+    "flip",
+    "reconstruction",
+    "interpretation",
+    "remake",
+    "rerub",
+    "redux",
+];
+
+/// Words that describe a mix without naming anyone: `<these> Mix` is not a
+/// remixer's mix.
+const GENERIC_WORDS: [&str; 12] = [
+    "vocal",
+    "club",
+    "dub",
+    "radio",
+    "extended",
+    "original",
+    "instrumental",
+    "acoustic",
+    "short",
+    "single",
+    "main",
+    "album",
+];
+
 /// Reads a mix descriptor (the text inside the brackets or after the dash).
 /// `None` when the text is not one.
 // One arm per descriptor family, as for `agree`.
 #[allow(clippy::match_same_arms)]
 fn classify(text: &str) -> Option<MixKind> {
-    let words: Vec<&str> = text.split_whitespace().collect();
-    if words.is_empty() || is_featuring(text) {
+    if is_featuring(text, false) {
         return Option::None;
     }
-    let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
-    let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
-    // Everything before the last `n` words, as written: the remixer's name.
-    let name = |n: usize| remixer(&words[..words.len() - n]);
+    // Each word as written, and lowercased without edge punctuation
+    // (`remix,` is `remix`); words that are only punctuation are dropped.
+    let pairs: Vec<(&str, String)> = text
+        .split_whitespace()
+        .filter_map(|w| {
+            let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            (!bare.is_empty()).then_some((w, bare))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return Option::None;
+    }
+    let words: Vec<&str> = pairs.iter().map(|(w, _)| *w).collect();
+    let lower: Vec<&str> = pairs.iter().map(|(_, l)| l.as_str()).collect();
 
-    let kind = match lower.as_slice() {
-        ["original"] | ["original", "mix" | "version"] => MixKind::Original,
+    let generic = match lower.as_slice() {
+        ["original"] | ["original", "mix" | "version"] => Some(MixKind::Original),
+        // The album or main mix of a track is its original.
+        ["album" | "main", "mix" | "version"] => Some(MixKind::Original),
         // "Extended Edit" is the label's lengthened DJ version, not an
         // editor's re-edit, so it sits with Extended (and is therefore
         // compatible with an Original Mix).
-        ["extended"] | ["extended", "mix" | "version" | "edit"] => MixKind::Extended,
-        ["radio"] | [.., "radio", "edit" | "mix" | "version"] => MixKind::Radio,
+        ["extended"] | ["extended", "mix" | "version" | "edit"] => Some(MixKind::Extended),
+        ["original", "extended", "mix" | "version"] => Some(MixKind::Extended),
+        ["radio"] | ["radio", "edit" | "mix" | "version"] => Some(MixKind::Radio),
         // Single/short edits are radio-length cuts.
-        ["single" | "short", "edit" | "version" | "mix"] => MixKind::Radio,
-        ["club"] | ["club", "mix" | "version" | "edit"] => MixKind::Club,
-        ["dub"] | ["dub", "mix" | "version"] => MixKind::Dub,
-        ["instrumental"] | ["instrumental", "mix" | "version"] => MixKind::Instrumental,
-        ["vip"] | ["vip", "mix" | "edit"] | [.., "vip"] | [.., "vip", "mix"] => MixKind::Vip,
-        // A named dub is that producer's version of the track: a remix.
-        [_, .., "dub"] => MixKind::Remix(name(1)),
-        [_, .., "dub", "mix"] => MixKind::Remix(name(2)),
-        [.., "remix" | "rmx" | "rework" | "bootleg"] => MixKind::Remix(name(1)),
-        [.., "edit" | "re-edit" | "reedit"] => MixKind::Edit(name(1)),
-        [.., "mix" | "version"] => MixKind::Other(collapse(text)),
+        ["single" | "short", "edit" | "version" | "mix"] => Some(MixKind::Radio),
+        ["club"] | ["club", "mix" | "version" | "edit"] => Some(MixKind::Club),
+        ["dub"] | ["dub", "mix" | "version"] => Some(MixKind::Dub),
+        ["instrumental"] | ["instrumental", "mix" | "version"] => Some(MixKind::Instrumental),
+        ["clean" | "explicit" | "dirty", "edit" | "version" | "mix"] => Some(MixKind::Other(collapse(text))),
+        _ => Option::None,
+    };
+    if generic.is_some() {
+        return generic;
+    }
+
+    // A remix word anywhere makes it a remix, whatever follows: `TC Remix
+    // Radio Edit` is TC's remix cut for radio, not the radio edit.
+    if let Some(r) = lower.iter().rposition(|w| *w == "dub" || REMIX_WORDS.contains(w)) {
+        let after = &lower[r + 1..];
+        let by_name = (after.first() == Some(&"by") && after.len() > 1).then(|| remixer(&words[r + 2..]));
+        let before = &lower[..r];
+        if lower[r] == "dub" {
+            if by_name.is_none() && before.iter().all(|w| GENERIC_WORDS.contains(w)) {
+                return Some(MixKind::Dub);
+            }
+            return Some(MixKind::NamedDub(by_name.unwrap_or_else(|| remixer(&words[..r]))));
+        }
+        return Some(MixKind::Remix(by_name.unwrap_or_else(|| remixer(&words[..r]))));
+    }
+
+    // Everything before the last word, as written: the editor's or
+    // remixer's name.
+    let name = || remixer(&words[..words.len() - 1]);
+    let kind = match lower.as_slice() {
+        // A named radio edit with no remix word: `Tribal Radio Edit`.
+        [.., "radio", "edit" | "mix" | "version"] => MixKind::Radio,
+        [.., "vip"] | [.., "vip", "mix" | "edit"] => MixKind::Vip,
+        [.., "edit" | "re-edit" | "reedit"] => MixKind::Edit(name()),
+        [named @ .., "mix" | "version"] => {
+            if named.iter().all(|w| GENERIC_WORDS.contains(w)) {
+                MixKind::Other(collapse(text))
+            } else {
+                MixKind::Remix(name())
+            }
+        }
         _ => return Option::None,
     };
     Some(kind)
 }
 
-/// The remixer from the words before `Remix`: drops a possessive (`TC's`)
-/// and a trailing `Extended` (`Yan Oxygen Extended Remix` is the long cut of
-/// Yan Oxygen's remix, the same version for matching).
+/// Whether text mentions a version of any kind: a remix word, `dub`,
+/// `edit` or `vip`.
+fn mentions_version(text: &str) -> bool {
+    text.split_whitespace().any(|w| {
+        let bare = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        REMIX_WORDS.contains(&bare.as_str())
+            || bare.starts_with("remix")
+            || matches!(bare.as_str(), "dub" | "edit" | "re-edit" | "reedit" | "vip")
+    })
+}
+
+/// Remixer or editor names agree: equal ignoring case, accents, spaces and
+/// dots (`TC`, `T.C.`, `T C`), or similar enough.
+fn same_name(a: &str, b: &str) -> bool {
+    let compact = |s: &str| normalize(s).replace(' ', "");
+    compact(a) == compact(b) || similarity(a, b) >= NAME_MATCH
+}
+
+/// The remixer from the words before `Remix`: drops a possessive (`TC's`),
+/// trailing commas and a trailing `Extended` (`Yan Oxygen Extended Remix`
+/// is the long cut of Yan Oxygen's remix, the same version for matching).
 fn remixer(words: &[&str]) -> String {
     let mut words = words.to_vec();
     if words.last().is_some_and(|w| w.eq_ignore_ascii_case("extended")) {
         words.pop();
     }
-    let mut name = words.join(" ");
+    let joined = words.join(" ");
+    let mut name = joined.trim_end_matches(',').to_owned();
     for suffix in ["'s", "\u{2019}s", "'S", "\u{2019}S"] {
         if let Some(stripped) = name.strip_suffix(suffix) {
             name = stripped.to_owned();
@@ -210,10 +350,12 @@ fn remixer(words: &[&str]) -> String {
     name
 }
 
-/// A group whose text starts with a featuring marker: not a mix.
-fn is_featuring(text: &str) -> bool {
+/// A group whose text starts with a featuring marker: not a mix. `with`
+/// counts only when asked: `parse_title` asks after [`classify`] has
+/// already failed, so `(With Love Remix)` is still a remix.
+fn is_featuring(text: &str, with_counts: bool) -> bool {
     let first = text.split_whitespace().next().unwrap_or("").to_lowercase();
-    matches!(first.as_str(), "feat" | "feat." | "ft" | "ft." | "featuring" | "with")
+    matches!(first.as_str(), "feat" | "feat." | "ft" | "ft." | "featuring") || (with_counts && first == "with")
 }
 
 /// The last bracket group: (text before it, trimmed; text inside it).
@@ -330,7 +472,7 @@ mod tests {
         check("T (Club Mix)", "T", MixKind::Club, "Club Mix");
         check("T (Dub)", "T", MixKind::Dub, "Dub");
         check("T (Dub Mix)", "T", MixKind::Dub, "Dub Mix");
-        check("T (Chris Deepak Dub)", "T", remix("Chris Deepak"), "Chris Deepak Dub");
+        check("T (Chris Deepak Dub)", "T", named_dub("Chris Deepak"), "Chris Deepak Dub");
         check("T (Instrumental)", "T", MixKind::Instrumental, "Instrumental");
         check("T (VIP)", "T", MixKind::Vip, "VIP");
         check("T (VIP Mix)", "T", MixKind::Vip, "VIP Mix");
@@ -389,6 +531,7 @@ mod tests {
             MixKind::Edit("TC".to_owned()),
             MixKind::Other("Acoustic Mix".to_owned()),
             MixKind::Other("Piano Version".to_owned()),
+            named_dub("TC"),
         ]
     }
 
@@ -439,10 +582,21 @@ mod tests {
             (Vip, Dub, Conflict),
             (Dub, other("Acoustic Mix"), Conflict),
             (other("Acoustic Mix"), other("acoustic mix"), Same),
-            (other("Acoustic Mix"), other("Piano Version"), Unknown),
-            (other("Acoustic Mix"), None, Unknown),
-            (other("Acoustic Mix"), Original, Unknown),
-            (other("Acoustic Mix"), Radio, Unknown),
+            // A generic other mix is its own recording.
+            (other("Acoustic Mix"), other("Piano Version"), Conflict),
+            (other("Acoustic Mix"), None, Conflict),
+            (other("Acoustic Mix"), Original, Conflict),
+            (other("Acoustic Mix"), Extended, Conflict),
+            (other("Acoustic Mix"), Radio, Conflict),
+            // A remixer's dub is not their remix.
+            (named_dub("TC"), remix("TC"), Conflict),
+            (named_dub("TC"), named_dub("T.C."), Same),
+            (named_dub("TC"), Dub, Conflict),
+            (named_dub("TC"), None, Conflict),
+            // Names ignore dots and spaces.
+            (remix("TC"), remix("T.C."), Same),
+            (remix("T C"), remix("TC"), Same),
+            (edit("T.C."), edit("TC"), Same),
             (remix("TC"), other("TC Mix"), Conflict),
             (None, None, Same),
         ];
@@ -450,6 +604,83 @@ mod tests {
             assert_eq!(agree(&a, &b), want, "{a:?} / {b:?}");
             assert_eq!(agree(&b, &a), want, "{b:?} / {a:?}");
         }
+    }
+
+    fn named_dub(name: &str) -> MixKind {
+        MixKind::NamedDub(name.to_owned())
+    }
+
+    #[test]
+    fn every_remix_word_is_a_remix() {
+        for word in [
+            "Remix",
+            "Rmx",
+            "Re-Mix",
+            "Rework",
+            "Re-Work",
+            "Bootleg",
+            "Refix",
+            "Remode",
+            "Flip",
+            "Reconstruction",
+            "Interpretation",
+            "Remake",
+            "Rerub",
+            "Redux",
+        ] {
+            let p = parse_title(&format!("Song (TC {word})"));
+            assert_eq!(p.mix, remix("TC"), "{word}");
+            assert_eq!(p.base, "Song", "{word}");
+        }
+    }
+
+    #[test]
+    fn named_mix_or_version_is_a_remix_unless_generic() {
+        check("T (Yan Oxygen Mix)", "T", remix("Yan Oxygen"), "Yan Oxygen Mix");
+        check("T (Armin Version)", "T", remix("Armin"), "Armin Version");
+        check("T (Vocal Mix)", "T", MixKind::Other("Vocal Mix".to_owned()), "Vocal Mix");
+        check("T (Main Vocal Mix)", "T", MixKind::Other("Main Vocal Mix".to_owned()), "Main Vocal Mix");
+        check("T (Acoustic Version)", "T", MixKind::Other("Acoustic Version".to_owned()), "Acoustic Version");
+        check("T (Album Version)", "T", MixKind::Original, "Album Version");
+        check("T (Main Mix)", "T", MixKind::Original, "Main Mix");
+        check("T (Original Extended Mix)", "T", MixKind::Extended, "Original Extended Mix");
+        check("T (Vocal Dub)", "T", MixKind::Dub, "Vocal Dub");
+    }
+
+    #[test]
+    fn a_remix_radio_edit_is_the_remix() {
+        check("T (TC Remix Radio Edit)", "T", remix("TC"), "TC Remix Radio Edit");
+        check("T - TC Remix - Radio Edit", "T", remix("TC"), "TC Remix Radio Edit");
+        check("T (TC Remix) (Radio Edit)", "T", remix("TC"), "TC Remix Radio Edit");
+        check("T (Dub) [Extended Mix]", "T", MixKind::Dub, "Dub Extended Mix");
+        // A remix-like word in the base is not a stacked mix.
+        check("Remix Me (Radio Edit)", "Remix Me", MixKind::Radio, "Radio Edit");
+        check("T (TC Rework Radio Version)", "T", remix("TC"), "TC Rework Radio Version");
+        check("T (Chris Deepak Dub Radio Edit)", "T", named_dub("Chris Deepak"), "Chris Deepak Dub Radio Edit");
+        // A plain named radio edit stays Radio.
+        check("Voodoo (Tribal Radio Edit)", "Voodoo", MixKind::Radio, "Tribal Radio Edit");
+    }
+
+    #[test]
+    fn with_is_only_featuring_when_not_a_mix() {
+        check("T (With Love Remix)", "T", remix("With Love"), "With Love Remix");
+        check("T (with Someone)", "T (with Someone)", MixKind::None, "");
+        check("T (Extended Mix) (with Someone)", "T (with Someone)", MixKind::Extended, "Extended Mix");
+    }
+
+    #[test]
+    fn disambiguation_mentioning_a_version_conflicts() {
+        assert_eq!(parse_candidate("T", "remix by Yan Oxygen").mix, remix("Yan Oxygen"));
+        assert_eq!(parse_candidate("T", "extended remix by X").mix, remix("X"));
+        assert_eq!(parse_candidate("T", "TC remix, radio edit").mix, remix("TC"));
+        let odd = parse_candidate("T", "2008 edit for the reissue");
+        assert_eq!(odd.mix, remix("2008 edit for the reissue"));
+        assert_eq!(agree(&odd.mix, &MixKind::None), MixAgreement::Conflict);
+        assert_eq!(agree(&odd.mix, &MixKind::Original), MixAgreement::Conflict);
+        let vip = parse_candidate("T", "the VIP from the 2019 tour");
+        assert_eq!(agree(&vip.mix, &MixKind::Extended), MixAgreement::Conflict);
+        // Nothing version-like: no mix.
+        assert_eq!(parse_candidate("T", "live, Berlin").mix, MixKind::None);
     }
 
     #[test]
