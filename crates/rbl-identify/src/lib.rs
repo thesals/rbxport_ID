@@ -10,7 +10,9 @@
 pub mod acoustid;
 pub mod clock;
 pub mod config;
+pub mod coverart;
 pub mod decide;
+pub mod discogs;
 pub mod error;
 pub mod fingerprint;
 pub mod mixname;
@@ -21,6 +23,7 @@ pub mod pipeline;
 pub mod ratelimit;
 pub mod report;
 pub mod score;
+pub mod store;
 pub mod tags;
 pub mod transport;
 

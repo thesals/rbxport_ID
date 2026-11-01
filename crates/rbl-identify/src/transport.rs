@@ -111,6 +111,19 @@ impl HttpTransport {
             .map_err(|e| http_error("http", e))?;
         Ok(Self { client })
     }
+
+    /// A transport that follows up to five redirects, for requests that
+    /// carry no secret at all: Cover Art Archive answers every image with a
+    /// redirect to archive.org. Never give it to a client holding a key or
+    /// token.
+    pub fn following_redirects() -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|e| http_error("http", e))?;
+        Ok(Self { client })
+    }
 }
 
 /// A transport error without its URL (which may hold a key), but with its
