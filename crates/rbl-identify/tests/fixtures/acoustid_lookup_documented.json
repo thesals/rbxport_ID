@@ -1,0 +1,41 @@
+{
+  "status": "ok",
+  "results": [{
+    "score": 1.0,
+    "id": "9ff43b6a-4f16-427c-93c2-92307ca505e0",
+    "recordings": [{
+      "duration": 639,
+      "releasegroups": [{
+        "type": "Album",
+        "id": "ddaa2d4d-314e-3e7c-b1d0-f6d207f5aa2f",
+        "title": "Before the Dawn Heals Us"
+      }, {
+        "type": "Album",
+        "secondarytypes": ["Compilation"],
+        "id": "00000000-0000-4000-8000-000000000001",
+        "title": "Hand-written compilation"
+      }],
+      "title": "Lower Your Eyelids to Die With the Sun",
+      "id": "cd2e7c47-16f5-46c6-a37c-a1eb7bf599ff",
+      "artists": [{
+        "id": "6d7b7cd4-254b-4c25-83f6-dd20f98ceacd",
+        "name": "M83"
+      }]
+    }, {
+      "duration": 412.5,
+      "title": "Hand-written Collaboration",
+      "id": "00000000-0000-4000-8000-000000000002",
+      "artists": [{
+        "id": "00000000-0000-4000-8000-000000000003",
+        "name": "First Artist",
+        "joinphrase": " & "
+      }, {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "name": "Second Artist"
+      }]
+    }]
+  }, {
+    "score": 0.62,
+    "id": "00000000-0000-4000-8000-000000000005"
+  }]
+}
