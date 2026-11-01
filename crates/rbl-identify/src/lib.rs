@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod ratelimit;
 pub mod report;
 pub mod score;
+pub mod tags;
 pub mod transport;
 
 pub use error::{IdentifyError, Result};

@@ -4044,6 +4044,7 @@ name = "rbl-identify"
 version = "1.2.0"
 dependencies = [
  "base64 0.22.1",
+ "lofty",
  "rbl-audio",
  "reqwest 0.12.28",
  "rusty-chromaprint",
