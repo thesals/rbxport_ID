@@ -17,11 +17,21 @@
 //! library of those would run to gigabytes. They are stored as JSON for the
 //! parsed values and as BLOBs for the raw ID3 bytes (not base64).
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags};
+use base64::Engine as _;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{IdentifyError, Result};
+use crate::model::{
+    ArtworkRef, Decision, Enrichment, ExistingTags, Field, FieldChange, FrameValues, Proposal, RawId3, Scored,
+    TagSnapshot,
+};
 
 /// The schema this build creates and understands, kept in
 /// `PRAGMA user_version`. A newer file is refused rather than guessed at.
@@ -68,6 +78,12 @@ CREATE TABLE snapshots (
 CREATE TRIGGER snapshots_never_update BEFORE UPDATE ON snapshots
 BEGIN SELECT RAISE(ABORT, 'an original tag snapshot is immutable'); END;
 CREATE TRIGGER snapshots_never_delete BEFORE DELETE ON snapshots
+BEGIN SELECT RAISE(ABORT, 'an original tag snapshot is immutable'); END;
+-- INSERT OR REPLACE deletes the old row without firing DELETE triggers
+-- (unless recursive_triggers is on), so a second insert for a track is
+-- refused here, whatever its conflict clause.
+CREATE TRIGGER snapshots_never_replace BEFORE INSERT ON snapshots
+WHEN EXISTS (SELECT 1 FROM snapshots WHERE track_id = NEW.track_id)
 BEGIN SELECT RAISE(ABORT, 'an original tag snapshot is immutable'); END;
 
 -- Every identification of a track. The newest is current; older ones stay
@@ -122,6 +138,232 @@ CREATE TABLE artwork (
     created_unix  INTEGER NOT NULL
 );
 ";
+
+/// A track's row id in the store.
+pub type TrackId = i64;
+/// An identification result's row id in the store.
+pub type ResultId = i64;
+
+/// Which file a track is, and the state it was in when read. The path is
+/// stored exactly as given (no normalisation): callers must pass the same
+/// spelling every time. Size and modification time tell a changed file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackKey {
+    pub path: String,
+    pub file_size: u64,
+    pub modified_unix: i64,
+}
+
+/// Where a result stands in the review flow. Stored as its variant name.
+///
+/// Allowed transitions ([`Store::set_state`] unless noted):
+///
+/// | from          | to                                            |
+/// |---------------|-----------------------------------------------|
+/// | `Pending`     | `Accepted`, `Rejected`                        |
+/// | `Accepted`    | `Pending`, `Rejected`; `Applied` only through [`Store::record_applied`] |
+/// | `Rejected`    | `Pending`                                     |
+/// | `Applied`     | `Undone`                                      |
+/// | `AutoApplied` | `Undone`                                      |
+/// | `Undone`      | `Pending`                                     |
+/// | `Unidentified`| none: identify the track again instead        |
+///
+/// Everything else, including a state to itself, is refused. Only a
+/// track's current result changes state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReviewState {
+    /// No candidate was good enough; nothing to review.
+    Unidentified,
+    /// Waiting for the user.
+    Pending,
+    /// The user accepted it; not written yet.
+    Accepted,
+    Rejected,
+    /// Written to the file, after review.
+    Applied,
+    /// Taken by auto-apply: empty fields only, user opted in.
+    AutoApplied,
+    /// Was applied, and the original tags were put back.
+    Undone,
+}
+
+impl ReviewState {
+    const ALL: [Self; 7] =
+        [Self::Unidentified, Self::Pending, Self::Accepted, Self::Rejected, Self::Applied, Self::AutoApplied, Self::Undone];
+
+    /// The stored text: the variant name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unidentified => "Unidentified",
+            Self::Pending => "Pending",
+            Self::Accepted => "Accepted",
+            Self::Rejected => "Rejected",
+            Self::Applied => "Applied",
+            Self::AutoApplied => "AutoApplied",
+            Self::Undone => "Undone",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|state| state.as_str() == s)
+            .ok_or_else(|| IdentifyError::Store("unknown review state in the store".to_owned()))
+    }
+
+    /// Whether [`Store::set_state`] may move a result from `self` to `to`.
+    /// `Applied` is never reached this way: only [`Store::record_applied`],
+    /// which records what was written, may set it.
+    #[must_use]
+    pub fn may_become(self, to: Self) -> bool {
+        use ReviewState::{Accepted, Applied, AutoApplied, Pending, Rejected, Undone};
+        matches!(
+            (self, to),
+            (Pending, Accepted | Rejected)
+                | (Accepted, Pending | Rejected)
+                | (Rejected | Undone, Pending)
+                | (Applied | AutoApplied, Undone)
+        )
+    }
+
+    /// Tags have been written for a result in this state.
+    #[must_use]
+    pub fn is_applied(self) -> bool {
+        matches!(self, Self::Applied | Self::AutoApplied)
+    }
+}
+
+/// The state a fresh result starts in.
+fn initial_state(decision: Decision) -> ReviewState {
+    match decision {
+        Decision::AutoApply => ReviewState::AutoApplied,
+        Decision::Review => ReviewState::Pending,
+        Decision::Unidentified => ReviewState::Unidentified,
+    }
+}
+
+fn decision_str(decision: Decision) -> &'static str {
+    match decision {
+        Decision::AutoApply => "AutoApply",
+        Decision::Review => "Review",
+        Decision::Unidentified => "Unidentified",
+    }
+}
+
+fn parse_decision(s: &str) -> Result<Decision> {
+    match s {
+        "AutoApply" => Ok(Decision::AutoApply),
+        "Review" => Ok(Decision::Review),
+        "Unidentified" => Ok(Decision::Unidentified),
+        _ => Err(IdentifyError::Store("unknown decision in the store".to_owned())),
+    }
+}
+
+/// A queue filter, as the review screen offers them. Each lists current
+/// results only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Filter {
+    Unidentified,
+    /// `Pending`.
+    NeedsReview,
+    /// `Applied` and `AutoApplied`: the undoable ones.
+    Applied,
+    All,
+}
+
+impl Filter {
+    /// The states the filter takes, as a SQL condition on `r.state`.
+    fn condition(self) -> &'static str {
+        match self {
+            Self::Unidentified => "r.state = 'Unidentified'",
+            Self::NeedsReview => "r.state = 'Pending'",
+            Self::Applied => "r.state IN ('Applied', 'AutoApplied')",
+            Self::All => "1",
+        }
+    }
+}
+
+/// One row of the review queue.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueItem {
+    pub track: TrackId,
+    pub result: ResultId,
+    pub path: String,
+    pub state: ReviewState,
+    pub decision: Decision,
+    /// The best candidate's score; `None` without candidates.
+    pub score: Option<f64>,
+    /// The file's tags as last read.
+    pub existing: ExistingTags,
+    pub proposal: Option<Proposal>,
+    /// When the result last changed.
+    pub updated_unix: i64,
+}
+
+/// A result in full: its queue row, all its candidates (best first), the
+/// Discogs enrichment and the warnings.
+pub type ResultDetail = (QueueItem, Vec<Scored>, Option<Enrichment>, Vec<String>);
+
+/// One time a result's changes were written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Application {
+    /// Exactly what was written.
+    pub changes: Vec<FieldChange>,
+    pub artwork: Option<ArtworkRef>,
+    /// The file right after the write: a different size or time later means
+    /// something else changed it since, and undo must not blindly restore.
+    pub file_after: TrackKey,
+    /// The library side of the change (rekordbox content ID and previous
+    /// values), JSON the store keeps without reading.
+    pub library_snapshot: Option<String>,
+    pub applied_unix: i64,
+}
+
+const QUEUE_COLUMNS: &str = "t.id, r.id, t.path, r.state, r.decision, r.score, t.existing_json, r.proposal_json, r.updated_unix";
+
+fn queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawQueueItem> {
+    Ok(RawQueueItem {
+        track: row.get(0)?,
+        result: row.get(1)?,
+        path: row.get(2)?,
+        state: row.get(3)?,
+        decision: row.get(4)?,
+        score: row.get(5)?,
+        existing: row.get(6)?,
+        proposal: row.get(7)?,
+        updated_unix: row.get(8)?,
+    })
+}
+
+/// A queue row as stored, before its text is decoded.
+struct RawQueueItem {
+    track: TrackId,
+    result: ResultId,
+    path: String,
+    state: String,
+    decision: String,
+    score: Option<f64>,
+    existing: String,
+    proposal: Option<String>,
+    updated_unix: i64,
+}
+
+impl RawQueueItem {
+    fn decode(self) -> Result<QueueItem> {
+        Ok(QueueItem {
+            track: self.track,
+            result: self.result,
+            path: self.path,
+            state: ReviewState::parse(&self.state)?,
+            decision: parse_decision(&self.decision)?,
+            score: self.score,
+            existing: from_json(&self.existing, "existing tags")?,
+            proposal: self.proposal.as_deref().map(|p| from_json(p, "proposal")).transpose()?,
+            updated_unix: self.updated_unix,
+        })
+    }
+}
 
 /// The identify store. One connection; not shared across threads (move it
 /// to the worker that uses it).
@@ -211,13 +453,502 @@ impl Store {
     /// Whether a table exists; for tests of the schema.
     #[cfg(test)]
     fn has_table(&self, name: &str) -> Result<bool> {
-        use rusqlite::OptionalExtension;
         self.conn
             .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [name], |_| Ok(()))
             .optional()
             .map(|r| r.is_some())
             .map_err(|e| sql("read the schema", &e))
     }
+}
+
+impl Store {
+    /// Records a track as just read: inserts it, or updates its latest
+    /// size, time, duration, fingerprint and tags. Never touches its
+    /// original snapshot (see [`Store::save_original_snapshot`]).
+    pub fn upsert_track(
+        &self,
+        key: &TrackKey,
+        duration_secs: f64,
+        fingerprint: Option<&str>,
+        existing: &ExistingTags,
+    ) -> Result<TrackId> {
+        let size = file_size(key.file_size)?;
+        let existing = to_json(existing, "existing tags")?;
+        // One statement: atomic without an explicit transaction. A
+        // fingerprint that could not be computed this time keeps the last
+        // one, unless the file has changed (then the old one is stale).
+        self.conn
+            .query_row(
+                "INSERT INTO tracks (path, file_size, modified_unix, duration_secs, fingerprint, existing_json,
+                                     created_unix, updated_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                 ON CONFLICT (path) DO UPDATE SET
+                     fingerprint = CASE
+                         WHEN excluded.file_size = tracks.file_size AND excluded.modified_unix = tracks.modified_unix
+                         THEN COALESCE(excluded.fingerprint, tracks.fingerprint)
+                         ELSE excluded.fingerprint END,
+                     file_size = excluded.file_size,
+                     modified_unix = excluded.modified_unix,
+                     duration_secs = excluded.duration_secs,
+                     existing_json = excluded.existing_json,
+                     updated_unix = excluded.updated_unix
+                 RETURNING id",
+                params![key.path, size, key.modified_unix, duration_secs, fingerprint, existing, now_unix()],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql("record the track", &e))
+    }
+
+    /// Records the track's ORIGINAL tags, to be called just before its first
+    /// write. Returns `true` when this stored the snapshot, `false` when the
+    /// track already had one, which is then kept unchanged: the first
+    /// snapshot is the original forever, whatever has been written since.
+    /// Refuses (storing nothing) a `raw_id3` part that is not unpadded
+    /// standard base64, since it could not be given back identical.
+    pub fn save_original_snapshot(&self, id: TrackId, snapshot: &TagSnapshot) -> Result<bool> {
+        let text = to_json(
+            &SnapshotText { format: &snapshot.format, values: &snapshot.values, has_artwork: snapshot.has_artwork },
+            "tag snapshot",
+        )?;
+        let raw = snapshot.raw_id3.as_ref();
+        let v2 = raw.and_then(|r| r.v2.as_deref()).map(|b| decode_raw(b, "ID3v2")).transpose()?;
+        let v1 = raw.and_then(|r| r.v1.as_deref()).map(|b| decode_raw(b, "ID3v1")).transpose()?;
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        if !track_exists(&tx, id)? {
+            return Err(IdentifyError::Store(format!("no track {id}")));
+        }
+        if has_snapshot(&tx, id)? {
+            // The original stays; the triggers would refuse a second row anyway.
+            return Ok(false);
+        }
+        // The file's size and time come from the track row: the file as it
+        // was when the snapshot was read.
+        tx.execute(
+            "INSERT INTO snapshots (track_id, snapshot_json, has_raw_id3, raw_id3_v2, raw_id3_v1,
+                                    file_size, modified_unix, taken_unix)
+             SELECT id, ?2, ?3, ?4, ?5, file_size, modified_unix, ?6 FROM tracks WHERE id = ?1",
+            params![id, text, raw.is_some(), v2, v1, now_unix()],
+        )
+        .map_err(|e| sql("record the tag snapshot", &e))?;
+        tx.commit().map_err(|e| sql("commit the tag snapshot", &e))?;
+        Ok(true)
+    }
+
+    /// The track's original tags, exactly as first recorded.
+    pub fn original_snapshot(&self, id: TrackId) -> Result<Option<TagSnapshot>> {
+        type Row = (String, bool, Option<Vec<u8>>, Option<Vec<u8>>);
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT snapshot_json, has_raw_id3, raw_id3_v2, raw_id3_v1 FROM snapshots WHERE track_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| sql("read the tag snapshot", &e))?;
+        let Some((text, has_raw, v2, v1)) = row else {
+            return Ok(None);
+        };
+        let mut snapshot: TagSnapshot = from_json(&text, "tag snapshot")?;
+        snapshot.raw_id3 = has_raw.then(|| RawId3 {
+            v2: v2.map(|b| BASE64.encode(b)),
+            v1: v1.map(|b| BASE64.encode(b)),
+        });
+        Ok(Some(snapshot))
+    }
+
+
+    /// The track with this path, if the store knows it.
+    pub fn track_id(&self, path: &str) -> Result<Option<TrackId>> {
+        self.conn
+            .query_row("SELECT id FROM tracks WHERE path = ?1", [path], |r| r.get(0))
+            .optional()
+            .map_err(|e| sql("find the track", &e))
+    }
+
+    /// Stores a new identification of a track as its current result; the
+    /// previous one stays as history. Starts `Pending`, or `Unidentified` /
+    /// `AutoApplied` for those decisions. A track whose current result has
+    /// been applied (`Applied` or `AutoApplied`) keeps it unless
+    /// `allow_replacing_applied`: replacing it would hide the undo for tags
+    /// already written.
+    #[allow(clippy::too_many_arguments)] // the contract's shape
+    pub fn save_result(
+        &self,
+        id: TrackId,
+        decision: Decision,
+        candidates: &[Scored],
+        proposal: Option<&Proposal>,
+        enrichment: Option<&Enrichment>,
+        warnings: &[String],
+        allow_replacing_applied: bool,
+    ) -> Result<ResultId> {
+        let score = candidates.first().map(|c| c.score);
+        let candidates = to_json(candidates, "candidates")?;
+        let proposal = proposal.map(|p| to_json(p, "proposal")).transpose()?;
+        let enrichment = enrichment.map(|e| to_json(e, "enrichment")).transpose()?;
+        let warnings = to_json(warnings, "warnings")?;
+        let now = now_unix();
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let current: Option<String> = tx
+            .query_row("SELECT state FROM results WHERE track_id = ?1 AND is_current = 1", [id], |r| r.get(0))
+            .optional()
+            .map_err(|e| sql("read the current result", &e))?;
+        if let Some(state) = current.as_deref().map(ReviewState::parse).transpose()? {
+            if state.is_applied() && !allow_replacing_applied {
+                return Err(IdentifyError::Store(format!(
+                    "track {id} has an applied result ({}); undo it before identifying again",
+                    state.as_str()
+                )));
+            }
+        }
+        tx.execute("UPDATE results SET is_current = 0 WHERE track_id = ?1 AND is_current = 1", [id])
+            .map_err(|e| sql("retire the previous result", &e))?;
+        let result = tx
+            .query_row(
+                "INSERT INTO results (track_id, is_current, decision, state, score, candidates_json, proposal_json,
+                                      enrichment_json, warnings_json, created_unix, updated_unix)
+                 VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                 RETURNING id",
+                params![
+                    id,
+                    decision_str(decision),
+                    initial_state(decision).as_str(),
+                    score,
+                    candidates,
+                    proposal,
+                    enrichment,
+                    warnings,
+                    now
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql("store the result", &e))?;
+        tx.commit().map_err(|e| sql("commit the result", &e))?;
+        Ok(result)
+    }
+
+    /// Moves a current result to another state, if the table on
+    /// [`ReviewState`] allows it.
+    pub fn set_state(&self, result: ResultId, state: ReviewState) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let from = current_state(&tx, result)?;
+        if !from.may_become(state) {
+            return Err(IdentifyError::Store(format!(
+                "result {result} cannot go from {} to {}",
+                from.as_str(),
+                state.as_str()
+            )));
+        }
+        set_state_unchecked(&tx, result, state)?;
+        tx.commit().map_err(|e| sql("commit the state", &e))
+    }
+
+    /// Records that `applied` (exactly what was written; the user may have
+    /// unticked some of the proposal) and `artwork` went into the file, which
+    /// now has the size and time in `file_after`. An `Accepted` result
+    /// becomes `Applied`; an `AutoApplied` one, not written yet, stays
+    /// `AutoApplied`. `library_snapshot` is the library side of the change,
+    /// kept as given for undo.
+    pub fn record_applied(
+        &self,
+        result: ResultId,
+        applied: &[FieldChange],
+        artwork: Option<&ArtworkRef>,
+        file_after: &TrackKey,
+        library_snapshot: Option<&str>,
+    ) -> Result<()> {
+        let changes = to_json(applied, "applied changes")?;
+        let artwork = artwork.map(|a| to_json(a, "artwork")).transpose()?;
+        let size = file_size(file_after.file_size)?;
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let from = current_state(&tx, result)?;
+        let to = match from {
+            ReviewState::Accepted => ReviewState::Applied,
+            ReviewState::AutoApplied if !has_application(&tx, result)? => ReviewState::AutoApplied,
+            _ => {
+                return Err(IdentifyError::Store(format!(
+                    "result {result} is {}; only an accepted (or not yet written auto-applied) result can be applied",
+                    from.as_str()
+                )));
+            }
+        };
+        let (path, track): (String, TrackId) = tx
+            .query_row(
+                "SELECT t.path, t.id FROM results r JOIN tracks t ON t.id = r.track_id WHERE r.id = ?1",
+                [result],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| sql("find the result's track", &e))?;
+        if path != file_after.path {
+            return Err(IdentifyError::Store(format!("result {result} belongs to another file than the one written")));
+        }
+        // Undo must have something to go back to: no write is recorded
+        // without the original snapshot taken first.
+        if !has_snapshot(&tx, track)? {
+            return Err(IdentifyError::Store(format!(
+                "track {track} has no original snapshot; take it before writing"
+            )));
+        }
+        tx.execute(
+            "INSERT INTO applications (result_id, changes_json, artwork_json, file_size_after, modified_unix_after,
+                                       library_snapshot, applied_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![result, changes, artwork, size, file_after.modified_unix, library_snapshot, now_unix()],
+        )
+        .map_err(|e| sql("record the applied changes", &e))?;
+        // The file on disk is now the written one; the next scan must not
+        // read it as a change by someone else.
+        tx.execute(
+            "UPDATE tracks SET file_size = ?2, modified_unix = ?3 WHERE id = ?1",
+            params![track, size, file_after.modified_unix],
+        )
+        .map_err(|e| sql("update the track", &e))?;
+        set_state_unchecked(&tx, result, to)?;
+        tx.commit().map_err(|e| sql("commit the applied changes", &e))
+    }
+
+    /// What was last written for a result; empty when nothing was.
+    pub fn applied_changes(&self, result: ResultId) -> Result<Vec<FieldChange>> {
+        Ok(self.last_application(result)?.map(|a| a.changes).unwrap_or_default())
+    }
+
+    /// The last write recorded for a result, with the file's state after it.
+    pub fn last_application(&self, result: ResultId) -> Result<Option<Application>> {
+        type Row = (String, Option<String>, String, i64, i64, Option<String>, i64);
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT a.changes_json, a.artwork_json, t.path, a.file_size_after, a.modified_unix_after,
+                        a.library_snapshot, a.applied_unix
+                 FROM applications a JOIN results r ON r.id = a.result_id JOIN tracks t ON t.id = r.track_id
+                 WHERE a.result_id = ?1 ORDER BY a.id DESC LIMIT 1",
+                [result],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .optional()
+            .map_err(|e| sql("read the applied changes", &e))?;
+        let Some((changes, artwork, path, size, modified_unix, library_snapshot, applied_unix)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(Application {
+            changes: from_json(&changes, "applied changes")?,
+            artwork: artwork.as_deref().map(|a| from_json(a, "artwork")).transpose()?,
+            file_after: TrackKey {
+                path,
+                file_size: u64::try_from(size).map_err(|_| IdentifyError::Store("negative file size".to_owned()))?,
+                modified_unix,
+            },
+            library_snapshot,
+            applied_unix,
+        }))
+    }
+
+    /// A page of current results, best score first (no score last), then
+    /// by path.
+    pub fn list(&self, filter: Filter, offset: u32, limit: u32) -> Result<Vec<QueueItem>> {
+        let query = format!(
+            "SELECT {QUEUE_COLUMNS} FROM results r JOIN tracks t ON t.id = r.track_id
+             WHERE r.is_current = 1 AND {}
+             ORDER BY r.score IS NULL, r.score DESC, t.path, r.id
+             LIMIT ?1 OFFSET ?2",
+            filter.condition()
+        );
+        let mut stmt = self.conn.prepare(&query).map_err(|e| sql("list the queue", &e))?;
+        let rows = stmt
+            .query_map(params![limit, offset], queue_item)
+            .map_err(|e| sql("list the queue", &e))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| sql("list the queue", &e))?;
+        rows.into_iter().map(RawQueueItem::decode).collect()
+    }
+
+    /// How many current results the filter takes.
+    pub fn count(&self, filter: Filter) -> Result<u64> {
+        let query = format!("SELECT COUNT(*) FROM results r WHERE r.is_current = 1 AND {}", filter.condition());
+        let n: i64 = self.conn.query_row(&query, [], |r| r.get(0)).map_err(|e| sql("count the queue", &e))?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// One result in full (current or history): its queue row, all its
+    /// candidates, the enrichment and the warnings.
+    pub fn result(&self, id: ResultId) -> Result<Option<ResultDetail>> {
+        let query = format!(
+            "SELECT {QUEUE_COLUMNS}, r.candidates_json, r.enrichment_json, r.warnings_json
+             FROM results r JOIN tracks t ON t.id = r.track_id WHERE r.id = ?1"
+        );
+        let row = self
+            .conn
+            .query_row(&query, [id], |r| {
+                Ok((queue_item(r)?, r.get::<_, String>(9)?, r.get::<_, Option<String>>(10)?, r.get::<_, String>(11)?))
+            })
+            .optional()
+            .map_err(|e| sql("read the result", &e))?;
+        let Some((item, candidates, enrichment, warnings)) = row else {
+            return Ok(None);
+        };
+        Ok(Some((
+            item.decode()?,
+            from_json(&candidates, "candidates")?,
+            enrichment.as_deref().map(|e| from_json(e, "enrichment")).transpose()?,
+            from_json(&warnings, "warnings")?,
+        )))
+    }
+
+    /// Bulk accept: every current `Pending` result scoring at least
+    /// `threshold` becomes `Accepted`. Returns them, best first.
+    pub fn accept_at_or_above(&self, threshold: f64) -> Result<Vec<ResultId>> {
+        if !threshold.is_finite() {
+            return Err(IdentifyError::Store("the accept threshold must be a number".to_owned()));
+        }
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let ids = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT r.id FROM results r JOIN tracks t ON t.id = r.track_id
+                     WHERE r.is_current = 1 AND r.state = 'Pending' AND r.score >= ?1
+                     ORDER BY r.score DESC, t.path, r.id",
+                )
+                .map_err(|e| sql("find results to accept", &e))?;
+            let ids = stmt
+                .query_map([threshold], |r| r.get::<_, ResultId>(0))
+                .map_err(|e| sql("find results to accept", &e))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| sql("find results to accept", &e))?;
+            ids
+        };
+        for &id in &ids {
+            set_state_unchecked(&tx, id, ReviewState::Accepted)?;
+        }
+        tx.commit().map_err(|e| sql("commit the accepts", &e))?;
+        Ok(ids)
+    }
+
+    /// Stores an image once per content and returns its lowercase hex
+    /// SHA-256. Storing the same bytes again keeps the first copy.
+    pub fn put_artwork(&self, bytes: &[u8], mime: &str) -> Result<String> {
+        let hash = sha256_hex(bytes);
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO artwork (sha256, mime, bytes, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                params![hash, mime, bytes, now_unix()],
+            )
+            .map_err(|e| sql("store the artwork", &e))?;
+        Ok(hash)
+    }
+
+    /// An image and its MIME type, by hash.
+    pub fn artwork(&self, sha256: &str) -> Result<Option<(Vec<u8>, String)>> {
+        self.conn
+            .query_row("SELECT bytes, mime FROM artwork WHERE sha256 = ?1", [sha256], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(|e| sql("read the artwork", &e))
+    }
+}
+
+/// The state of a result, which must be its track's current one.
+fn current_state(conn: &Connection, result: ResultId) -> Result<ReviewState> {
+    let row: Option<(String, bool)> = conn
+        .query_row("SELECT state, is_current FROM results WHERE id = ?1", [result], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .map_err(|e| sql("read the result's state", &e))?;
+    match row {
+        None => Err(IdentifyError::Store(format!("no result {result}"))),
+        Some((_, false)) => Err(IdentifyError::Store(format!("result {result} has been superseded by a newer one"))),
+        Some((state, true)) => ReviewState::parse(&state),
+    }
+}
+
+fn set_state_unchecked(conn: &Connection, result: ResultId, state: ReviewState) -> Result<()> {
+    conn.execute(
+        "UPDATE results SET state = ?2, updated_unix = ?3 WHERE id = ?1",
+        params![result, state.as_str(), now_unix()],
+    )
+    .map_err(|e| sql("change the result's state", &e))?;
+    Ok(())
+}
+
+fn track_exists(conn: &Connection, id: TrackId) -> Result<bool> {
+    conn.query_row("SELECT 1 FROM tracks WHERE id = ?1", [id], |_| Ok(()))
+        .optional()
+        .map(|r| r.is_some())
+        .map_err(|e| sql("find the track", &e))
+}
+
+fn has_snapshot(conn: &Connection, track: TrackId) -> Result<bool> {
+    conn.query_row("SELECT 1 FROM snapshots WHERE track_id = ?1", [track], |_| Ok(()))
+        .optional()
+        .map(|r| r.is_some())
+        .map_err(|e| sql("read the tag snapshot", &e))
+}
+
+fn has_application(conn: &Connection, result: ResultId) -> Result<bool> {
+    conn.query_row("SELECT 1 FROM applications WHERE result_id = ?1 LIMIT 1", [result], |_| Ok(()))
+        .optional()
+        .map(|r| r.is_some())
+        .map_err(|e| sql("read the applied changes", &e))
+}
+
+fn file_size(size: u64) -> Result<i64> {
+    i64::try_from(size).map_err(|_| IdentifyError::Store("file size out of range".to_owned()))
+}
+
+/// Seconds since the Unix epoch; 0 for a clock set before it.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn to_json<T: Serialize + ?Sized>(value: &T, what: &str) -> Result<String> {
+    // The serde error is left out: it can quote the value (tag text).
+    serde_json::to_string(value).map_err(|e| IdentifyError::Store(format!("could not encode the {what} ({:?})", e.classify())))
+}
+
+fn from_json<T: DeserializeOwned>(json: &str, what: &str) -> Result<T> {
+    // Position only: serde's message can quote the stored text.
+    serde_json::from_str(json).map_err(|e| {
+        IdentifyError::Store(format!(
+            "the stored {what} is unreadable ({:?} error at line {} column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })
+}
+
+/// The text part of a [`TagSnapshot`]: everything but `raw_id3`, which is
+/// stored as BLOBs. Deserialises as a `TagSnapshot` with no `raw_id3`.
+#[derive(Serialize)]
+struct SnapshotText<'a> {
+    format: &'a str,
+    values: &'a BTreeMap<Field, Vec<FrameValues>>,
+    has_artwork: bool,
+}
+
+/// The model's encoding of raw ID3 bytes: unpadded standard base64.
+const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD_NO_PAD;
+
+/// Raw tag bytes from the model's base64, refused unless encoding them
+/// again gives back exactly the same text.
+fn decode_raw(b64: &str, what: &str) -> Result<Vec<u8>> {
+    let bytes = BASE64
+        .decode(b64)
+        .map_err(|_| IdentifyError::Store(format!("the snapshot's raw {what} is not unpadded standard base64")))?;
+    if BASE64.encode(&bytes) != b64 {
+        return Err(IdentifyError::Store(format!("the snapshot's raw {what} is not canonical base64")));
+    }
+    Ok(bytes)
 }
 
 /// A SQLite error as a store error, saying what was being done. Never
@@ -240,7 +971,100 @@ fn sql(doing: &str, e: &rusqlite::Error) -> IdentifyError {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::model::{
+        ArtworkSource, Candidate, CandidateSource, Field, FrameValues, RawId3, ReleaseInfo, ScoreBreakdown,
+    };
+
+    fn key(path: &str) -> TrackKey {
+        TrackKey { path: path.to_owned(), file_size: 1_000, modified_unix: 1_700_000_000 }
+    }
+
+    fn tags(title: &str) -> ExistingTags {
+        ExistingTags { artist: "Artist".into(), title: title.into(), ..ExistingTags::default() }
+    }
+
+    fn snapshot(title: &str) -> TagSnapshot {
+        let mut values = BTreeMap::new();
+        values.insert(Field::Title, vec![FrameValues { frame: "TIT2".into(), values: vec![title.into()] }]);
+        values.insert(
+            Field::CatalogNumber,
+            vec![FrameValues { frame: "TXXX:Catalog #".into(), values: vec!["CAT 001".into(), "cat001".into()] }],
+        );
+        TagSnapshot {
+            format: "Id3v2".into(),
+            values,
+            has_artwork: false,
+            raw_id3: Some(RawId3 { v2: Some(BASE64.encode(format!("ID3 {title}"))), v1: None }),
+        }
+    }
+
+    fn scored(title: &str, score: f64) -> Scored {
+        Scored {
+            candidate: Candidate {
+                recording_mbid: format!("mbid-{title}"),
+                artists: vec!["Artist".into()],
+                artist_credit: "Artist feat. Other".into(),
+                title: title.into(),
+                disambiguation: String::new(),
+                remixers: vec!["Remixer".into()],
+                length_ms: Some(360_000),
+                isrcs: vec!["GBAAA0000001".into()],
+                genres: vec!["house".into()],
+                releases: vec![ReleaseInfo { mbid: "rel".into(), title: "EP".into(), ..ReleaseInfo::default() }],
+                acoustid_score: Some(0.97),
+                source: CandidateSource::Fingerprint,
+            },
+            score,
+            breakdown: ScoreBreakdown { acoustid: Some(0.97), duration: 1.0, text: 0.9, mix: 1.0, rejected: None },
+        }
+    }
+
+    fn proposal() -> Proposal {
+        Proposal::new(
+            vec![FieldChange { field: Field::Label, current: String::new(), proposed: "Defected".into() }],
+            Some(ArtworkRef {
+                source: ArtworkSource::CoverArtArchive,
+                url: "https://coverartarchive.org/release/rel/front-500".into(),
+                sha256: "00".repeat(32),
+                mime: "image/jpeg".into(),
+                bytes: 12,
+            }),
+            false,
+        )
+    }
+
+    fn enrichment() -> Enrichment {
+        Enrichment {
+            discogs_release_id: Some(123),
+            release_title: "The EP".into(),
+            label: "Defected".into(),
+            catalog_number: "DFTD001".into(),
+            year: Some(2014),
+            styles: vec!["Tech House".into(), "Deep House".into()],
+            genres: vec!["Electronic".into()],
+        }
+    }
+
+    /// A track with a review result scoring `score`.
+    fn reviewed(store: &Store, path: &str, top: f64) -> (TrackId, ResultId) {
+        let track = store.upsert_track(&key(path), 360.0, Some("AQAB"), &tags("T")).unwrap();
+        let result = store
+            .save_result(track, Decision::Review, &[scored("T", top)], Some(&proposal()), None, &[], false)
+            .unwrap();
+        (track, result)
+    }
+
+    /// Takes the original snapshot and writes `result`'s proposal, as Phase 4 will.
+    fn apply(store: &Store, track: TrackId, result: ResultId) {
+        store.save_original_snapshot(track, &snapshot("T")).unwrap();
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let path = store.result(result).unwrap().unwrap().0.path;
+        let after = TrackKey { path, file_size: 2_000, modified_unix: 1_800_000_000 };
+        store.record_applied(result, &proposal().changes, None, &after, None).unwrap();
+    }
 
     #[test]
     fn a_new_store_has_the_schema() {
@@ -249,5 +1073,412 @@ mod tests {
         for table in ["tracks", "snapshots", "results", "applications", "artwork"] {
             assert!(store.has_table(table).unwrap(), "{table}");
         }
+    }
+
+    #[test]
+    fn upsert_returns_the_same_id_and_keeps_the_latest_info() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.upsert_track(&key("a.mp3"), 360.0, Some("AQAB"), &tags("Old")).unwrap();
+        let b = store.upsert_track(&key("a.mp3"), 361.0, None, &tags("New")).unwrap();
+        assert_eq!(a, b);
+        let (existing, fingerprint): (String, Option<String>) = store
+            .conn
+            .query_row("SELECT existing_json, fingerprint FROM tracks WHERE id = ?1", [a], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(from_json::<ExistingTags>(&existing, "x").unwrap().title, "New");
+        assert_eq!(fingerprint.as_deref(), Some("AQAB"), "an unchanged file keeps its fingerprint");
+        let changed = TrackKey { file_size: 5, ..key("a.mp3") };
+        store.upsert_track(&changed, 361.0, None, &tags("New")).unwrap();
+        let fingerprint: Option<String> =
+            store.conn.query_row("SELECT fingerprint FROM tracks WHERE id = ?1", [a], |r| r.get(0)).unwrap();
+        assert_eq!(fingerprint, None, "a changed file's old fingerprint is stale");
+        assert_eq!(store.track_id("a.mp3").unwrap(), Some(a));
+        assert_eq!(store.track_id("b.mp3").unwrap(), None);
+    }
+
+    #[test]
+    fn the_original_snapshot_round_trips_exactly() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        assert_eq!(store.original_snapshot(track).unwrap(), None);
+        let original = snapshot("Original Title (Extended Mix)");
+        assert!(store.save_original_snapshot(track, &original).unwrap());
+        assert_eq!(store.original_snapshot(track).unwrap(), Some(original));
+        // Every shape of raw_id3 comes back as it went in.
+        for raw in [
+            None,
+            Some(RawId3::default()),
+            Some(RawId3 { v2: Some(String::new()), v1: Some(BASE64.encode([0u8; 128])) }),
+        ] {
+            let t = store.upsert_track(&key(&format!("{raw:?}.mp3")), 1.0, None, &tags("T")).unwrap();
+            let snap = TagSnapshot { raw_id3: raw, ..snapshot("x") };
+            assert!(store.save_original_snapshot(t, &snap).unwrap());
+            assert_eq!(store.original_snapshot(t).unwrap(), Some(snap));
+        }
+    }
+
+    #[test]
+    fn the_original_snapshot_is_never_replaced() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, first) = reviewed(&store, "a.mp3", 0.8);
+        let original = snapshot("Original");
+        assert!(store.save_original_snapshot(track, &original).unwrap());
+
+        // Another snapshot, before anything is written: refused.
+        assert!(!store.save_original_snapshot(track, &snapshot("Second")).unwrap());
+        // Through the whole review flow and an apply.
+        store.set_state(first, ReviewState::Accepted).unwrap();
+        let after = TrackKey { file_size: 2_000, modified_unix: 1_800_000_000, ..key("a.mp3") };
+        store.record_applied(first, &proposal().changes, None, &after, None).unwrap();
+        assert!(!store.save_original_snapshot(track, &snapshot("After apply")).unwrap());
+        // A re-scan after the tags were applied (the file changed).
+        store.upsert_track(&after, 360.0, None, &tags("Applied Title")).unwrap();
+        assert!(!store.save_original_snapshot(track, &snapshot("Applied Title")).unwrap());
+        // Undo, re-identify (replacing an applied result), re-apply.
+        store.set_state(first, ReviewState::Undone).unwrap();
+        let second =
+            store.save_result(track, Decision::Review, &[scored("U", 0.9)], Some(&proposal()), None, &[], false).unwrap();
+        store.set_state(second, ReviewState::Accepted).unwrap();
+        store.record_applied(second, &proposal().changes, None, &after, None).unwrap();
+        let third = store.save_result(track, Decision::AutoApply, &[], None, None, &[], true).unwrap();
+        assert!(!store.save_original_snapshot(track, &snapshot("Later")).unwrap());
+        store.set_state(third, ReviewState::Undone).unwrap();
+
+        assert_eq!(store.original_snapshot(track).unwrap(), Some(original));
+    }
+
+    #[test]
+    fn the_database_itself_refuses_to_change_a_snapshot() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        store.save_original_snapshot(track, &snapshot("Original")).unwrap();
+        for statement in [
+            "UPDATE snapshots SET snapshot_json = '{}'",
+            "DELETE FROM snapshots",
+            "INSERT OR REPLACE INTO snapshots (track_id, snapshot_json, has_raw_id3, file_size, modified_unix, taken_unix)
+             SELECT track_id, '{}', 0, 0, 0, 0 FROM snapshots",
+        ] {
+            let err = store.conn.execute(statement, []).unwrap_err();
+            assert!(err.to_string().contains("immutable"), "{statement}: {err}");
+        }
+        assert_eq!(store.original_snapshot(track).unwrap(), Some(snapshot("Original")));
+    }
+
+    #[test]
+    fn a_snapshot_needs_a_known_track() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(matches!(store.save_original_snapshot(42, &snapshot("x")), Err(IdentifyError::Store(_))));
+    }
+
+    #[test]
+    fn a_snapshot_with_base64_that_would_not_come_back_identical_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        for bad in ["not base64!", "SUQz==" /* padded */] {
+            let snap = TagSnapshot { raw_id3: Some(RawId3 { v2: Some(bad.into()), v1: None }), ..snapshot("x") };
+            assert!(store.save_original_snapshot(track, &snap).is_err(), "{bad}");
+        }
+        assert_eq!(store.original_snapshot(track).unwrap(), None, "nothing half-stored");
+    }
+
+    #[test]
+    fn raw_id3_is_stored_as_bytes_not_base64() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        let v2: Vec<u8> = (0..2 * 1024 * 1024_u32).map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[2]).collect();
+        let v1 = vec![b'T'; 128];
+        let snap = TagSnapshot {
+            raw_id3: Some(RawId3 { v2: Some(BASE64.encode(&v2)), v1: Some(BASE64.encode(&v1)) }),
+            ..snapshot("x")
+        };
+        assert!(store.save_original_snapshot(track, &snap).unwrap());
+        let (stored_v2, stored_v1, json): (Vec<u8>, Vec<u8>, String) = store
+            .conn
+            .query_row("SELECT raw_id3_v2, raw_id3_v1, snapshot_json FROM snapshots", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(stored_v2, v2, "the BLOB is the raw bytes");
+        assert_eq!(stored_v1, v1);
+        assert!(json.len() < 1_000, "no base64 in the JSON part ({} bytes)", json.len());
+        assert_eq!(store.original_snapshot(track).unwrap(), Some(snap));
+    }
+
+    #[test]
+    fn the_newest_result_is_current_and_older_ones_stay() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, first) = reviewed(&store, "a.mp3", 0.6);
+        let second = store
+            .save_result(track, Decision::Review, &[scored("B", 0.8)], Some(&proposal()), None, &[], false)
+            .unwrap();
+        assert_ne!(first, second);
+        let all = store.list(Filter::All, 0, 10).unwrap();
+        assert_eq!(all.len(), 1, "one current result per track");
+        assert_eq!(all[0].result, second);
+        // The first is history: still readable, no longer changeable.
+        assert!(store.result(first).unwrap().is_some());
+        assert!(store.set_state(first, ReviewState::Accepted).is_err());
+        assert_eq!(store.count(Filter::All).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_new_result_starts_in_the_state_its_decision_implies() {
+        let store = Store::open_in_memory().unwrap();
+        for (path, decision, state) in [
+            ("a", Decision::Review, ReviewState::Pending),
+            ("b", Decision::Unidentified, ReviewState::Unidentified),
+            ("c", Decision::AutoApply, ReviewState::AutoApplied),
+        ] {
+            let track = store.upsert_track(&key(path), 1.0, None, &tags("T")).unwrap();
+            let id = store.save_result(track, decision, &[], None, None, &[], false).unwrap();
+            let (item, ..) = store.result(id).unwrap().unwrap();
+            assert_eq!((item.state, item.decision, item.score), (state, decision, None));
+        }
+    }
+
+    #[test]
+    fn the_state_machine_allows_only_its_transitions() {
+        use ReviewState::{Accepted, Applied, AutoApplied, Pending, Rejected, Undone, Unidentified};
+        let allowed = [
+            (Pending, Accepted),
+            (Pending, Rejected),
+            (Accepted, Pending),
+            (Accepted, Rejected),
+            (Rejected, Pending),
+            (Applied, Undone),
+            (AutoApplied, Undone),
+            (Undone, Pending),
+        ];
+        for from in ReviewState::ALL {
+            for to in ReviewState::ALL {
+                assert_eq!(from.may_become(to), allowed.contains(&(from, to)), "{from:?} -> {to:?}");
+            }
+        }
+        assert!(!Unidentified.may_become(Pending));
+        assert!(!Accepted.may_become(Applied), "only record_applied reaches Applied");
+    }
+
+    #[test]
+    fn set_state_follows_the_table_in_the_store() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, result) = reviewed(&store, "a.mp3", 0.8);
+        let state = |s: &Store| s.result(result).unwrap().unwrap().0.state;
+
+        assert!(store.set_state(result, ReviewState::Undone).is_err());
+        assert!(store.set_state(result, ReviewState::Applied).is_err());
+        assert!(store.set_state(result, ReviewState::Pending).is_err(), "a state to itself is refused");
+        assert_eq!(state(&store), ReviewState::Pending, "a refused change changes nothing");
+
+        store.set_state(result, ReviewState::Rejected).unwrap();
+        assert!(store.set_state(result, ReviewState::Accepted).is_err());
+        store.set_state(result, ReviewState::Pending).unwrap();
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        assert_eq!(state(&store), ReviewState::Accepted);
+        assert!(store.set_state(9_999, ReviewState::Accepted).is_err());
+    }
+
+    #[test]
+    fn record_applied_keeps_exactly_what_was_written() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, result) = reviewed(&store, "a.mp3", 0.8);
+        let written = vec![FieldChange { field: Field::Label, current: String::new(), proposed: "Defected".into() }];
+        let art = proposal().artwork;
+        let after = TrackKey { file_size: 2_048, modified_unix: 1_800_000_123, ..key("a.mp3") };
+
+        // Not before it is accepted, and not without the original snapshot.
+        assert!(store.record_applied(result, &written, art.as_ref(), &after, None).is_err());
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let err = store.record_applied(result, &written, art.as_ref(), &after, None).unwrap_err();
+        assert!(err.to_string().contains("snapshot"), "{err}");
+        store.save_original_snapshot(track, &snapshot("T")).unwrap();
+        // Not for another file.
+        let other = TrackKey { path: "b.mp3".into(), ..after.clone() };
+        assert!(store.record_applied(result, &written, art.as_ref(), &other, None).is_err());
+
+        store.record_applied(result, &written, art.as_ref(), &after, Some(r#"{"content_id":7}"#)).unwrap();
+        assert_eq!(store.applied_changes(result).unwrap(), written);
+        let application = store.last_application(result).unwrap().unwrap();
+        assert_eq!(application.artwork, art);
+        assert_eq!(application.file_after, after);
+        assert_eq!(application.library_snapshot.as_deref(), Some(r#"{"content_id":7}"#));
+        assert!(application.applied_unix > 0);
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Applied);
+        // Applied twice is refused.
+        assert!(store.record_applied(result, &written, None, &after, None).is_err());
+        assert_eq!(store.applied_changes(9_999).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn an_auto_applied_result_is_recorded_once_and_stays_auto_applied() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 1.0, None, &tags("T")).unwrap();
+        store.save_original_snapshot(track, &snapshot("T")).unwrap();
+        let result = store.save_result(track, Decision::AutoApply, &[scored("T", 0.95)], None, None, &[], false).unwrap();
+        store.record_applied(result, &proposal().changes, None, &key("a.mp3"), None).unwrap();
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::AutoApplied);
+        assert!(store.record_applied(result, &proposal().changes, None, &key("a.mp3"), None).is_err());
+    }
+
+    #[test]
+    fn a_re_apply_after_undo_keeps_both_records() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, result) = reviewed(&store, "a.mp3", 0.8);
+        apply(&store, track, result);
+        store.set_state(result, ReviewState::Undone).unwrap();
+        store.set_state(result, ReviewState::Pending).unwrap();
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let only_label = &proposal().changes[..1];
+        store.record_applied(result, only_label, None, &key("a.mp3"), None).unwrap();
+        assert_eq!(store.applied_changes(result).unwrap(), only_label);
+        let n: i64 = store.conn.query_row("SELECT COUNT(*) FROM applications", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn an_applied_result_is_not_replaced_unless_allowed() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, result) = reviewed(&store, "a.mp3", 0.8);
+        apply(&store, track, result);
+        let err = store.save_result(track, Decision::Review, &[], None, None, &[], false).unwrap_err();
+        assert!(matches!(err, IdentifyError::Store(_)));
+        assert_eq!(store.list(Filter::All, 0, 10).unwrap()[0].result, result, "still current");
+        let newer = store.save_result(track, Decision::Review, &[], None, None, &[], true).unwrap();
+        assert_eq!(store.list(Filter::All, 0, 10).unwrap()[0].result, newer);
+
+        // AutoApplied is applied too.
+        let t2 = store.upsert_track(&key("b.mp3"), 1.0, None, &tags("T")).unwrap();
+        store.save_result(t2, Decision::AutoApply, &[], None, None, &[], false).unwrap();
+        assert!(store.save_result(t2, Decision::Review, &[], None, None, &[], false).is_err());
+        // An undone one may be replaced.
+        let (t3, r3) = reviewed(&store, "c.mp3", 0.8);
+        apply(&store, t3, r3);
+        store.set_state(r3, ReviewState::Undone).unwrap();
+        store.save_result(t3, Decision::Review, &[], None, None, &[], false).unwrap();
+    }
+
+    #[test]
+    fn the_queue_filters_orders_and_pages() {
+        let store = Store::open_in_memory().unwrap();
+        reviewed(&store, "b.mp3", 0.7);
+        reviewed(&store, "a.mp3", 0.7);
+        reviewed(&store, "c.mp3", 0.9);
+        let none = store.upsert_track(&key("d.mp3"), 1.0, None, &tags("T")).unwrap();
+        store.save_result(none, Decision::Unidentified, &[], None, None, &[], false).unwrap();
+        let (t, r) = reviewed(&store, "e.mp3", 0.6);
+        apply(&store, t, r);
+        let auto = store.upsert_track(&key("f.mp3"), 1.0, None, &tags("T")).unwrap();
+        store.save_result(auto, Decision::AutoApply, &[scored("F", 0.95)], None, None, &[], false).unwrap();
+        // A track with no result is not in the queue.
+        store.upsert_track(&key("g.mp3"), 1.0, None, &tags("T")).unwrap();
+
+        let paths = |filter, offset, limit| -> Vec<String> {
+            store.list(filter, offset, limit).unwrap().into_iter().map(|i| i.path).collect()
+        };
+        assert_eq!(paths(Filter::NeedsReview, 0, 10), ["c.mp3", "a.mp3", "b.mp3"]);
+        assert_eq!(paths(Filter::Unidentified, 0, 10), ["d.mp3"]);
+        assert_eq!(paths(Filter::Applied, 0, 10), ["f.mp3", "e.mp3"]);
+        assert_eq!(paths(Filter::All, 0, 10), ["f.mp3", "c.mp3", "a.mp3", "b.mp3", "e.mp3", "d.mp3"]);
+        assert_eq!(paths(Filter::All, 2, 2), ["a.mp3", "b.mp3"]);
+        assert_eq!(paths(Filter::All, 6, 2), Vec::<String>::new());
+        assert_eq!(store.count(Filter::NeedsReview).unwrap(), 3);
+        assert_eq!(store.count(Filter::Unidentified).unwrap(), 1);
+        assert_eq!(store.count(Filter::Applied).unwrap(), 2);
+        assert_eq!(store.count(Filter::All).unwrap(), 6);
+
+        let item = &store.list(Filter::NeedsReview, 0, 1).unwrap()[0];
+        assert_eq!(item.score, Some(0.9));
+        assert_eq!(item.existing, tags("T"));
+        assert_eq!(item.proposal, Some(proposal()));
+        assert!(item.updated_unix > 0);
+    }
+
+    #[test]
+    fn bulk_accept_takes_pending_results_at_or_above_the_threshold() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, low) = reviewed(&store, "a.mp3", 0.79);
+        let (_, at) = reviewed(&store, "b.mp3", 0.8);
+        let (_, high) = reviewed(&store, "c.mp3", 0.95);
+        let (_, rejected) = reviewed(&store, "d.mp3", 0.99);
+        store.set_state(rejected, ReviewState::Rejected).unwrap();
+        // A superseded high scorer is history, not accepted.
+        let (t, old) = reviewed(&store, "e.mp3", 0.99);
+        store.save_result(t, Decision::Review, &[scored("E", 0.5)], None, None, &[], false).unwrap();
+
+        assert_eq!(store.accept_at_or_above(0.8).unwrap(), [high, at]);
+        let state = |id| store.result(id).unwrap().unwrap().0.state;
+        assert_eq!(state(high), ReviewState::Accepted);
+        assert_eq!(state(at), ReviewState::Accepted);
+        assert_eq!(state(low), ReviewState::Pending);
+        assert_eq!(state(rejected), ReviewState::Rejected);
+        assert_eq!(state(old), ReviewState::Pending);
+        assert_eq!(store.accept_at_or_above(0.8).unwrap(), Vec::<ResultId>::new(), "nothing twice");
+        assert!(store.accept_at_or_above(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn artwork_is_stored_once_per_content() {
+        let store = Store::open_in_memory().unwrap();
+        let png = [0x89, b'P', b'N', b'G', 1, 2, 3];
+        let hash = store.put_artwork(&png, "image/png").unwrap();
+        // SHA-256 of the empty string, to pin the encoding.
+        assert_eq!(
+            store.put_artwork(&[], "image/jpeg").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(store.put_artwork(&png, "image/png").unwrap(), hash);
+        let n: i64 = store.conn.query_row("SELECT COUNT(*) FROM artwork", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(store.artwork(&hash).unwrap(), Some((png.to_vec(), "image/png".to_owned())));
+        assert_eq!(store.artwork(&"0".repeat(64)).unwrap(), None);
+    }
+
+    #[test]
+    fn candidates_proposal_enrichment_and_warnings_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 1.0, None, &tags("T")).unwrap();
+        let candidates = vec![scored("Best (Extended Mix)", 0.93), scored("Other", 0.4)];
+        let warnings = vec!["Discogs: HTTP 503".to_owned()];
+        let id = store
+            .save_result(track, Decision::Review, &candidates, Some(&proposal()), Some(&enrichment()), &warnings, false)
+            .unwrap();
+        let (item, got, enr, warn) = store.result(id).unwrap().unwrap();
+        assert_eq!(got, candidates);
+        assert_eq!(item.proposal, Some(proposal()));
+        assert_eq!(item.score, Some(0.93));
+        assert_eq!(enr, Some(enrichment()));
+        assert_eq!(warn, warnings);
+        assert_eq!(store.result(9_999).unwrap().map(|r| r.0), None);
+    }
+
+    #[test]
+    fn a_windows_path_round_trips_exactly() {
+        let store = Store::open_in_memory().unwrap();
+        let path = "C:\\Music\\Röyksopp\\Track.mp3";
+        let (track, _) = reviewed(&store, path, 0.8);
+        assert_eq!(store.list(Filter::All, 0, 1).unwrap()[0].path, path);
+        assert_eq!(store.track_id(path).unwrap(), Some(track));
+        // Another spelling is another key: the store does not normalise.
+        assert_eq!(store.track_id("C:/Music/Röyksopp/Track.mp3").unwrap(), None);
+    }
+
+    #[test]
+    fn errors_never_quote_bound_values() {
+        let store = Store::open_in_memory().unwrap();
+        let secret_path = "C:\\Music\\SECRET-PATH.mp3";
+        let (_, result) = reviewed(&store, secret_path, 0.8);
+        let errors = [
+            store.set_state(result, ReviewState::Undone).unwrap_err(),
+            store.record_applied(result, &[], None, &key(secret_path), Some("SECRET-LIB")).unwrap_err(),
+        ];
+        for err in errors {
+            let text = err.to_string();
+            assert!(!text.contains("SECRET"), "{text}");
+        }
+        let bad = from_json::<ExistingTags>(r#"{"artist": 5, "title": "SECRET-TAG"}"#, "existing tags").unwrap_err();
+        assert!(!bad.to_string().contains("SECRET"), "{bad}");
     }
 }
