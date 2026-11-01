@@ -180,6 +180,11 @@ fn id3v2_fields(block: &[u8]) -> Vec<(Field, FrameValues)> {
         return Vec::new();
     }
     let flags = block[5];
+    if flags & 0x80 != 0 {
+        // Whole-tag unsynchronisation: frames would need un-escaping first.
+        // Rare; the reader's own values stand for such a tag.
+        return Vec::new();
+    }
     let body_end = block.len().min(10 + syncsafe(&block[6..10]));
     let mut at = 10;
     if flags & 0x40 != 0 {
@@ -270,7 +275,10 @@ fn decode_text(data: &[u8]) -> Option<String> {
 fn split_once_text(data: &[u8]) -> Option<(String, String)> {
     let text = decode_text(data)?;
     let (description, value) = text.split_once('\0').unwrap_or((text.as_str(), ""));
-    Some((description.to_owned(), value.trim_end_matches('\0').to_owned()))
+    // In UTF-16 each string has its own BOM; the first was consumed when
+    // decoding, the value's would be left as a leading U+FEFF.
+    let value = value.trim_end_matches('\0').trim_start_matches('\u{feff}');
+    Some((description.trim_start_matches('\u{feff}').to_owned(), value.to_owned()))
 }
 
 /// Multiple values of a text frame are NUL-separated; trailing NULs are
