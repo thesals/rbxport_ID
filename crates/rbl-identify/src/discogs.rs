@@ -27,7 +27,7 @@ const SERVICE: &str = "discogs";
 /// The API root. The token is sent only to this host.
 pub const BASE_URL: &str = "https://api.discogs.com";
 const API_HOST: &str = "api.discogs.com";
-/// Said once Discogs answers 401/403: the token is not a personal access
+/// Said once Discogs answers 401: the token is not a personal access
 /// token (a consumer key looks similar but does not authenticate).
 const TOKEN_REFUSED: &str =
     "Discogs refused the token; use a personal access token (Discogs → Settings → Developers → Generate token)";
@@ -123,7 +123,7 @@ pub struct DiscogsClient {
     clock: Arc<dyn Clock>,
     token: Secret,
     user_agent: String,
-    /// Set once Discogs refuses the token (401/403): a bad token would fail
+    /// Set once Discogs refuses the token (401): a bad token would fail
     /// every request, so after the first the client stops asking.
     refused: AtomicBool,
 }
@@ -211,7 +211,8 @@ impl DiscogsClient {
         }
         let request = self.api_request(url);
         match ratelimit::send(&*self.transport, &self.limiter, &*self.clock, SERVICE, &request) {
-            Err(IdentifyError::Status { status: 401 | 403, .. }) => {
+            // 401 only: a 403 can be about one resource, not the token.
+            Err(IdentifyError::Status { status: 401, .. }) => {
                 self.refused.store(true, Ordering::Relaxed);
                 Err(IdentifyError::Service { service: SERVICE, message: TOKEN_REFUSED.to_owned() })
             }
