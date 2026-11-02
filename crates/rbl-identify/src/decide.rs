@@ -1,6 +1,6 @@
 //! The decision: auto-apply, review or unidentified.
 
-use crate::model::{Decision, Scored};
+use crate::model::{CandidateSource, Decision, Scored};
 
 /// A candidate at or above this may be applied unattended, when the other
 /// auto-apply conditions hold.
@@ -10,9 +10,11 @@ pub const REVIEW_THRESHOLD: f64 = 0.5;
 
 /// Decides what may happen to a file given its best candidate.
 ///
-/// Auto-apply needs all three: score ≥ 0.92, a proposal that only fills
-/// empty fields (`Proposal::fills_only_empty`, the one rule for that), and
-/// the user's opt-in (off by default). Below 0.5, or with no
+/// Auto-apply needs all four: a fingerprint match (a text search or the
+/// Discogs fallback is never proof enough, whatever its score), score ≥
+/// 0.92, a proposal that only fills empty fields
+/// (`Proposal::fills_only_empty`, the one rule for that), and the user's
+/// opt-in (off by default). Below 0.5, or with no
 /// candidate, the file is unidentified rather than guessed at. Anything in
 /// between goes to review.
 pub fn decide(best: Option<&Scored>, fills_only_empty: bool, auto_apply_enabled: bool) -> Decision {
@@ -22,7 +24,8 @@ pub fn decide(best: Option<&Scored>, fills_only_empty: bool, auto_apply_enabled:
     if best.score.is_nan() || best.score < REVIEW_THRESHOLD {
         return Decision::Unidentified;
     }
-    if best.score >= AUTO_APPLY_THRESHOLD && fills_only_empty && auto_apply_enabled {
+    let fingerprinted = best.candidate.source == CandidateSource::Fingerprint;
+    if fingerprinted && best.score >= AUTO_APPLY_THRESHOLD && fills_only_empty && auto_apply_enabled {
         Decision::AutoApply
     } else {
         Decision::Review
@@ -75,6 +78,15 @@ mod tests {
         assert_eq!(decide(Some(&best), false, true), Decision::Review);
         assert_eq!(decide(Some(&best), true, false), Decision::Review);
         assert_eq!(decide(Some(&best), false, false), Decision::Review);
+    }
+
+    #[test]
+    fn only_a_fingerprint_match_may_auto_apply() {
+        for source in [CandidateSource::TextSearch, CandidateSource::DiscogsText] {
+            let mut best = scored(0.99);
+            best.candidate.source = source;
+            assert_eq!(decide(Some(&best), true, true), Decision::Review, "{source:?}");
+        }
     }
 
 }
