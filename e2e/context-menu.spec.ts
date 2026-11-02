@@ -45,8 +45,10 @@ test("the rows are on rekordbox's 25pt pitch in its 12.5px face", async ({ page 
   const items = await rows(menu);
   // Thirteen in the capture, less the three cloud rows, Collaborative
   // playlist and Create New Intelligent Playlist (unfinished, hidden
-  // 2026-09-20), plus Rename.
-  expect(items).toHaveLength(9);
+  // 2026-09-20), plus Rename. The fork's two identify rows follow
+  // rekordbox's, behind a separator of their own.
+  expect(items).toHaveLength(9 + 2);
+  expect(items.slice(-2).map((i) => i.label)).toEqual(["Identify Tracks", "Review Identified Tracks"]);
   for (const item of items) {
     expect(item.height, item.label).toBe(25);
     expect(item.fontSize, item.label).toBe("12.5px");
@@ -82,8 +84,8 @@ test("the panel is a point of padding inside a one-point hairline", async ({ pag
   // Nine rows, six separators, the padding and the hairline. The capture's
   // panel is 812px tall at 2x: four cloud rows, a separator and Create New
   // Intelligent Playlist (unfinished, hidden 2026-09-20) shorter, one
-  // Rename taller.
-  expect(panel.height).toBe(9 * 25 + 6 * 11 + 2 + 2);
+  // Rename taller. The fork's two identify rows and their separator add to it.
+  expect(panel.height).toBe((9 + 2) * 25 + (6 + 1) * 11 + 2 + 2);
 
   const separators = await menu.evaluate((m) => {
     const box = m.getBoundingClientRect();
@@ -92,7 +94,7 @@ test("the panel is a point of padding inside a one-point hairline", async ({ pag
       return { height: r.height, left: r.left - box.left, right: box.right - r.right };
     });
   });
-  expect(separators).toHaveLength(6);
+  expect(separators).toHaveLength(6 + 1);
   for (const s of separators) {
     expect(s.height).toBe(1);
     // 4pt in from the hairline on the left, 16pt on the right.
@@ -157,8 +159,10 @@ test("the track menu is the same panel, with rekordbox's entries less the cloud"
   await expect(menu).toBeVisible();
 
   const items = await rows(menu);
-  // Twenty-one in the capture, less Cloud Library Sync.
-  expect(items).toHaveLength(20);
+  // Twenty-one in the capture, less Cloud Library Sync, plus the fork's
+  // Identify Tracks at the end.
+  expect(items).toHaveLength(20 + 1);
+  expect(items.at(-1)?.label).toBe("Identify Tracks");
   expect(items.map((i) => i.label)).toContain("Convert Memory Cues to Hot Cues");
   expect(items.map((i) => i.label)).not.toContain("Cloud Library Sync");
   for (const item of items) {
@@ -168,7 +172,7 @@ test("the track menu is the same panel, with rekordbox's entries less the cloud"
   // Twenty rows and seven separators; 1212px at 2x in the capture, one row less
   // here. The groups are unchanged: the cloud row shared one with Export Track.
   const height = await menu.evaluate((m) => m.getBoundingClientRect().height);
-  expect(height).toBe(20 * 25 + 7 * 11 + 2 + 2);
+  expect(height).toBe((20 + 1) * 25 + (7 + 1) * 11 + 2 + 2);
   await expect(menu.getByRole("menuitem", { name: "Track information" })).toHaveAttribute(
     "aria-disabled",
     "true",
