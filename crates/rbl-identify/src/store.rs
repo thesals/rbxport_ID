@@ -187,14 +187,31 @@ pub type ApplicationId = i64;
 ///
 /// The path is the key and is stored exactly as given: no case folding, no
 /// slash or `\\?\` normalisation, no resolving. `C:\Music\a.mp3` and
-/// `c:/music/A.mp3` are two tracks to the store. The caller (the Phase 3
-/// job) canonicalises paths before they get here, so one file always has
-/// one spelling.
+/// `c:/music/A.mp3` are two tracks to the store. Build keys with
+/// [`TrackKey::for_file`], which canonicalises the path
+/// ([`crate::paths::canonical_key`]), so one file always has one spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackKey {
     pub path: String,
     pub file_size: u64,
     pub modified_unix: i64,
+}
+
+impl TrackKey {
+    /// The key of an existing file as it is now: its canonical path, size
+    /// and modification time (whole seconds since the Unix epoch; 0 for a
+    /// time before it).
+    pub fn for_file(path: &Path) -> Result<Self> {
+        let canonical = crate::paths::canonical_key(path)?;
+        let meta = std::fs::metadata(&canonical)
+            .map_err(|e| IdentifyError::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))))?;
+        let modified_unix = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        Ok(Self { path: canonical, file_size: meta.len(), modified_unix })
+    }
 }
 
 /// Where a result stands in the review flow. Stored as its variant name.
@@ -1952,6 +1969,24 @@ mod tests {
         assert_eq!(store.track_id(path).unwrap(), Some(track));
         // Another spelling is another key: the store does not normalise.
         assert_eq!(store.track_id("C:/Music/Röyksopp/Track.mp3").unwrap(), None);
+    }
+
+    #[test]
+    fn a_key_for_a_file_is_canonical_so_spellings_meet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let file = dir.path().join("Track.mp3");
+        std::fs::write(&file, b"12345").unwrap();
+        let direct = TrackKey::for_file(&file).unwrap();
+        assert_eq!(direct.file_size, 5);
+        assert!(direct.modified_unix > 0);
+        assert!(!direct.path.starts_with(r"\\?\"), "{}", direct.path);
+        let roundabout = TrackKey::for_file(&dir.path().join("sub").join("..").join("Track.mp3")).unwrap();
+        assert_eq!(roundabout, direct);
+        let store = Store::open_in_memory().unwrap();
+        let id = store.upsert_track(&direct, 1.0, None, &tags("T")).unwrap();
+        assert_eq!(store.upsert_track(&roundabout, 1.0, None, &tags("T")).unwrap(), id, "one file, one track");
+        assert!(TrackKey::for_file(&dir.path().join("missing.mp3")).is_err());
     }
 
     #[test]

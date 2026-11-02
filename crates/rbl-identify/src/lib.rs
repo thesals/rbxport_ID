@@ -20,6 +20,7 @@ pub mod mixname;
 pub mod model;
 pub mod musicbrainz;
 pub mod normalize;
+pub mod paths;
 pub mod pipeline;
 pub mod ratelimit;
 pub mod report;
