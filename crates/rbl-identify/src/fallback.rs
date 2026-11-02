@@ -261,8 +261,9 @@ pub fn score_match(
 
 /// What a fallback match may change: only release fields that are empty in
 /// the file now (album, label, catalog number, year, Discogs release ID)
-/// and the sub-genre from Discogs styles. Never title, artist or genre, no
-/// MusicBrainz IDs, no artwork.
+/// and the sub-genre from Discogs styles, appended to the comment
+/// ([`crate::comment`]). Never title, artist or genre, no MusicBrainz IDs,
+/// no artwork.
 #[must_use]
 pub fn propose(snapshot: &TagSnapshot, enrichment: &Enrichment) -> Proposal {
     let wanted = [
@@ -271,13 +272,18 @@ pub fn propose(snapshot: &TagSnapshot, enrichment: &Enrichment) -> Proposal {
         (Field::CatalogNumber, enrichment.catalog_number.clone()),
         (Field::Year, enrichment.year.map(|y| y.to_string()).unwrap_or_default()),
         (Field::DiscogsReleaseId, enrichment.discogs_release_id.map(|id| id.to_string()).unwrap_or_default()),
-        (Field::SubGenre, enrichment.styles.join("; ")),
     ];
-    let changes = wanted
+    let mut changes: Vec<FieldChange> = wanted
         .into_iter()
         .filter(|(field, proposed)| !proposed.trim().is_empty() && pipeline::current(snapshot, *field).trim().is_empty())
         .map(|(field, proposed)| FieldChange { field, current: String::new(), proposed })
         .collect();
+    let styles = enrichment.styles.join(crate::comment::SEPARATOR);
+    let comment = pipeline::current(snapshot, Field::SubGenre);
+    let appended = crate::comment::append(&comment, &styles);
+    if appended != comment {
+        changes.push(FieldChange { field: Field::SubGenre, current: comment, proposed: appended });
+    }
     Proposal::new(changes, None, snapshot.has_artwork)
 }
 
@@ -386,7 +392,8 @@ mod tests {
         assert!(proposal.changes.iter().all(|c| c.current.is_empty()));
         assert_eq!(proposal.changes[3].proposed, "Tech House; Minimal");
         assert!(proposal.artwork.is_none());
-        // Everything already filled: nothing to change but the unread sub-genre.
+        // Everything already filled: nothing to change but the sub-genre,
+        // appended to the comment.
         let full = snapshot(&[
             (Field::Album, "A"),
             (Field::Label, "L"),

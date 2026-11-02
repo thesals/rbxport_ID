@@ -1,6 +1,6 @@
 //! Reading what a file already says: its tags, its true duration, and an
 //! exact snapshot of every field identification may change. Read-only;
-//! tag writing is Phase 4.
+//! writing is the tag writer's (Phase 4).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -53,15 +53,16 @@ fn keys(field: Field) -> Vec<ItemKey> {
         Field::DiscogsReleaseId => {
             vec![ItemKey::Unknown("DISCOGS_RELEASE_ID".to_owned()), ItemKey::Unknown("DISCOGS_RELEASEID".to_owned())]
         }
-        // TODO(Phase 4): read from the frame sub-genre is written to, once
-        // it is confirmed (COMM, TIT3 or TXXX:DESCRIPTION; comments are on the
-        // never-modify list). Until then it is not read: never in the
-        // snapshot, so always shown as empty, and never auto-applied.
-        Field::SubGenre | Field::Artwork => Vec::new(),
+        // The comment the sub-genre is appended to (crate::comment). In an
+        // ID3v2 tag read from the file's raw frames instead, where present:
+        // only a description-less COMM counts, which the generic item
+        // cannot be relied on to tell apart.
+        Field::SubGenre => vec![ItemKey::Comment],
+        Field::Artwork => Vec::new(),
     }
 }
 
-const TEXT_FIELDS: [Field; 15] = [
+const TEXT_FIELDS: [Field; 16] = [
     Field::Title,
     Field::Artist,
     Field::Album,
@@ -77,6 +78,7 @@ const TEXT_FIELDS: [Field; 15] = [
     Field::MbReleaseTrackId,
     Field::MbAlbumArtistId,
     Field::DiscogsReleaseId,
+    Field::SubGenre,
 ];
 
 /// Every frame holding a field, with its values exactly as stored, in the
@@ -139,7 +141,12 @@ pub fn read(path: &Path) -> Result<FileInfo> {
     // not look absent, or a proposal would count as filling an empty field
     // and auto-apply could overwrite it. Such a field is taken from the raw
     // frame instead.
-    for (field, frame) in raw_v2.as_deref().map(id3v2_fields).unwrap_or_default() {
+    let raw_fields = raw_v2.as_deref().map(id3v2_fields).unwrap_or_default();
+    if raw_v2.is_some() {
+        // The comment is exactly the first description-less COMM frame.
+        values.remove(&Field::SubGenre);
+    }
+    for (field, frame) in raw_fields {
         values.entry(field).or_insert_with(|| vec![frame]);
     }
     let has_artwork = tagged.tags().iter().any(|t| t.picture_count() > 0);
@@ -160,6 +167,7 @@ pub fn read(path: &Path) -> Result<FileInfo> {
         mb_release_id: first(Field::MbReleaseId),
         discogs_release_id: first(Field::DiscogsReleaseId),
         has_artwork,
+        comment: first_value(Field::SubGenre).cloned().unwrap_or_default(),
     };
     let raw_id3 = (raw_v2.is_some() || raw_v1.is_some()).then(|| {
         use base64::Engine as _;
@@ -225,6 +233,20 @@ fn frame_field(id: &str, data: &[u8]) -> Option<(Field, FrameValues)> {
             let end = data.iter().position(|&b| b == 0)?;
             let owner = String::from_utf8_lossy(&data[..end]).into_owned();
             (format!("UFID:{owner}"), vec![String::from_utf8_lossy(&data[end + 1..]).into_owned()])
+        }
+        "COMM" => {
+            // Encoding, three bytes of language, then description and text.
+            let (&encoding, rest) = data.split_first()?;
+            let mut text_data = vec![encoding];
+            text_data.extend_from_slice(rest.get(3..)?);
+            let (description, text) = split_once_text(&text_data)?;
+            let text = text.trim_end_matches(' ').to_owned();
+            // A described COMM (iTunNORM, ID3v1 Comment) is not the comment,
+            // and an empty one says nothing.
+            if !description.is_empty() || text.is_empty() {
+                return None;
+            }
+            return Some((Field::SubGenre, FrameValues { frame: "COMM".to_owned(), values: vec![text] }));
         }
         _ if id.starts_with('T') => (id.to_owned(), decode_text(data).map_or_else(|| vec![UNREADABLE.to_owned()], |text| split_values(&text))),
         _ => return None,
@@ -444,6 +466,32 @@ mod tests {
         );
         assert_eq!(get(Field::Label).unwrap().values, vec!["Ministry Of Sound (UK)".to_owned()]);
         assert_eq!(found.len(), 3, "TCOM is not a field identification changes");
+    }
+
+    #[test]
+    fn the_comment_is_the_first_comm_frame_without_a_description() {
+        let comm = |lang: &str, description: &str, text: &str| {
+            let mut payload = vec![0];
+            payload.extend_from_slice(lang.as_bytes());
+            payload.extend_from_slice(description.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(text.as_bytes());
+            ("COMM", payload)
+        };
+        let mut utf16 = vec![1];
+        utf16.extend_from_slice(b"Pur");
+        utf16.extend_from_slice(&[0xFF, 0xFE, 0, 0, 0xFF, 0xFE]);
+        utf16.extend("Purchased at Beatport.com".encode_utf16().flat_map(u16::to_le_bytes));
+        let block = id3v23(&[
+            comm("eng", "iTunNORM", " 000012A1"),
+            comm("eng", "ID3v1 Comment", "Ministry"),
+            comm("eng", "", ""),
+            ("COMM", utf16),
+            comm("eng", "", "second"),
+        ]);
+        let found: Vec<_> = id3v2_fields(&block).into_iter().filter(|(f, _)| *f == Field::SubGenre).collect();
+        assert_eq!(found.len(), 2, "described and empty COMM frames are not the comment");
+        assert_eq!(found[0].1, FrameValues { frame: "COMM".into(), values: vec!["Purchased at Beatport.com".into()] });
     }
 
     #[test]

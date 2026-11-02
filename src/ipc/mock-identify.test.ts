@@ -158,6 +158,32 @@ describe("mock identify", () => {
     expect((await identify.result(second!.resultId)).item.state).toBe("accepted");
   });
 
+  it("appends the sub-genre to the comment and refuses what the store refuses", async () => {
+    const identify = createMockIdentify({ tickMs: TICK });
+    await identify.start(["1", "2", "3"]);
+    await finish(3);
+    const review = (await identify.queue("needsReview", 0, 10)).items[0]!;
+    const detail = await identify.result(review.resultId);
+    const subGenre = review.changes.find((c) => c.field === "subGenre")!;
+    expect(subGenre.current).toBe(detail.existing.comment);
+    expect(subGenre.proposed).toBe(`${detail.existing.comment}; Tech House`);
+
+    expect((await identify.apply([{ resultId: review.resultId, fields: ["subGenre"] }]))[0]?.ok).toBe(true);
+    expect((await identify.result(review.resultId)).existing.comment).toBe(subGenre.proposed);
+    expect((await identify.undo(review.resultId)).ok).toBe(true);
+    expect((await identify.result(review.resultId)).existing.comment).toBe(subGenre.current);
+    // Undone, rejected and applied results are not written.
+    expect((await identify.apply([{ resultId: review.resultId, fields: ["title"] }]))[0]).toMatchObject({ ok: false });
+    await identify.setState(review.resultId, "pending");
+    await identify.setState(review.resultId, "reject");
+    expect((await identify.apply([{ resultId: review.resultId, fields: ["title"] }]))[0]).toMatchObject({ ok: false });
+
+    const auto = (await identify.queue("all", 0, 10)).items.find((i) => i.decision === "autoApply")!;
+    expect((await identify.apply([{ resultId: auto.resultId, fields: ["label"] }]))[0]?.ok).toBe(true);
+    expect((await identify.result(auto.resultId)).item.state).toBe("autoApplied");
+    await expect(identify.acceptAbove(Number.NaN)).rejects.toMatchObject({ kind: "malformed" });
+  });
+
   it("names tracks from the mock library", async () => {
     const backend = createMockBackend({ trackCount: 10 });
     const view = await backend.openView({ source: { kind: "collection" }, sort: "trackNo", descending: false, query: "" });

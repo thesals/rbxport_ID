@@ -1771,7 +1771,14 @@ export type IdentifyField =
   | "mbRecordingId" | "mbReleaseId" | "mbReleaseGroupId" | "mbArtistId" | "mbReleaseTrackId"
   | "mbAlbumArtistId" | "discogsReleaseId" | "subGenre" | "artwork";
 
-/** One row of the per-field diff: the file's value against the proposal. */
+/**
+ * One row of the per-field diff: the file's value against the proposal.
+ * For `subGenre` (Discogs styles, appended to the comment rekordbox shows),
+ * `current` is the whole current comment and `proposed` the whole comment
+ * after the append (`"Purchased at Beatport.com"` → `"Purchased at
+ * Beatport.com; Tech House"`): existing text is never removed, and a style
+ * already there is not added twice.
+ */
 export interface IdentifyFieldChange {
   field: IdentifyField;
   current: string;
@@ -1843,6 +1850,8 @@ export interface IdentifyDetail {
     isrc: string;
     genre: string;
     catalogNumber: string;
+    /** The comment as rekordbox reads it from the file; what `subGenre` is appended to. */
+    comment: string;
     hasArtwork: boolean;
   };
   /** Best first. */

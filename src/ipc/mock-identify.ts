@@ -32,6 +32,9 @@ type Outcome = IdentifyDecision | "failed";
 /** What the tracks of a job come out as, in turn. */
 const OUTCOMES: readonly Outcome[] = ["review", "unidentified", "autoApply", "review", "failed"];
 
+/** The comment a Beatport download carries, which `subGenre` appends to. */
+const COMMENT = "Purchased at Beatport.com";
+
 const fail = (kind: AppErrorDto["kind"], message: string) =>
   Promise.reject(Object.assign(new Error(message), { kind }));
 
@@ -90,6 +93,8 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   const changedListeners = new Set<(event: IdentifyChangedEvent) => void>();
   /** The values an apply replaced, by result, for its undo. */
   const snapshots = new Map<number, IdentifyFieldChange[]>();
+  /** Results written at least once: only an auto-apply's first write is autoApplied. */
+  const written = new Set<number>();
   /** Every result, current or replaced, by id. */
   const results = new Map<number, IdentifyDetail>();
   /** Each file's current result. */
@@ -128,7 +133,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
           : [
               { field: "title", current: title, proposed: `${title} (Extended Mix)` },
               { field: "label", current: "Old Label", proposed: "Mock Records" },
-              { field: "subGenre", current: "", proposed: "Tech House" },
+              { field: "subGenre", current: COMMENT, proposed: `${COMMENT}; Tech House` },
               { field: "artwork", current: "none", proposed: "JPEG from Cover Art Archive" },
             ];
     const state: IdentifyReviewState =
@@ -140,7 +145,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       },
       existing: {
         artist, title, album: "", label: decision === "review" ? "Old Label" : "", year: null, isrc: "", genre: "",
-        catalogNumber: "", hasArtwork: decision !== "review",
+        catalogNumber: "", comment: decision === "review" ? COMMENT : "", hasArtwork: decision !== "review",
       },
       candidates: decision === "unidentified" ? [] : [candidate(artist, `${title} (Extended Mix)`, score)],
       enrichment: null,
@@ -314,12 +319,15 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
         detail.item.changes = detail.item.changes.map((c) => fields.includes(c.field) ? { ...c, current: c.proposed } : c);
         for (const change of picked) {
           if (change.field === "artwork") detail.existing.hasArtwork = true;
+          else if (change.field === "subGenre") detail.existing.comment = change.proposed;
           else if (change.field === "year") detail.existing.year = Number(change.proposed) || null;
           else if (change.field in detail.existing) {
             (detail.existing as unknown as Record<string, string>)[change.field] = change.proposed;
           }
         }
-        detail.item.state = "applied";
+        // As the store: an auto-apply result's first write is autoApplied.
+        detail.item.state = detail.item.decision === "autoApply" && !written.has(resultId) ? "autoApplied" : "applied";
+        written.add(resultId);
         detail.item.undoable = true;
         touch(detail);
         return { resultId, ok: true, error: null };
@@ -337,6 +345,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
         const now = detail.item.changes.find((c) => c.field === original.field);
         if (!now || now.current === original.current) continue;
         if (original.field === "artwork") detail.existing.hasArtwork = false;
+        else if (original.field === "subGenre") detail.existing.comment = original.current;
         else if (original.field === "year") detail.existing.year = Number(original.current) || null;
         else if (original.field in detail.existing) {
           (detail.existing as unknown as Record<string, string>)[original.field] = original.current;
@@ -353,6 +362,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       return Promise.resolve({ resultId, ok: true, error: null });
     },
     acceptAbove: (threshold) => {
+      if (!Number.isFinite(threshold)) return fail("malformed", "That change could not be made to this result.");
       const accepted: number[] = [];
       for (const id of current.values()) {
         const detail = results.get(id);

@@ -476,7 +476,8 @@ pub enum GenrePolicy {
 /// number, or same title and year); with no MusicBrainz release, Discogs's
 /// is the release.
 ///
-/// Discogs styles are proposed as [`Field::SubGenre`], only to fill it;
+/// Discogs styles are proposed as [`Field::SubGenre`]: the whole comment
+/// with them appended ([`crate::comment::append`]), when that adds any;
 /// into Genre only as `genre` allows (by default only an empty Genre).
 ///
 /// When the MusicBrainz release ID changes, Picard's release-bound IDs
@@ -500,7 +501,7 @@ pub fn propose(
         .map(str::to_owned)
         .or_else(|| discogs.and_then(|e| e.year).map(|y| y.to_string()));
     let styles = discogs.map(|e| e.styles.join("; ")).filter(|s| !s.is_empty());
-    let sub_genre = fill_only(snapshot, Field::SubGenre, styles.clone());
+    let sub_genre = styles.as_deref().map(|s| crate::comment::append(&current(snapshot, Field::SubGenre), s));
     let genre = match genre {
         GenrePolicy::FillEmpty => fill_only(snapshot, Field::Genre, styles),
         GenrePolicy::Replace => styles,
@@ -782,9 +783,18 @@ mod tests {
             let sub = change_for(&proposal, Field::SubGenre).unwrap();
             assert_eq!((sub.current.as_str(), sub.proposed.as_str()), ("", "Tech House; Minimal"), "{policy:?}");
         }
-        // Fill-only: a sub-genre already there (once it is read) is kept.
-        let has_sub = snapshot(&[(Field::SubGenre, "TXXX:DESCRIPTION", "Deep House")]);
-        let kept = propose(&file(""), &has_sub, &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
+        // Appended to the comment there is, never replacing it.
+        let commented = snapshot(&[(Field::SubGenre, "COMM", "Purchased at Beatport.com")]);
+        let appended = propose(&file(""), &commented, &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
+        let sub = change_for(&appended, Field::SubGenre).unwrap();
+        assert_eq!(
+            (sub.current.as_str(), sub.proposed.as_str()),
+            ("Purchased at Beatport.com", "Purchased at Beatport.com; Tech House; Minimal")
+        );
+        assert!(!appended.fills_only_empty());
+        // Styles already in the comment: nothing to propose.
+        let done = snapshot(&[(Field::SubGenre, "COMM", "Purchased at Beatport.com; tech house; Minimal")]);
+        let kept = propose(&file(""), &done, &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
         assert_eq!(change_for(&kept, Field::SubGenre), None);
         // No styles, no sub-genre.
         let none = propose(&file(""), &TagSnapshot::default(), &c, Some(&Enrichment::default()), None, GenrePolicy::FillEmpty);

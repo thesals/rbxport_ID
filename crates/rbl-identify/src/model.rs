@@ -33,11 +33,15 @@ pub struct ExistingTags {
     /// for a file without any.
     #[serde(default)]
     pub has_artwork: bool,
+    /// The comment rekordbox shows ([`crate::comment`] says which frame):
+    /// what a [`Field::SubGenre`] is appended to.
+    #[serde(default)]
+    pub comment: String,
 }
 
 /// A tag field identification may propose a value for. Key, BPM, cues,
-/// grid, rating, colour and comments are deliberately absent: the spec
-/// forbids touching them.
+/// grid, rating and colour are deliberately absent: the spec forbids
+/// touching them. The comment is touched only to append a sub-genre.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Field {
     Title,
@@ -46,17 +50,14 @@ pub enum Field {
     Label,
     Year,
     Genre,
-    /// Discogs styles (Tech House, Progressive House), joined with "; ":
-    /// the sub-genre beside the broader Genre. Proposed only to fill.
-    ///
-    /// TODO(Phase 4): the frame it is written to is not decided yet (`COMM`,
-    /// `TIT3` or `TXXX:DESCRIPTION`; the user asked for "the description
-    /// field"). Comments are on the spec's never-modify list and most files
-    /// already carry a `COMM` such as "Purchased at Beatport.com", so `COMM`
-    /// needs explicit approval. Until the frame is confirmed nothing reads
-    /// it: the snapshot never holds it, so it always looks empty, and for
-    /// that reason it never counts as an empty fill
-    /// ([`Proposal::fills_only_empty`]), so it can never be auto-applied.
+    /// Discogs styles (Tech House, Progressive House), APPENDED to the
+    /// comment rekordbox shows (the user's decision, overriding the spec's
+    /// never-modify-comments rule for this one purpose; see
+    /// [`crate::comment`]). Its values are the whole comment: `current` as
+    /// the file holds it, `proposed` with the styles appended
+    /// (`Purchased at Beatport.com; Minimal Techno; Acid`). Existing text is
+    /// never removed, and it is never a fill
+    /// ([`Proposal::fills_only_empty`]), so it is never auto-applied.
     SubGenre,
     Isrc,
     CatalogNumber,
@@ -101,11 +102,11 @@ impl Field {
         }
     }
 
-    /// Whether the file's current value of this field is actually read.
-    /// [`Field::SubGenre`] is not yet (its frame is decided in Phase 4), so
-    /// its "empty" current value proves nothing.
+    /// Whether a change to this field may ever count as filling an empty
+    /// field. Not [`Field::SubGenre`]: it edits the comment, which the user
+    /// must always see and approve, even when the comment is empty.
     #[must_use]
-    pub fn is_read(self) -> bool {
+    pub fn may_fill(self) -> bool {
         self != Self::SubGenre
     }
 }
@@ -180,13 +181,12 @@ impl Proposal {
     /// True when every change fills a field that is empty now (artwork:
     /// added to a file that has none): the only proposals auto-apply may
     /// ever take. An empty proposal changes nothing and is not "only empty
-    /// fields". A field whose current value is not read ([`Field::is_read`])
-    /// is never known to be empty, so a change to it is never a fill.
+    /// fields". A sub-genre ([`Field::may_fill`]) is never a fill.
     #[must_use]
     pub fn fills_only_empty(&self) -> bool {
         !self.changes.is_empty()
             && self.changes.iter().all(|c| {
-                c.field.is_read()
+                c.field.may_fill()
                     && (c.current.trim().is_empty() || (c.field == Field::Artwork && c.current == Field::NO_ARTWORK))
             })
     }
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_genre_is_never_an_empty_fill_until_its_frame_is_read() {
+    fn a_sub_genre_is_never_an_empty_fill() {
         let sub = FieldChange { field: Field::SubGenre, current: String::new(), proposed: "Tech House".into() };
         assert!(!Proposal::new(vec![sub.clone()], None, false).fills_only_empty());
         assert!(!Proposal::new(vec![change(""), sub], None, false).fills_only_empty());

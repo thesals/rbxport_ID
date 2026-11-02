@@ -888,6 +888,9 @@ pub struct ExistingTagsDto {
     pub isrc: String,
     pub genre: String,
     pub catalog_number: String,
+    /// The comment as rekordbox reads it from the file: what a `subGenre`
+    /// change appends to.
+    pub comment: String,
     pub has_artwork: bool,
 }
 
@@ -902,6 +905,7 @@ impl From<&rbl_identify::model::ExistingTags> for ExistingTagsDto {
             isrc: t.isrc.clone(),
             genre: t.genre.clone(),
             catalog_number: t.catalog_number.clone(),
+            comment: t.comment.clone(),
             has_artwork: t.has_artwork,
         }
     }

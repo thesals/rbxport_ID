@@ -9,6 +9,7 @@
 
 pub mod acoustid;
 pub mod clock;
+pub mod comment;
 pub mod config;
 pub mod coverart;
 pub mod decide;
