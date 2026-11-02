@@ -1,0 +1,17 @@
+{
+  "id": 9000101,
+  "year": 2018,
+  "title": "Other Compilation",
+  "released": "2018-03-00",
+  "artists": [{"name": "Various", "anv": "", "join": "", "role": "", "tracks": "", "id": 194}],
+  "labels": [{"name": "Other Records", "catno": "OTH001", "entity_type_name": "Label", "id": 9300101}],
+  "genres": ["Electronic"],
+  "styles": ["Tech House"],
+  "tracklist": [
+    {"position": "1", "type_": "track", "title": "Unrelated Song (Original Mix)", "duration": "5:55",
+     "artists": [{"name": "Somebody Else", "join": "", "role": ""}]},
+    {"position": "2", "type_": "track", "title": "Fallback Track (Extended Mix)", "duration": "6:31",
+     "artists": [{"name": "Example Artist (2)", "join": "", "role": ""}]}
+  ],
+  "images": []
+}

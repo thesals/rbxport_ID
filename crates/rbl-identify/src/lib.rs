@@ -14,6 +14,7 @@ pub mod coverart;
 pub mod decide;
 pub mod discogs;
 pub mod error;
+pub mod fallback;
 pub mod fingerprint;
 pub mod mixname;
 pub mod model;

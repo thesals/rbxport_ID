@@ -1,0 +1,23 @@
+{
+  "pagination": {"page": 1, "pages": 1, "per_page": 10, "items": 3, "urls": {}},
+  "results": [
+    {
+      "country": "Germany", "year": "2018", "format": ["File", "MP3", "Compilation"],
+      "label": ["Other Records"], "type": "release", "genre": ["Electronic"], "style": ["Tech House"],
+      "id": 9000101, "uri": "/release/9000101-Various-Other-Compilation", "catno": "OTH001",
+      "title": "Various - Other Compilation", "resource_url": "https://api.discogs.com/releases/9000101"
+    },
+    {
+      "country": "UK", "year": "2019", "format": ["File", "WAV", "EP"],
+      "label": ["Fallback Records"], "type": "release", "genre": ["Electronic"], "style": ["Tech House", "Minimal"],
+      "id": 9000102, "uri": "/release/9000102-Example-Artist-Fallback-EP", "catno": "FB 001",
+      "title": "Example Artist (2) - Fallback EP", "resource_url": "https://api.discogs.com/releases/9000102"
+    },
+    {
+      "country": "", "year": "", "format": ["Vinyl", "12\""],
+      "label": ["No Duration Records"], "type": "release", "genre": ["Electronic"], "style": ["Deep House"],
+      "id": 9000103, "uri": "/release/9000103-Example-Artist-Fallback-Track", "catno": "ND001",
+      "title": "Example Artist (2) - Fallback Track", "resource_url": "https://api.discogs.com/releases/9000103"
+    }
+  ]
+}

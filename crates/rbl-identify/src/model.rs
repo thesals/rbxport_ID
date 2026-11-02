@@ -261,6 +261,12 @@ pub enum CandidateSource {
     Fingerprint,
     /// A MusicBrainz text search on the existing artist and title.
     TextSearch,
+    /// The Discogs fallback for a track nothing else identified: a Discogs
+    /// search on the existing artist and title, the track found in a
+    /// release's tracklist. No MusicBrainz recording (`recording_mbid` is
+    /// empty), never above 0.85, never auto-applied, and its proposal only
+    /// fills empty release fields ([`crate::fallback`]).
+    DiscogsText,
 }
 
 /// One release a recording appears on.
@@ -283,6 +289,8 @@ pub struct ReleaseInfo {
 /// A recording the services propose for a file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
+    /// Empty for a [`CandidateSource::DiscogsText`] candidate, which has no
+    /// MusicBrainz recording.
     pub recording_mbid: String,
     /// The credited artist names, in order.
     pub artists: Vec<String>,

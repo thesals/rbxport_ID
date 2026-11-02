@@ -1,0 +1,15 @@
+{
+  "id": 9000103,
+  "year": 0,
+  "title": "Fallback Track",
+  "released": "",
+  "artists": [{"name": "Example Artist (2)", "anv": "", "join": "", "role": "", "tracks": "", "id": 9200101}],
+  "labels": [{"name": "No Duration Records", "catno": "ND001", "entity_type_name": "Label", "id": 9300103}],
+  "genres": ["Electronic"],
+  "styles": ["Deep House"],
+  "tracklist": [
+    {"position": "A", "type_": "track", "title": "Fallback Track (Extended Mix)", "duration": ""},
+    {"position": "B", "type_": "track", "title": "Fallback Track (Dub)", "duration": ""}
+  ],
+  "images": []
+}

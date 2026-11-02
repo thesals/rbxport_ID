@@ -1,0 +1,19 @@
+{
+  "id": 9000102,
+  "year": 2019,
+  "title": "Fallback EP",
+  "released": "2019-05-10",
+  "artists": [{"name": "Example Artist (2)", "anv": "", "join": "", "role": "", "tracks": "", "id": 9200101}],
+  "labels": [{"name": "Fallback Records", "catno": "FB 001", "entity_type_name": "Label", "id": 9300102}],
+  "genres": ["Electronic"],
+  "styles": ["Tech House", "Minimal"],
+  "tracklist": [
+    {"position": "1", "type_": "track", "title": "Fallback Track (Extended Mix)", "duration": "6:30"},
+    {"position": "2", "type_": "track", "title": "Fallback Track (Radio Edit)", "duration": "3:10"},
+    {"position": "3", "type_": "track", "title": "Fallback Track", "duration": "7:00",
+     "extraartists": [{"name": "Someone (4)", "anv": "", "join": "", "role": "Remix", "tracks": "", "id": 9200102}]}
+  ],
+  "images": [
+    {"type": "primary", "uri": "https://i.discogs.com/fallback/front.jpeg", "width": 500, "height": 500}
+  ]
+}

@@ -52,6 +52,10 @@ search) was answered 401, because the `DISCOGS_TOKEN` in `.env.identify` is
 | `discogs_search_example.json` | A search page: a full release hit (string year, two labels), one with `null` labels and styles, an empty year and catno `none`, a `master` the client skips, and a compilation with a numeric year and `Not On Label`. |
 | `discogs_search_empty.json` | A search with no results, as for Deepack "The Music". |
 | `discogs_release_example.json` | A release: an artist with a ` (2)` suffix, a `Not On Label` / `none` label credit, headings, an index track with sub-tracks, a remixer and an engineer in `extraartists`, a track-level artist, `null` duration and lists, and a primary and a secondary image on `i.discogs.com`. |
+| `discogs_fallback_search.json` | The fallback tests' search page for Example Artist "Fallback Track": a compilation on Other Records first, then an EP on Fallback Records (catno `FB 001`), then a vinyl release on No Duration Records. |
+| `discogs_fallback_release_9000101.json` | The compilation: `Various` with track-level artists, holding only "Fallback Track (Extended Mix)" (6:31). |
+| `discogs_fallback_release_9000102.json` | The EP: extended mix (6:30), radio edit (3:10), and a plainly titled track credited to a remixer (7:00). |
+| `discogs_fallback_release_9000103.json` | The vinyl release: no durations, year `0`. |
 
 The Discogs image test serves the Cover Art Archive JPEG below under an
 `i.discogs.com` path; only its bytes matter.

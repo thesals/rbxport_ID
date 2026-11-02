@@ -9,6 +9,11 @@
 //! relationship, so no candidate is offered for review without it. Those
 //! below the threshold are not looked up: a remix flag can only lower a
 //! score, so they could never rise above it.
+//!
+//! A track that ends with no candidate at the review threshold gets the
+//! Discogs fallback instead of enrichment ([`crate::fallback`]: at most
+//! three searches and two release lookups), which can only ever send it to
+//! review with empty release fields filled.
 
 use std::path::{Path, PathBuf};
 
@@ -17,8 +22,9 @@ use serde::Serialize;
 use crate::acoustid::{AcoustIdClient, AcoustIdMatch, AcoustIdRecording};
 use crate::coverart::{CoverArtClient, FetchedImage};
 use crate::decide;
-use crate::discogs::{DiscogsClient, DiscogsQuery, DiscogsRelease};
+use crate::discogs::{DiscogsClient, DiscogsQuery, DiscogsRelease, DiscogsTrack};
 use crate::error::Result;
+use crate::fallback;
 use crate::fingerprint;
 use crate::mixname;
 use crate::model::{
@@ -158,15 +164,52 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
     }
     let below: Vec<Candidate> =
         ranked.iter().filter(|s| s.score < decide::REVIEW_THRESHOLD).map(|s| s.candidate.clone()).collect();
-    let ranked = score::rank(&existing, duration_secs, resolved.into_iter().chain(below).collect());
+    let mut ranked = score::rank(&existing, duration_secs, resolved.into_iter().chain(below).collect());
 
-    // 5. Enrich the winner from Discogs and, for a file without artwork,
-    //    fetch a cover; then propose and decide.
-    let best = ranked.first().filter(|b| b.score >= decide::REVIEW_THRESHOLD).map(|b| &b.candidate);
-    let chosen = best.and_then(|c| chosen_release(&current(&info.snapshot, Field::Album), &c.releases));
     // A token Discogs has refused stops Discogs for the rest of the run; the
     // track that saw the refusal carries the one warning.
     let discogs = services.discogs.filter(|d| !d.is_refused());
+
+    // 5a. Nothing identified the track: look for it on Discogs by its own
+    //     artist and title. A match goes to review only, and only fills
+    //     empty release fields.
+    let identified = ranked.first().is_some_and(|b| b.score >= decide::REVIEW_THRESHOLD);
+    if let (false, Some(discogs)) = (identified, discogs) {
+        if !existing.artist.is_empty() && !existing.title.is_empty() {
+            match fallback::find(discogs, &existing, duration_secs) {
+                Ok(Some(found)) => {
+                    let accepted = found.scored.score >= decide::REVIEW_THRESHOLD;
+                    let at = ranked.iter().position(|s| s.score < found.scored.score).unwrap_or(ranked.len());
+                    ranked.insert(at, found.scored);
+                    if accepted {
+                        let proposal = fallback::propose(&info.snapshot, &found.enrichment);
+                        // Review whatever the settings: never auto-applied.
+                        let decision = decide::decide(ranked.first(), false, false);
+                        return Ok(TrackResult {
+                            path: path.to_owned(),
+                            existing,
+                            snapshot: info.snapshot,
+                            duration_secs,
+                            fingerprint: outcome,
+                            candidates: ranked,
+                            decision,
+                            proposal: Some(proposal),
+                            enrichment: Some(found.enrichment),
+                            artwork: None,
+                            warnings,
+                        });
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warnings.push(format!("Discogs fallback: {e}")),
+            }
+        }
+    }
+
+    // 5b. Enrich the winner from Discogs and, for a file without artwork,
+    //     fetch a cover; then propose and decide.
+    let best = ranked.first().filter(|b| b.score >= decide::REVIEW_THRESHOLD).map(|b| &b.candidate);
+    let chosen = best.and_then(|c| chosen_release(&current(&info.snapshot, Field::Album), &c.releases));
     let (enrichment, discogs_image) = match (best, discogs) {
         (Some(candidate), Some(discogs)) => match enrich(discogs, candidate, chosen) {
             Ok(Some((enrichment, image))) => (Some(enrichment), image),
@@ -251,26 +294,45 @@ fn enrich(
 /// Whether a Discogs tracklist holds the track: the same base title and an
 /// agreeing mix (a remix is not the original on Discogs either).
 fn holds_track(release: &DiscogsRelease, ours: &mixname::ParsedTitle) -> bool {
-    release.tracklist.iter().any(|track| {
-        let theirs = mixname::parse_title(&track.title);
-        let theirs = match track.extra_artists.iter().find(|(_, role)| role.to_ascii_lowercase().contains("remix")) {
-            // A remixer credit names a remix the title may not.
-            Some((name, _)) if theirs.mix_text.is_empty() => {
-                mixname::ParsedTitle { mix: mixname::MixKind::Remix(name.clone()), mix_text: format!("{name} Remix"), ..theirs }
-            }
-            _ => theirs,
-        };
-        let (a, _) = normalize::strip_featuring(&ours.base);
-        let (b, _) = normalize::strip_featuring(&theirs.base);
-        normalize::similarity(&a, &b) >= 0.85
-            && matches!(mixname::agree(&ours.mix, &theirs.mix), mixname::MixAgreement::Same | mixname::MixAgreement::Compatible)
-    })
+    release.tracklist.iter().any(|track| track_matches(track, ours))
+}
+
+/// Whether one Discogs track is ours: the same base title and an agreeing
+/// mix (same, or compatible such as Original vs Extended).
+pub(crate) fn track_matches(track: &DiscogsTrack, ours: &mixname::ParsedTitle) -> bool {
+    let theirs = discogs_track_mix(track);
+    let (a, _) = normalize::strip_featuring(&ours.base);
+    let (b, _) = normalize::strip_featuring(&theirs.base);
+    normalize::similarity(&a, &b) >= 0.85
+        && matches!(mixname::agree(&ours.mix, &theirs.mix), mixname::MixAgreement::Same | mixname::MixAgreement::Compatible)
+}
+
+/// A Discogs track's title and mix. A remixer credit names a remix the
+/// title may not.
+pub(crate) fn discogs_track_mix(track: &DiscogsTrack) -> mixname::ParsedTitle {
+    let theirs = mixname::parse_title(&track.title);
+    match discogs_remixers(track).first() {
+        Some(name) if theirs.mix_text.is_empty() => {
+            mixname::ParsedTitle { mix: mixname::MixKind::Remix(name.clone()), mix_text: format!("{name} Remix"), ..theirs }
+        }
+        _ => theirs,
+    }
+}
+
+/// The names credited with a remix role on a Discogs track.
+pub(crate) fn discogs_remixers(track: &DiscogsTrack) -> Vec<String> {
+    track
+        .extra_artists
+        .iter()
+        .filter(|(_, role)| role.to_ascii_lowercase().contains("remix"))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Label, catalog number, year, styles and the primary image of a Discogs
 /// release. "Not On Label" and a catalog number of "none" are Discogs's
 /// placeholders, not values.
-fn enrichment_from(release: &DiscogsRelease) -> (Enrichment, Option<String>) {
+pub(crate) fn enrichment_from(release: &DiscogsRelease) -> (Enrichment, Option<String>) {
     let label = release.labels.iter().find(|l| !l.name.to_ascii_lowercase().starts_with("not on label"));
     let enrichment = Enrichment {
         discogs_release_id: Some(release.id),
@@ -533,7 +595,7 @@ fn fill_only(snapshot: &TagSnapshot, field: Field, value: Option<String>) -> Opt
 
 /// A field's current value as the review screen shows it: every value of
 /// every frame holding it, joined with "; ". Empty when absent.
-fn current(snapshot: &TagSnapshot, field: Field) -> String {
+pub(crate) fn current(snapshot: &TagSnapshot, field: Field) -> String {
     snapshot
         .values
         .get(&field)
