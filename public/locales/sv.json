@@ -1571,5 +1571,6 @@
   "coverArtArchive": "coverArtArchive",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "bild/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} ansöker automatiskt · {review} för att granska · {unidentified} oidentifierad · {failed} misslyckades"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} ansöker automatiskt · {review} för att granska · {unidentified} oidentifierad · {failed} misslyckades",
+  "The library track no longer points at this file. Identify the track again.": "Biblioteksspåret pekar inte längre på den här filen. Identifiera spåret igen."
 }

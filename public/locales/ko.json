@@ -1575,5 +1575,6 @@
   "coverArtArchive": "커버아트아카이브",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "이미지/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} 자동 적용 · 검토를 위한 {review} · {unidentified} 미확인 · {failed} 실패"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} 자동 적용 · 검토를 위한 {review} · {unidentified} 미확인 · {failed} 실패",
+  "The library track no longer points at this file. Identify the track again.": "라이브러리 트랙은 더 이상 이 파일을 가리키지 않습니다. 트랙을 다시 식별하십시오."
 }

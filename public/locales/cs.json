@@ -1575,5 +1575,6 @@
   "coverArtArchive": "obálkaArchiv",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "obrázek/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automaticky použít · {review} ke kontrole · {unidentified} neidentifikováno · {failed} se nezdařilo"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automaticky použít · {review} ke kontrole · {unidentified} neidentifikováno · {failed} se nezdařilo",
+  "The library track no longer points at this file. Identify the track again.": "Stopa knihovny již neukazuje na tento soubor. Znovu identifikujte stopu."
 }

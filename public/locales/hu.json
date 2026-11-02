@@ -1575,5 +1575,6 @@
   "coverArtArchive": "coverArtArchive",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "kép/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automatikus alkalmazás · {review} az ellenőrzéshez · {unidentified} azonosítatlan · {failed} sikertelen"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automatikus alkalmazás · {review} az ellenőrzéshez · {unidentified} azonosítatlan · {failed} sikertelen",
+  "The library track no longer points at this file. Identify the track again.": "A könyvtári sáv már nem mutat erre a fájlra. Határozza meg újra a nyomvonalat."
 }

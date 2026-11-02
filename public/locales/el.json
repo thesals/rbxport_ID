@@ -1577,5 +1577,6 @@
   "coverArtArchive": "coverArtArchive",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "εικόνα/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} αυτόματη εφαρμογή · {review} για έλεγχο · {unidentified} unidentified · {failed} απέτυχε"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} αυτόματη εφαρμογή · {review} για έλεγχο · {unidentified} unidentified · {failed} απέτυχε",
+  "The library track no longer points at this file. Identify the track again.": "Το κομμάτι της βιβλιοθήκης δεν οδηγεί πλέον σε αυτό το αρχείο. Προσδιορίστε ξανά το κομμάτι."
 }

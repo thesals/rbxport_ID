@@ -1576,5 +1576,6 @@
   "coverArtArchive": "coverArtArşiv",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "resim/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} otomatik uygulama · {review} incelenecek · {unidentified} tanımlanamadı · {failed} başarısız oldu"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} otomatik uygulama · {review} incelenecek · {unidentified} tanımlanamadı · {failed} başarısız oldu",
+  "The library track no longer points at this file. Identify the track again.": "Kütüphane parçası artık bu dosyayı işaret etmiyor. Parçayı tekrar tanımlayın."
 }

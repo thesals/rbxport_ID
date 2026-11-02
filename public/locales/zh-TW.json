@@ -1580,5 +1580,6 @@
   "coverArtArchive": "封面藝術檔案",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "圖片/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} 自動申請 · {review} 待審核 · {unidentified} 未識別 · {failed} 失敗"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} 自動申請 · {review} 待審核 · {unidentified} 未識別 · {failed} 失敗",
+  "The library track no longer points at this file. Identify the track again.": "庫軌道不再指向該文件。再次識別軌道。"
 }

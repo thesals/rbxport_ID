@@ -1139,6 +1139,7 @@
   "The library could not be found.",
   "The library has not finished loading yet.",
   "The library is read-only.",
+  "The library track no longer points at this file. Identify the track again.",
   "The log attachment could not be added.",
   "The log folder could not be read.",
   "The log may include library paths and track titles.",

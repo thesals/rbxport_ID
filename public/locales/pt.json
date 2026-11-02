@@ -1579,5 +1579,6 @@
   "coverArtArchive": "coverArtArchive",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "imagem/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} aplicação automática · {review} para revisar · {unidentified} não identificado · {failed} falhou"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} aplicação automática · {review} para revisar · {unidentified} não identificado · {failed} falhou",
+  "The library track no longer points at this file. Identify the track again.": "A trilha da biblioteca não aponta mais para este arquivo. Identifique a pista novamente."
 }

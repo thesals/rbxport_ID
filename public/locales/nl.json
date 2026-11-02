@@ -1573,5 +1573,6 @@
   "coverArtArchive": "coverArtArchief",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "afbeelding/jpeg",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automatisch toepassen · {review} om te beoordelen · {unidentified} ongeïdentificeerd · {failed} mislukt"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automatisch toepassen · {review} om te beoordelen · {unidentified} ongeïdentificeerd · {failed} mislukt",
+  "The library track no longer points at this file. Identify the track again.": "De bibliotheektrack verwijst niet langer naar dit bestand. Identificeer het spoor opnieuw."
 }

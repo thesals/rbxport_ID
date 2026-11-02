@@ -1580,5 +1580,6 @@
   "coverArtArchive": "обложкаАрхивАрхив",
   "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500": "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500",
   "image/jpeg": "изображение/JPEG",
-  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} автоматическая подача заявки · {review} для проверки · {unidentified} unidentified · {failed} не удалось"
+  "{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} автоматическая подача заявки · {review} для проверки · {unidentified} unidentified · {failed} не удалось",
+  "The library track no longer points at this file. Identify the track again.": "Дорожка библиотеки больше не указывает на этот файл. Определите след еще раз."
 }
