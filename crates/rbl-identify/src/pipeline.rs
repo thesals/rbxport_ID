@@ -94,7 +94,8 @@ pub struct TrackResult {
     pub enrichment: Option<Enrichment>,
     /// The cover fetched for a file without artwork, for the store; the
     /// proposal refers to it by hash. Not serialised: the bytes live in the
-    /// store's artwork table.
+    /// store's artwork table ([`crate::store::Store::save_track_result`]
+    /// puts them there with the result).
     #[serde(skip)]
     pub artwork: Option<FetchedImage>,
     /// Stage failures that did not stop the track (a service down, a

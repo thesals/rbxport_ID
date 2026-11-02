@@ -41,6 +41,7 @@ use crate::model::{
     ArtworkRef, Decision, Enrichment, ExistingTags, Field, FieldChange, FrameValues, Proposal, RawId3, Scored,
     TagSnapshot,
 };
+use crate::pipeline::TrackResult;
 
 /// The schema this build creates and understands, kept in
 /// `PRAGMA user_version`. A newer file is refused rather than guessed at.
@@ -779,6 +780,48 @@ impl Store {
             .map_err(|e| sql("store the result", &e))?;
         tx.commit().map_err(|e| sql("commit the result", &e))?;
         Ok(result)
+    }
+
+    /// Stores one identification as the pipeline returned it, in one call:
+    /// the fetched artwork (so the caller can drop the bytes), the track as
+    /// read (`key` should come from [`TrackKey::for_file`] when the file was
+    /// read), and the result ([`Store::save_result`]'s rules apply).
+    ///
+    /// The artwork goes in first, so a stored proposal never refers to an
+    /// image the store lacks: a proposal whose artwork hash differs from the
+    /// fetched bytes, or that names artwork neither fetched nor stored, is
+    /// refused before anything is written. The fingerprint is not part of
+    /// a [`TrackResult`]; an unchanged file keeps the one stored before.
+    pub fn save_track_result(
+        &self,
+        key: &TrackKey,
+        result: &TrackResult,
+        allow_replacing_applied: bool,
+    ) -> Result<(TrackId, ResultId)> {
+        let wanted = result.proposal.as_ref().and_then(|p| p.artwork.as_ref()).map(|a| a.sha256.as_str());
+        match (&result.artwork, wanted) {
+            (Some(image), Some(wanted)) if sha256_hex(&image.bytes) != wanted => {
+                return Err(IdentifyError::Store("the fetched artwork is not the image the proposal names".to_owned()));
+            }
+            (None, Some(wanted)) if self.artwork(wanted)?.is_none() => {
+                return Err(IdentifyError::Store("the proposal names artwork that was neither fetched nor stored".to_owned()));
+            }
+            _ => {}
+        }
+        if let Some(image) = &result.artwork {
+            self.put_artwork(&image.bytes, &image.mime)?;
+        }
+        let track = self.upsert_track(key, result.duration_secs, None, &result.existing)?;
+        let saved = self.save_result(
+            track,
+            result.decision,
+            &result.candidates,
+            result.proposal.as_ref(),
+            result.enrichment.as_ref(),
+            &result.warnings,
+            allow_replacing_applied,
+        )?;
+        Ok((track, saved))
     }
 
     /// Moves a current result to another state, if the table on
@@ -2036,6 +2079,71 @@ mod tests {
         assert_eq!(store.track_id(path).unwrap(), Some(track));
         // Another spelling is another key: the store does not normalise.
         assert_eq!(store.track_id("C:/Music/Röyksopp/Track.mp3").unwrap(), None);
+    }
+
+    fn track_result(image: Option<&[u8]>, named: Option<String>) -> TrackResult {
+        let art = named.map(|sha256| ArtworkRef {
+            source: ArtworkSource::CoverArtArchive,
+            url: "https://coverartarchive.org/release/rel/front-500".into(),
+            sha256,
+            mime: "image/jpeg".into(),
+            bytes: 4,
+        });
+        TrackResult {
+            path: "a.mp3".into(),
+            existing: tags("T"),
+            duration_secs: 360.0,
+            fingerprint: crate::pipeline::FingerprintOutcome::default(),
+            candidates: vec![scored("T", 0.8)],
+            decision: Decision::Review,
+            snapshot: snapshot("T"),
+            proposal: Some(Proposal::new(
+                vec![FieldChange { field: Field::Label, current: String::new(), proposed: "Defected".into() }],
+                art,
+                false,
+            )),
+            enrichment: Some(enrichment()),
+            artwork: image.map(|bytes| crate::coverart::FetchedImage {
+                bytes: bytes.to_vec(),
+                mime: "image/jpeg".into(),
+                url: "https://coverartarchive.org/release/rel/front-500".into(),
+            }),
+            warnings: vec!["Discogs: slow".into()],
+        }
+    }
+
+    #[test]
+    fn a_track_result_is_saved_with_its_artwork_in_one_call() {
+        let store = Store::open_in_memory().unwrap();
+        let bytes: &[u8] = b"\xFF\xD8\xFF\xE0";
+        let result = track_result(Some(bytes), Some(sha256_hex(bytes)));
+        let (track, saved) = store.save_track_result(&key("a.mp3"), &result, false).unwrap();
+        assert_eq!(store.track_id("a.mp3").unwrap(), Some(track));
+        let (item, candidates, enrichment, warnings) = store.result(saved).unwrap().unwrap();
+        assert_eq!((item.state, item.proposal.as_ref()), (ReviewState::Pending, result.proposal.as_ref()));
+        assert_eq!((candidates, enrichment, warnings), (result.candidates.clone(), result.enrichment.clone(), result.warnings.clone()));
+        // The bytes are in the store under the hash the proposal names.
+        let named = item.proposal.unwrap().artwork.unwrap().sha256;
+        assert_eq!(store.artwork(&named).unwrap(), Some((bytes.to_vec(), "image/jpeg".to_owned())));
+        // Saved again without the bytes: the stored copy still backs it.
+        let again = track_result(None, Some(named));
+        let (same_track, newer) = store.save_track_result(&key("a.mp3"), &again, false).unwrap();
+        assert_eq!(same_track, track);
+        assert_ne!(newer, saved);
+        // No artwork at all is fine too.
+        store.save_track_result(&key("b.mp3"), &track_result(None, None), false).unwrap();
+    }
+
+    #[test]
+    fn a_track_result_whose_artwork_does_not_add_up_is_refused_whole() {
+        let store = Store::open_in_memory().unwrap();
+        let bytes: &[u8] = b"\xFF\xD8\xFF\xE0";
+        let mismatched = track_result(Some(bytes), Some("00".repeat(32)));
+        assert!(store.save_track_result(&key("a.mp3"), &mismatched, false).is_err());
+        let missing = track_result(None, Some("11".repeat(32)));
+        assert!(store.save_track_result(&key("a.mp3"), &missing, false).is_err());
+        assert_eq!(store.track_id("a.mp3").unwrap(), None, "nothing was written");
+        assert_eq!(store.artwork(&sha256_hex(bytes)).unwrap(), None);
     }
 
     /// A track with an accepted result and a write begun but not finished.
