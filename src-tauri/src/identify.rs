@@ -8,10 +8,13 @@
 //! end. A track is saved the moment it finishes, so a cancel or a crash
 //! keeps every finished track.
 //!
-//! Nothing here writes a tag, touches the rekordbox library or goes near
-//! the USB export path. Review commands change review state in the identify
-//! store only; writing comes in Phase 4 (`identify_apply`, `identify_undo`),
-//! which will take the result ids these commands already use.
+//! Review commands change review state in the identify store only. Tags are
+//! written only by `identify_apply`, on the user's explicit request: the
+//! file first (`rbl_identify::write`, snapshotted in the store before it is
+//! touched), then the library record through the app's single edit path
+//! (`AppState::write_then`, refused while rekordbox runs), its values kept
+//! so `identify_undo` can put both back. Nothing here goes near the USB
+//! export path.
 //!
 //! The store is this feature's own SQLite file under the app's data folder
 //! (`<data>/rbxport/identify/identify.db`): a local disk, never the library
@@ -32,12 +35,13 @@ use rbl_identify::model::{Decision, Field, FieldChange, Proposal, Scored};
 use rbl_identify::musicbrainz::MusicBrainzClient;
 use rbl_identify::pipeline::{self, Services, Settings, TrackResult};
 use rbl_identify::ratelimit::Limiters;
-use rbl_identify::store::{Filter, QueueItem, Reconciliation, ResultId, ReviewState, Store, TrackKey};
+use rbl_db::write::{ColumnValue, StoredValue};
+use rbl_identify::store::{Filter, LibraryTrack, QueueItem, Reconciliation, ResultId, ReviewState, Store, TrackKey};
 use rbl_identify::transport::{HttpTransport, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::commands::{blocking, MAX_ROWS};
+use crate::commands::{blocking, refresh_after_edit, write_error, Touched, MAX_ROWS};
 use crate::error::{AppError, AppResult, ErrorKind};
 use crate::state::AppState;
 
@@ -48,6 +52,8 @@ const ENV_FILE: &str = ".env.identify";
 
 pub const PROGRESS_EVENT: &str = "identify:progress";
 pub const RESULT_EVENT: &str = "identify:result";
+/// Results changed by apply, undo or bulk accept: `{ resultIds }`.
+pub const CHANGED_EVENT: &str = "identify:changed";
 
 /// The folder the store and `.env.identify` live in.
 pub fn default_root() -> PathBuf {
@@ -553,7 +559,8 @@ fn identify_and_save(
     // this track's failure, not an internal error to report.
     let result_id = state
         .with_store(|store| {
-            save(store, &key, &mut result).map_err(|e| AppError::new(ErrorKind::Malformed, e.to_string()))
+            let library = LibraryTrack { track_id: track.track_id.clone(), path: raw.to_owned() };
+            save(store, &key, &mut result, &library).map_err(|e| AppError::new(ErrorKind::Malformed, e.to_string()))
         })
         .map_err(|e| e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message)))?;
     Ok((path_text, result_id, decision, score))
@@ -561,8 +568,8 @@ fn identify_and_save(
 
 /// Saves a finished track (its cover, row and result) in one call, then
 /// drops the cover's bytes: the store holds them now.
-fn save(store: &Store, key: &TrackKey, result: &mut TrackResult) -> rbl_identify::Result<ResultId> {
-    let (_, saved) = store.save_track_result(key, result, None, false)?;
+fn save(store: &Store, key: &TrackKey, result: &mut TrackResult, library: &LibraryTrack) -> rbl_identify::Result<ResultId> {
+    let (_, saved) = store.save_track_result(key, result, Some(library), false)?;
     result.artwork = None;
     Ok(saved)
 }
@@ -720,6 +727,325 @@ pub async fn identify_edit(
     blocking("identify_edit", move || identify.edit(result_id, &changes)).await
 }
 
+// ---------------------------------------------------------------- writing
+
+/// The library side of one write, as the store keeps it: the track and the
+/// exact column values before and after.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibrarySide {
+    track_id: String,
+    values: Vec<ColumnValue>,
+}
+
+/// The `djmdContent` column a field is stored in, for the fields the
+/// library has a place for; `None` for the rest (catalog number, the
+/// MusicBrainz and Discogs IDs, artwork), which only the file holds.
+fn library_column(field: Field) -> Option<&'static str> {
+    Some(match field {
+        Field::Title => "Title",
+        Field::Artist => "ArtistID",
+        Field::Album => "AlbumID",
+        Field::Label => "LabelID",
+        Field::Year => "ReleaseYear",
+        Field::Genre => "GenreID",
+        Field::SubGenre => "Commnt",
+        Field::Isrc => "ISRC",
+        _ => return None,
+    })
+}
+
+/// Writes the written changes to the library record, the way rekordbox
+/// stores each: references through their lookup rows, the year as a
+/// number, and the sub-genre appended to the library's own comment (the
+/// styles the file's comment gained, never the file's other text).
+fn write_library(
+    writer: &mut rbl_db::write::Writer,
+    track: &str,
+    before: &[ColumnValue],
+    written: &[FieldChange],
+) -> Result<(), rbl_db::DbError> {
+    use rbl_db::write::TrackField;
+    for change in written {
+        let changed = match change.field {
+            Field::Title => writer.set_field(track, TrackField::Title, &change.proposed)?,
+            Field::Artist => writer.set_field(track, TrackField::Artist, &change.proposed)?,
+            Field::Album => writer.set_field(track, TrackField::Album, &change.proposed)?,
+            Field::Label => writer.set_field(track, TrackField::Label, &change.proposed)?,
+            Field::Genre => writer.set_field(track, TrackField::Genre, &change.proposed)?,
+            Field::Year => {
+                let year = change.proposed.trim().get(..4).unwrap_or_default();
+                if year.is_empty() {
+                    continue;
+                }
+                writer.set_field(track, TrackField::Year, year)?
+            }
+            Field::Isrc => writer.set_isrc(track, change.proposed.trim())?,
+            Field::SubGenre => {
+                let comment = before.iter().find(|v| v.column == "Commnt").map_or("", |v| match &v.value {
+                    StoredValue::Text(text) => text.as_str(),
+                    _ => "",
+                });
+                let added = rbl_identify::comment::added(&change.current, &change.proposed);
+                let appended = rbl_identify::comment::append(comment, &added.join(rbl_identify::comment::SEPARATOR));
+                writer.set_comment(track, &appended)?
+            }
+            _ => continue,
+        };
+        if changed.rows == 0 {
+            return Err(rbl_db::DbError::WriteRefused("the track is no longer in the library".to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn library_json(side: &LibrarySide) -> Result<String, String> {
+    serde_json::to_string(side).map_err(|e| format!("could not record the library values ({:?})", e.classify()))
+}
+
+impl IdentifyState {
+    /// Writes one result's ticked fields: file first, then the library record
+    /// through `writer` (inside the app's edit path), both snapshotted
+    /// before so the write can be undone.
+    fn apply_one(&self, writer: &mut rbl_db::write::Writer, item: &ApplyItemDto) -> Result<(), String> {
+        let fields = item
+            .fields
+            .iter()
+            .map(|name| parse_field(name).ok_or_else(|| format!("There is no tag field \"{name}\".")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let outcome = self.with_store(|store| {
+            let library = rbl_identify::write::library_track(store, item.result_id)
+                .map_err(store_error)?
+                .ok_or_else(|| {
+                    AppError::new(
+                        ErrorKind::Malformed,
+                        "This result is not linked to its library track. Identify the track again.",
+                    )
+                })?;
+            let columns: Vec<&str> = fields.iter().filter_map(|f| library_column(*f)).collect();
+            let before = writer.track_values(&library.track_id, &columns).map_err(write_error)?;
+            let side = LibrarySide { track_id: library.track_id.clone(), values: before.clone() };
+            let before_json = library_json(&side).map_err(AppError::internal)?;
+            let applied = rbl_identify::write::apply_result(store, item.result_id, &fields, Some(&before_json), |written| {
+                let done = write_library(writer, &library.track_id, &before, written)
+                    .and_then(|()| writer.track_values(&library.track_id, &columns));
+                match done {
+                    Ok(values) => library_json(&LibrarySide { track_id: library.track_id.clone(), values }).map(Some),
+                    Err(e) => {
+                        // Leave the record as it was before anything else.
+                        let _ = writer.restore_track_values(&library.track_id, &before);
+                        Err(e.to_string())
+                    }
+                }
+            });
+            Ok(applied.map(|_| ()).map_err(|e| e.to_string()))
+        });
+        match outcome {
+            Ok(result) => result,
+            Err(e) => Err(e.detail.map_or(e.message.clone(), |d| format!("{}: {d}", e.message))),
+        }
+    }
+
+    /// Undoes one result's write: the file's exact tags, then the library
+    /// columns that still hold what the write left (a later edit in the
+    /// library is kept).
+    fn undo_one(&self, writer: &mut rbl_db::write::Writer, result: ResultId) -> Result<(), String> {
+        let outcome = self.with_store(|store| {
+            let undone = rbl_identify::write::undo_result(store, result, |before, after| {
+                let Some(before) = before else { return Ok(()) };
+                let before: LibrarySide = serde_json::from_str(before).map_err(|_| "the recorded library values are unreadable".to_owned())?;
+                let after: Option<LibrarySide> = after.and_then(|a| serde_json::from_str(a).ok());
+                let now = writer
+                    .track_values(&before.track_id, &before.values.iter().map(|v| v.column.as_str()).collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())?;
+                let restore: Vec<ColumnValue> = before
+                    .values
+                    .iter()
+                    .filter(|old| {
+                        let written = after.as_ref().and_then(|a| a.values.iter().find(|v| v.column == old.column));
+                        let current = now.iter().find(|v| v.column == old.column);
+                        // Unrecorded after-state: put it back regardless.
+                        written.is_none_or(|w| current == Some(w))
+                    })
+                    .cloned()
+                    .collect();
+                if restore.is_empty() {
+                    return Ok(());
+                }
+                writer.restore_track_values(&before.track_id, &restore).map(|_| ()).map_err(|e| e.to_string())
+            });
+            Ok(undone.map(|_| ()).map_err(|e| e.to_string()))
+        });
+        match outcome {
+            Ok(result) => result,
+            Err(e) => Err(e.detail.map_or(e.message.clone(), |d| format!("{}: {d}", e.message))),
+        }
+    }
+
+    /// Applies each item in the library's edit path; returns each item's
+    /// outcome and, when anything was written, the library's new generation.
+    pub(crate) fn apply_items(&self, app: &AppState, items: &[ApplyItemDto]) -> (Vec<IdentifyWriteOutcomeDto>, Option<u32>) {
+        let mut outcomes: Vec<IdentifyWriteOutcomeDto> = Vec::with_capacity(items.len());
+        let written = app.write_then(
+            |writer| {
+                for item in items {
+                    let result = self.apply_one(writer, item);
+                    outcomes.push(IdentifyWriteOutcomeDto::new(item.result_id, result));
+                }
+                Ok(outcomes.iter().any(|o| o.ok))
+            },
+            |db, any| if any { refresh_after_edit(app, db, Touched::Tracks).map(Some) } else { Ok(None) },
+        );
+        match written {
+            Ok(generation) => (outcomes, generation),
+            Err(e) => {
+                // Nothing ran (rekordbox is running, no library) or the
+                // refresh failed after the writes: report it on every item
+                // not already answered.
+                let message = write_error(e).message;
+                let answered = outcomes.len();
+                let mut all = outcomes;
+                all.extend(items[answered..].iter().map(|i| IdentifyWriteOutcomeDto::new(i.result_id, Err(message.clone()))));
+                (all, None)
+            }
+        }
+    }
+
+    pub(crate) fn undo_item(&self, app: &AppState, result: ResultId) -> (IdentifyWriteOutcomeDto, Option<u32>) {
+        let mut outcome = None;
+        let written = app.write_then(
+            |writer| {
+                let done = self.undo_one(writer, result);
+                let ok = done.is_ok();
+                outcome = Some(IdentifyWriteOutcomeDto::new(result, done));
+                Ok(ok)
+            },
+            |db, ok| if ok { refresh_after_edit(app, db, Touched::Tracks).map(Some) } else { Ok(None) },
+        );
+        match written {
+            Ok(generation) => {
+                (outcome.unwrap_or_else(|| IdentifyWriteOutcomeDto::new(result, Err("Nothing was undone.".to_owned()))), generation)
+            }
+            // Refused before anything ran (rekordbox is running, no
+            // library), or the refresh failed after a done undo.
+            Err(e) => (
+                outcome
+                    .filter(|o| o.ok)
+                    .unwrap_or_else(|| IdentifyWriteOutcomeDto::new(result, Err(write_error(e).message))),
+                None,
+            ),
+        }
+    }
+
+    fn accept_above(&self, threshold: f64) -> AppResult<Vec<ResultId>> {
+        self.with_store(|store| store.accept_at_or_above(threshold).map_err(refused))
+    }
+}
+
+/// Tells the window: results changed, and (when written) the library.
+fn announce<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &AppState, result_ids: Vec<ResultId>, generation: Option<u32>) {
+    if let Some(generation) = generation {
+        let history = {
+            let mut history = state.edit_history.lock();
+            history.clear_redo();
+            crate::commands::history_dto(generation, &history)
+        };
+        let _ = tauri::Emitter::emit(app, Touched::Tracks.event(), generation);
+        let _ = tauri::Emitter::emit(app, "edit-history:changed", history);
+    }
+    if !result_ids.is_empty() {
+        let _ = tauri::Emitter::emit(app, CHANGED_EVENT, IdentifyChangedDto { result_ids });
+    }
+}
+
+/// Writes the ticked fields of each result to its file and its library
+/// record. Each item answers for itself; refused items change nothing.
+#[tauri::command]
+pub async fn identify_apply<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    identify: State<'_, Arc<IdentifyState>>,
+    items: Vec<ApplyItemDto>,
+) -> AppResult<Vec<IdentifyWriteOutcomeDto>> {
+    let (state, identify) = (Arc::clone(&state), Arc::clone(&identify));
+    let (outcomes, generation) = {
+        let state = Arc::clone(&state);
+        blocking("identify_apply", move || Ok(identify.apply_items(&state, &items))).await?
+    };
+    let changed = outcomes.iter().filter(|o| o.ok).map(|o| o.result_id).collect();
+    announce(&app, &state, changed, generation);
+    Ok(outcomes)
+}
+
+/// Puts back the file's tags and the library record as they were before the
+/// result's last write. Refused (ok: false) when the file changed since.
+#[tauri::command]
+pub async fn identify_undo<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    identify: State<'_, Arc<IdentifyState>>,
+    result_id: ResultId,
+) -> AppResult<IdentifyWriteOutcomeDto> {
+    let (state, identify) = (Arc::clone(&state), Arc::clone(&identify));
+    let (outcome, generation) = {
+        let state = Arc::clone(&state);
+        blocking("identify_undo", move || Ok(identify.undo_item(&state, result_id))).await?
+    };
+    let changed = if outcome.ok { vec![result_id] } else { Vec::new() };
+    announce(&app, &state, changed, generation);
+    Ok(outcome)
+}
+
+/// Accepts every pending result scoring at least `threshold`. Writes
+/// nothing; resolves to how many were accepted.
+#[tauri::command]
+pub async fn identify_accept_above<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, Arc<AppState>>,
+    identify: State<'_, Arc<IdentifyState>>,
+    threshold: f64,
+) -> AppResult<usize> {
+    let identify = Arc::clone(&identify);
+    let accepted = blocking("identify_accept_above", move || identify.accept_above(threshold)).await?;
+    let count = accepted.len();
+    announce(&app, &state, accepted, None);
+    Ok(count)
+}
+
+/// One item of `identify_apply`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyItemDto {
+    pub result_id: ResultId,
+    /// Frontend field names (`title`, `catalogNumber`, `subGenre`, ...).
+    pub fields: Vec<String>,
+}
+
+/// How one apply or undo went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentifyWriteOutcomeDto {
+    pub result_id: ResultId,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+impl IdentifyWriteOutcomeDto {
+    fn new(result_id: ResultId, result: Result<(), String>) -> Self {
+        match result {
+            Ok(()) => Self { result_id, ok: true, error: None },
+            Err(error) => Self { result_id, ok: false, error: Some(error) },
+        }
+    }
+}
+
+/// `identify:changed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentifyChangedDto {
+    pub result_ids: Vec<ResultId>,
+}
+
 // ---------------------------------------------------------------- DTOs
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -863,6 +1189,9 @@ pub struct FieldChangeDto {
 #[serde(rename_all = "camelCase")]
 pub struct IdentifyQueueItemDto {
     pub result_id: ResultId,
+    /// The library track the result was identified for; empty for one
+    /// stored before tracks were linked.
+    pub track_id: String,
     pub path: String,
     /// `unidentified`, `pending`, `accepted`, `rejected`, `applied`,
     /// `autoApplied` or `undone`.
@@ -875,6 +1204,8 @@ pub struct IdentifyQueueItemDto {
     pub title: String,
     pub changes: Vec<FieldChangeDto>,
     pub updated_unix: i64,
+    /// Applied, so `identify_undo` can put its last write back.
+    pub undoable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1017,6 +1348,7 @@ fn change_dto(change: &FieldChange) -> FieldChangeDto {
 fn queue_item_dto(item: &QueueItem) -> IdentifyQueueItemDto {
     IdentifyQueueItemDto {
         result_id: item.result,
+        track_id: item.library.as_ref().map(|l| l.track_id.clone()).unwrap_or_default(),
         path: item.path.clone(),
         state: camel(&item.state),
         decision: camel(&item.decision),
@@ -1025,6 +1357,7 @@ fn queue_item_dto(item: &QueueItem) -> IdentifyQueueItemDto {
         title: item.existing.title.clone(),
         changes: item.proposal.as_ref().map(|p: &Proposal| p.changes.iter().map(change_dto).collect()).unwrap_or_default(),
         updated_unix: item.updated_unix,
+        undoable: item.state.is_applied(),
     }
 }
 
@@ -1073,6 +1406,7 @@ mod tests {
         ArtworkRef, ArtworkSource, Candidate, CandidateSource, ExistingTags, ScoreBreakdown, TagSnapshot,
     };
     use rbl_identify::pipeline::FingerprintOutcome;
+    use rbl_identify::tags;
 
     /// Answers by file name: `review*` → Review with a cover, `broken*` →
     /// an error, anything else → Unidentified. Can raise the cancel flag on
@@ -1368,6 +1702,156 @@ mod tests {
         let config = load_config(std::slice::from_ref(&env_file), none, dir.path()).unwrap();
         assert_eq!(config.acoustid_key.expose(), "sekrit-key");
         assert!(config.discogs_token.is_none());
+    }
+
+    /// One second of silent 16-bit mono WAV.
+    fn wav(path: &Path) {
+        let rate = 44_100_u32;
+        let data_len = rate * 2;
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16_u32.to_le_bytes());
+        out.extend_from_slice(&1_u16.to_le_bytes());
+        out.extend_from_slice(&1_u16.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes());
+        out.extend_from_slice(&2_u16.to_le_bytes());
+        out.extend_from_slice(&16_u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(out.len() + data_len as usize, 0);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// The library values identification writes, for one track.
+    fn library_row(state: &AppState, track: &str) -> (String, Option<String>, Option<String>) {
+        state
+            .read_db(|db| {
+                db.connection()
+                    .query_row("SELECT Title, Commnt, ISRC FROM djmdContent WHERE ID = ?1", [track], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .map_err(Into::into)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn apply_writes_the_file_and_the_library_record_and_undo_puts_both_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let app = AppState::with_backups(dir.path().join("backups"));
+        app.set_library(library, false, db.schema().db_version, 0, location);
+        drop(db);
+        let track = rbl_db::fixture::track_id(1);
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let before_row = library_row(&app, &track);
+
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let changes = vec![
+            FieldChange { field: Field::Title, current: String::new(), proposed: "New Title (Extended Mix)".into() },
+            FieldChange { field: Field::SubGenre, current: String::new(), proposed: "Tech House".into() },
+            FieldChange { field: Field::Isrc, current: String::new(), proposed: "GBAAA1400001".into() },
+            FieldChange { field: Field::CatalogNumber, current: String::new(), proposed: "CAT001".into() },
+        ];
+        let result = identify
+            .with_store(|store| {
+                // Saved and linked as the job saves it.
+                let key = TrackKey::for_file(&audio).map_err(store_error)?;
+                let mut track_result = result(&audio, Decision::Review);
+                track_result.proposal = Some(Proposal::new(changes.clone(), None, true));
+                track_result.artwork = None;
+                let library = LibraryTrack { track_id: track.clone(), path: key.path.clone() };
+                Ok(store.save_track_result(&key, &track_result, Some(&library), false).map_err(store_error)?.1)
+            })
+            .unwrap();
+        let item = identify.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items.remove(0);
+        assert_eq!((item.result_id, item.track_id.as_str(), item.undoable), (result, track.as_str(), false));
+
+        // A field the proposal lacks is refused alone, changing nothing.
+        let items = [
+            ApplyItemDto { result_id: result, fields: vec!["genre".into()] },
+            ApplyItemDto { result_id: result, fields: vec!["title".into(), "subGenre".into(), "isrc".into(), "catalogNumber".into()] },
+        ];
+        let generation_before = app.summary().3;
+        let (outcomes, generation) = identify.apply_items(&app, &items);
+        assert_eq!(outcomes.iter().map(|o| o.ok).collect::<Vec<_>>(), [false, true], "{outcomes:?}");
+        assert!(generation.is_some_and(|g| g != generation_before), "the library was refreshed");
+        let written = tags::read(&audio).unwrap().snapshot;
+        assert_eq!(rbl_identify::pipeline::current(&written, Field::Title), "New Title (Extended Mix)");
+        assert_eq!(rbl_identify::pipeline::current(&written, Field::CatalogNumber), "CAT001");
+        let row = library_row(&app, &track);
+        assert_eq!(row.0, "New Title (Extended Mix)");
+        assert_eq!(row.2.as_deref(), Some("GBAAA1400001"));
+        let comment = row.1.clone().unwrap_or_default();
+        assert!(comment.ends_with("Tech House"), "{comment}");
+        let refreshed = app.library().unwrap();
+        let at = refreshed.row_of(&track).unwrap() as usize;
+        assert_eq!(refreshed.title.get(at), "New Title (Extended Mix)");
+        let item = identify.detail(result).unwrap().item;
+        assert_eq!((item.state.as_str(), item.undoable), ("applied", true));
+
+        // Applied once: not again.
+        let (again, _) = identify.apply_items(&app, &items[1..]);
+        assert!(!again[0].ok);
+
+        let (undone, generation) = identify.undo_item(&app, result);
+        assert!(undone.ok, "{undone:?}");
+        assert!(generation.is_some());
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "the file byte for byte");
+        assert_eq!(library_row(&app, &track), before_row, "the library record as it was");
+        assert_eq!(identify.detail(result).unwrap().item.state, "undone");
+        let (twice, _) = identify.undo_item(&app, result);
+        assert!(!twice.ok);
+    }
+
+    #[test]
+    fn undo_is_refused_when_the_file_changed_since_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let app = AppState::with_backups(dir.path().join("backups"));
+        app.set_library(library, false, db.schema().db_version, 0, location);
+        drop(db);
+        let track = rbl_db::fixture::track_id(2);
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let result = identify
+            .with_store(|store| {
+                let key = TrackKey::for_file(&audio).map_err(store_error)?;
+                let mut track_result = result(&audio, Decision::Review);
+                track_result.proposal = Some(Proposal::new(
+                    vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }],
+                    None,
+                    true,
+                ));
+                track_result.artwork = None;
+                let library = LibraryTrack { track_id: track.clone(), path: key.path.clone() };
+                Ok(store.save_track_result(&key, &track_result, Some(&library), false).map_err(store_error)?.1)
+            })
+            .unwrap();
+        let (outcomes, _) = identify.apply_items(&app, &[ApplyItemDto { result_id: result, fields: vec!["title".into()] }]);
+        assert!(outcomes[0].ok, "{outcomes:?}");
+        // Someone retags the file afterwards.
+        let after = tags::read(&audio).unwrap().snapshot;
+        let edits = rbl_identify::write::plan(
+            &after,
+            &[FieldChange { field: Field::Title, current: "Mine".into(), proposed: "By Hand".into() }],
+        )
+        .unwrap();
+        rbl_identify::write::write(&audio, &after, &edits, None).unwrap();
+        let (undone, generation) = identify.undo_item(&app, result);
+        assert!(!undone.ok);
+        assert!(undone.error.as_deref().unwrap_or_default().contains("changed since"), "{undone:?}");
+        assert_eq!(generation, None);
+        assert_eq!(identify.detail(result).unwrap().item.state, "applied");
     }
 
     #[test]

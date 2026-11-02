@@ -647,7 +647,7 @@ where
     Ok(generation)
 }
 
-fn history_dto(generation: u32, history: &EditHistory) -> EditHistoryDto {
+pub(crate) fn history_dto(generation: u32, history: &EditHistory) -> EditHistoryDto {
     EditHistoryDto {
         generation,
         can_undo: !history.undo.is_empty(),
