@@ -53,7 +53,11 @@ fn keys(field: Field) -> Vec<ItemKey> {
         Field::DiscogsReleaseId => {
             vec![ItemKey::Unknown("DISCOGS_RELEASE_ID".to_owned()), ItemKey::Unknown("DISCOGS_RELEASEID".to_owned())]
         }
-        Field::Artwork => Vec::new(),
+        // TODO(Phase 4): read from the frame sub-genre is written to, once
+        // it is confirmed (COMM, TIT3 or TXXX:DESCRIPTION; comments are on the
+        // never-modify list). Until then it is not read: never in the
+        // snapshot, so always shown as empty, and never auto-applied.
+        Field::SubGenre | Field::Artwork => Vec::new(),
     }
 }
 

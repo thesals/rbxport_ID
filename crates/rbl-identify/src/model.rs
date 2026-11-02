@@ -46,6 +46,18 @@ pub enum Field {
     Label,
     Year,
     Genre,
+    /// Discogs styles (Tech House, Progressive House), joined with "; ":
+    /// the sub-genre beside the broader Genre. Proposed only to fill.
+    ///
+    /// TODO(Phase 4): the frame it is written to is not decided yet (`COMM`,
+    /// `TIT3` or `TXXX:DESCRIPTION`; the user asked for "the description
+    /// field"). Comments are on the spec's never-modify list and most files
+    /// already carry a `COMM` such as "Purchased at Beatport.com", so `COMM`
+    /// needs explicit approval. Until the frame is confirmed nothing reads
+    /// it: the snapshot never holds it, so it always looks empty, and for
+    /// that reason it never counts as an empty fill
+    /// ([`Proposal::fills_only_empty`]), so it can never be auto-applied.
+    SubGenre,
     Isrc,
     CatalogNumber,
     MbRecordingId,
@@ -64,6 +76,38 @@ pub enum Field {
 impl Field {
     /// The value an absent artwork is described by in a [`FieldChange`].
     pub const NO_ARTWORK: &'static str = "none";
+
+    /// The field's stable name: its variant name, as it is serialised.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+            Self::Label => "Label",
+            Self::Year => "Year",
+            Self::Genre => "Genre",
+            Self::SubGenre => "SubGenre",
+            Self::Isrc => "Isrc",
+            Self::CatalogNumber => "CatalogNumber",
+            Self::MbRecordingId => "MbRecordingId",
+            Self::MbReleaseId => "MbReleaseId",
+            Self::MbReleaseGroupId => "MbReleaseGroupId",
+            Self::MbArtistId => "MbArtistId",
+            Self::MbReleaseTrackId => "MbReleaseTrackId",
+            Self::MbAlbumArtistId => "MbAlbumArtistId",
+            Self::DiscogsReleaseId => "DiscogsReleaseId",
+            Self::Artwork => "Artwork",
+        }
+    }
+
+    /// Whether the file's current value of this field is actually read.
+    /// [`Field::SubGenre`] is not yet (its frame is decided in Phase 4), so
+    /// its "empty" current value proves nothing.
+    #[must_use]
+    pub fn is_read(self) -> bool {
+        self != Self::SubGenre
+    }
 }
 
 /// One proposed change, current value against proposed, as the review
@@ -136,12 +180,14 @@ impl Proposal {
     /// True when every change fills a field that is empty now (artwork:
     /// added to a file that has none): the only proposals auto-apply may
     /// ever take. An empty proposal changes nothing and is not "only empty
-    /// fields".
+    /// fields". A field whose current value is not read ([`Field::is_read`])
+    /// is never known to be empty, so a change to it is never a fill.
     #[must_use]
     pub fn fills_only_empty(&self) -> bool {
         !self.changes.is_empty()
             && self.changes.iter().all(|c| {
-                c.current.trim().is_empty() || (c.field == Field::Artwork && c.current == Field::NO_ARTWORK)
+                c.field.is_read()
+                    && (c.current.trim().is_empty() || (c.field == Field::Artwork && c.current == Field::NO_ARTWORK))
             })
     }
 }
@@ -202,7 +248,8 @@ pub struct Enrichment {
     pub catalog_number: String,
     pub year: Option<u16>,
     /// Discogs styles: the sub-genre granularity (Tech House, Progressive
-    /// House) the genre policy writes.
+    /// House). Proposed as [`Field::SubGenre`], and into Genre only as the
+    /// genre policy allows.
     pub styles: Vec<String>,
     pub genres: Vec<String>,
 }
@@ -293,6 +340,7 @@ pub enum Decision {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -331,5 +379,14 @@ mod tests {
         let stray = FieldChange { field: Field::Artwork, current: "none".into(), proposed: "x".into() };
         let has_art = Proposal::new(vec![stray], Some(art()), true);
         assert_eq!(has_art, Proposal::default());
+    }
+
+    #[test]
+    fn a_sub_genre_is_never_an_empty_fill_until_its_frame_is_read() {
+        let sub = FieldChange { field: Field::SubGenre, current: String::new(), proposed: "Tech House".into() };
+        assert!(!Proposal::new(vec![sub.clone()], None, false).fills_only_empty());
+        assert!(!Proposal::new(vec![change(""), sub], None, false).fills_only_empty());
+        assert_eq!(Field::SubGenre.as_str(), "SubGenre");
+        assert_eq!(serde_json::to_string(&Field::SubGenre).unwrap(), "\"SubGenre\"");
     }
 }

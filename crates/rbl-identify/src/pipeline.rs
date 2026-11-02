@@ -413,6 +413,9 @@ pub enum GenrePolicy {
 /// number, or same title and year); with no MusicBrainz release, Discogs's
 /// is the release.
 ///
+/// Discogs styles are proposed as [`Field::SubGenre`], only to fill it;
+/// into Genre only as `genre` allows (by default only an empty Genre).
+///
 /// When the MusicBrainz release ID changes, Picard's release-bound IDs
 /// already in the file (release track, album artist) are proposed for
 /// clearing, so the file never carries IDs that contradict each other.
@@ -434,8 +437,9 @@ pub fn propose(
         .map(str::to_owned)
         .or_else(|| discogs.and_then(|e| e.year).map(|y| y.to_string()));
     let styles = discogs.map(|e| e.styles.join("; ")).filter(|s| !s.is_empty());
+    let sub_genre = fill_only(snapshot, Field::SubGenre, styles.clone());
     let genre = match genre {
-        GenrePolicy::FillEmpty => styles.filter(|_| current(snapshot, Field::Genre).trim().is_empty()),
+        GenrePolicy::FillEmpty => fill_only(snapshot, Field::Genre, styles),
         GenrePolicy::Replace => styles,
         GenrePolicy::Never => None,
     };
@@ -449,6 +453,7 @@ pub fn propose(
         (Field::Year, year),
         (Field::Isrc, candidate.isrcs.first().cloned()),
         (Field::Genre, genre),
+        (Field::SubGenre, sub_genre),
         (Field::MbRecordingId, Some(candidate.recording_mbid.clone()).filter(|v| !v.is_empty())),
         (Field::MbReleaseId, release_text(|r| &r.mbid)),
         (Field::MbReleaseGroupId, release_text(|r| &r.release_group_mbid)),
@@ -519,6 +524,11 @@ fn same_title(a: &str, b: &str) -> bool {
         found
     };
     !a.trim().is_empty() && normalize::similarity(a, b) >= ALBUM_MATCH && numbers(a) == numbers(b)
+}
+
+/// `value`, only when the field is empty in the file now.
+fn fill_only(snapshot: &TagSnapshot, field: Field, value: Option<String>) -> Option<String> {
+    value.filter(|_| current(snapshot, field).trim().is_empty())
 }
 
 /// A field's current value as the review screen shows it: every value of
@@ -700,6 +710,25 @@ mod tests {
     }
 
     #[test]
+    fn styles_are_proposed_as_the_sub_genre_whatever_the_genre_policy() {
+        let enrichment = Enrichment { styles: vec!["Tech House".into(), "Minimal".into()], ..Enrichment::default() };
+        let c = candidate("x", "", &[]);
+        let set = snapshot(&[(Field::Genre, "TCON", "House")]);
+        for policy in [GenrePolicy::FillEmpty, GenrePolicy::Replace, GenrePolicy::Never] {
+            let proposal = propose(&file(""), &set, &c, Some(&enrichment), None, policy);
+            let sub = change_for(&proposal, Field::SubGenre).unwrap();
+            assert_eq!((sub.current.as_str(), sub.proposed.as_str()), ("", "Tech House; Minimal"), "{policy:?}");
+        }
+        // Fill-only: a sub-genre already there (once it is read) is kept.
+        let has_sub = snapshot(&[(Field::SubGenre, "TXXX:DESCRIPTION", "Deep House")]);
+        let kept = propose(&file(""), &has_sub, &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&kept, Field::SubGenre), None);
+        // No styles, no sub-genre.
+        let none = propose(&file(""), &TagSnapshot::default(), &c, Some(&Enrichment::default()), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&none, Field::SubGenre), None);
+    }
+
+    #[test]
     fn discogs_label_and_catalog_number_win_and_unchanged_fields_are_left_out() {
         let enrichment = Enrichment {
             discogs_release_id: Some(42),
@@ -776,7 +805,7 @@ mod tests {
         let proposal = propose(&file(""), &TagSnapshot::default(), &c, Some(&other), None, GenrePolicy::FillEmpty);
         assert_eq!(change_for(&proposal, Field::Album).unwrap().proposed, "Original EP");
         assert_eq!(change_for(&proposal, Field::Year).unwrap().proposed, "2014");
-        for field in [Field::Label, Field::CatalogNumber, Field::DiscogsReleaseId, Field::Genre] {
+        for field in [Field::Label, Field::CatalogNumber, Field::DiscogsReleaseId, Field::Genre, Field::SubGenre] {
             assert_eq!(change_for(&proposal, field), None, "{field:?} must not come from another release");
         }
         // The same release on Discogs (title and year agree) fills the gaps.
