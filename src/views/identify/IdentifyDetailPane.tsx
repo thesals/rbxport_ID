@@ -11,11 +11,15 @@ import { getBackend } from "@/ipc/client";
 import type { IdentifyDetail, IdentifyField, IdentifyReviewAction } from "@/ipc/types";
 import { useTranslation } from "@/i18n";
 import { errorMessage } from "@/lib/errorMessage";
-import { formatBytes } from "@/lib/format";
 import {
   canApply, changes, decisionLabel, defaultFields, fieldLabel, formatScore, sourceLabel, stateLabel, trackName,
 } from "./identifyText";
 import styles from "./IdentifyPanel.module.css";
+
+/** A cover's size: tens of kilobytes, which `formatBytes` would round to 0.0 MB. */
+function imageSize(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
 
 /** Fields whose proposal can be typed over. Artwork is a picture; the comment is only ever appended to. */
 const EDITABLE = (field: IdentifyField) => field !== "artwork" && field !== "subGenre";
@@ -229,7 +233,7 @@ export function IdentifyDetailPane({ resultId, readOnly, readOnlyReason, onChang
         <p className={styles.hint}>
           {t("Proposed artwork: {mime}, {size}, from {source}", {
             mime: detail.artwork.mime,
-            size: formatBytes(detail.artwork.bytes),
+            size: imageSize(detail.artwork.bytes),
             source: detail.artwork.source === "discogs" ? "Discogs" : "Cover Art Archive",
           })}
         </p>

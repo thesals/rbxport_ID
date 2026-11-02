@@ -114,6 +114,7 @@
   background: linear-gradient(var(--c-pref-button-top), var(--c-pref-button-bottom));
   color: var(--c-icon-on);
   font: inherit;
+  white-space: nowrap;
   cursor: default;
 }
 .button { height: var(--s-pref-button-h); padding: 0 14px; }
