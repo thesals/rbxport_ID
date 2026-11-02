@@ -32,7 +32,9 @@ export type TrackAction =
   | "showInformation"
   | "showInFinder"
   | "loadPlayer1"
-  | "loadPlayer2";
+  | "loadPlayer2"
+  /** Fork-only: track identification (`docs/identify/IDENTIFY_SPEC.md`). */
+  | "identify";
 
 export type TreeAction =
   | "export"
@@ -46,7 +48,10 @@ export type TreeAction =
   | "rename"
   | "delete"
   | "addToShortcut"
-  | "sortItems";
+  | "sortItems"
+  /** Fork-only: identify the node's tracks, or open the review queue. */
+  | "identify"
+  | "identifyReview";
 
 /** The deck's ≡ menu: the choices it changes, and the one thing it does. */
 export type DeckAction =
@@ -205,7 +210,37 @@ export const TRACK_MENU: readonly MenuRow<TrackAction>[] = [
  * rows would promise a feature that is not coming, which is a different
  * thing from one not built yet.
  */
-export function treeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "collection"): readonly MenuRow<TreeAction>[] {
+export function treeMenu(
+  kind: "playlist" | "smartPlaylist" | "folder" | "collection",
+  /** Fork-only: end the menu with the identify entries. */
+  options: { identify?: boolean } = {},
+): readonly MenuRow<TreeAction>[] {
+  const rows = rekordboxTreeMenu(kind);
+  return options.identify === true && kind !== "collection" ? [...rows, SEPARATOR, ...IDENTIFY_NODE_ROWS] : rows;
+}
+
+/**
+ * The fork's track identification, which rekordbox does not have
+ * (`docs/identify/IDENTIFY_SPEC.md`). It is kept out of the transcribed
+ * menus above and appended after them, behind a separator, so those stay
+ * rekordbox's own. Starting a job writes nothing to the library — only
+ * applying a reviewed result does — so it is live while the library is
+ * read-only.
+ */
+const IDENTIFY_NODE_ROWS: readonly MenuRow<TreeAction>[] = [
+  { label: "Identify Tracks", action: "identify" },
+  { label: "Review Identified Tracks", action: "identifyReview" },
+];
+
+/** All Tracks has no menu in rekordbox; in the fork it has the identify one. */
+export function allTracksMenu(): readonly MenuRow<TreeAction>[] {
+  return [
+    { label: "Identify All Tracks", action: "identify" },
+    { label: "Review Identified Tracks", action: "identifyReview" },
+  ];
+}
+
+function rekordboxTreeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "collection"): readonly MenuRow<TreeAction>[] {
   if (kind === "collection") {
     return [
       { label: "Create New Playlist", action: "createPlaylist" },
@@ -449,7 +484,8 @@ export function trackMenuFor(
   // [ASSUME: the capture is over a playlist].
   // In the Explorer, rekordbox draws no Convert Memory Cues to Hot Cues row,
   // over an imported file or a loose one [OBS 7, Winrig 2026-10-08].
-  options: { tagList?: boolean; explorer?: boolean } = {},
+  // `identify` appends the fork's Identify Tracks entry after rekordbox's rows.
+  options: { tagList?: boolean; explorer?: boolean; identify?: boolean } = {},
 ): readonly MenuRow<TrackAction>[] {
   const every: MenuRow<TrackAction>[] = [
     { label: "Load track to player 1", action: "loadPlayer1" },
@@ -469,7 +505,10 @@ export function trackMenuFor(
   const rows = options.explorer === true
     ? TRACK_MENU.filter((row) => row === SEPARATOR || row.action !== "convertMemoryCues")
     : TRACK_MENU;
-  return rows.map((row) => {
+  const fork: readonly MenuRow<TrackAction>[] = options.identify === true
+    ? [SEPARATOR, { label: "Identify Tracks", action: "identify", needs: "track" }]
+    : [];
+  return [...rows, ...fork].map((row) => {
     if (row === SEPARATOR) return row;
     if (row.label === "Load" && decks.length > 0) return { ...row, items: decks };
     if (row.label === "Add To Playlist" && lists.length > 0) return { ...row, items: lists };

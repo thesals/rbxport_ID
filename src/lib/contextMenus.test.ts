@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import { deckMenu, enabled, entriesOf, SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext } from "./contextMenus";
+import {
+  allTracksMenu, deckMenu, enabled, entriesOf, SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext,
+} from "./contextMenus";
 
 const OPEN: MenuContext = { inPlaylist: true, hasFile: true, readOnly: false };
 
@@ -317,5 +319,30 @@ describe("deckMenu", () => {
   it("offers Analyze Track for the loaded track", () => {
     const entry = entriesOf(deckMenu(state)).find((e) => e.label === "Analyze Track");
     expect(entry?.action).toBe("analyse");
+  });
+});
+
+describe("the fork's identify entries", () => {
+  const context: MenuContext = { inPlaylist: false, hasFile: true, readOnly: true };
+  const shape = (rows: ReturnType<typeof trackMenuFor>) => rows.map((row) => row === SEPARATOR ? row : row.label);
+
+  it("leave rekordbox's menus alone unless asked for, then come last", () => {
+    const rows = trackMenuFor(2, [], [], { identify: true });
+    expect(shape(rows.slice(0, TRACK_MENU.length))).toEqual(shape(trackMenuFor(2)));
+    expect(rows.at(-2)).toBe(SEPARATOR);
+    const identify = entriesOf(rows).at(-1);
+    expect(identify).toMatchObject({ label: "Identify Tracks", action: "identify" });
+    // Identifying writes nothing to the library, so read-only leaves it live.
+    expect(enabled(identify!, context)).toBe(true);
+    expect(enabled(identify!, { ...context, loose: true })).toBe(false);
+  });
+
+  it("end the playlist and folder menus, and make All Tracks' menu", () => {
+    for (const kind of ["playlist", "smartPlaylist", "folder"] as const) {
+      expect(entriesOf(treeMenu(kind, { identify: true })).slice(-2).map((e) => e.action)).toEqual(["identify", "identifyReview"]);
+      expect(entriesOf(treeMenu(kind)).map((e) => e.action)).not.toContain("identify");
+    }
+    expect(entriesOf(treeMenu("collection", { identify: true })).map((e) => e.action)).not.toContain("identify");
+    expect(entriesOf(allTracksMenu()).map((e) => e.label)).toEqual(["Identify All Tracks", "Review Identified Tracks"]);
   });
 });
