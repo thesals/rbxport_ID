@@ -2276,3 +2276,29 @@ fn grid_lock_preserves_other_flags_and_grid_revision_uses_reference_character() 
     assert_eq!(f.one::<String>("SELECT AnalysisUpdated FROM djmdContent WHERE ID=?1", &[&id]),":");
     assert_eq!(f.one::<i64>("SELECT BPM FROM djmdContent WHERE ID=?1", &[&id]),12800);
 }
+
+#[test]
+fn track_values_are_kept_exactly_and_put_back() {
+    use rbl_db::write::{ColumnValue, StoredValue, TrackField};
+    let mut f = fixture();
+    let id = fixture::track_id(1);
+    let columns = ["Title", "ArtistID", "Commnt", "ISRC", "ReleaseYear"];
+    let before = f.writer.track_values(&id, &columns).unwrap();
+    assert_eq!(before.iter().map(|v| v.column.as_str()).collect::<Vec<_>>(), columns);
+    f.writer.set_field(&id, TrackField::Title, "Identified (Extended Mix)").unwrap();
+    f.writer.set_field(&id, TrackField::Artist, "Someone New").unwrap();
+    f.writer.set_comment(&id, "note; Tech House").unwrap();
+    f.writer.set_isrc(&id, "GBAAA1400001").unwrap();
+    f.writer.set_field(&id, TrackField::Year, "2014").unwrap();
+    let isrc: String = f.one("SELECT ISRC FROM djmdContent WHERE ID = ?1", &[&id]);
+    assert_eq!(isrc, "GBAAA1400001");
+    // Through JSON, as the identify store keeps them.
+    let kept: Vec<ColumnValue> = serde_json::from_str(&serde_json::to_string(&before).unwrap()).unwrap();
+    f.writer.restore_track_values(&id, &kept).unwrap();
+    assert_eq!(f.writer.track_values(&id, &columns).unwrap(), before);
+    // Only writable columns, only live tracks.
+    assert!(f.writer.track_values(&id, &["Rating = 0 --"]).is_err());
+    let bogus = vec![ColumnValue { column: "UUID".into(), value: StoredValue::Null }];
+    assert!(f.writer.restore_track_values(&id, &bogus).is_err());
+    assert!(f.writer.restore_track_values("no-such-track", &kept).is_err());
+}
