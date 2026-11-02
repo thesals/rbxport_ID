@@ -13,8 +13,9 @@
  * few hundred lines.
  */
 import type {
-  AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyDecision, IdentifyDetail, IdentifyFieldChange, IdentifyFilter,
-  IdentifyProgress, IdentifyQueueItem, IdentifyResultEvent, IdentifyReviewAction, IdentifyReviewState,
+  AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyChangedEvent, IdentifyDecision, IdentifyDetail, IdentifyFieldChange,
+  IdentifyFilter, IdentifyProgress, IdentifyQueueItem, IdentifyResultEvent, IdentifyReviewAction, IdentifyReviewState,
+  IdentifyWriteOutcome,
 } from "./types";
 
 /** The most rows one queue call answers, as `MAX_ROWS` is in Rust. */
@@ -86,6 +87,9 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   const tickMs = options.tickMs ?? 400;
   const progressListeners = new Set<(progress: IdentifyProgress) => void>();
   const resultListeners = new Set<(result: IdentifyResultEvent) => void>();
+  const changedListeners = new Set<(event: IdentifyChangedEvent) => void>();
+  /** The values an apply replaced, by result, for its undo. */
+  const snapshots = new Map<number, IdentifyFieldChange[]>();
   /** Every result, current or replaced, by id. */
   const results = new Map<number, IdentifyDetail>();
   /** Each file's current result. */
@@ -104,9 +108,13 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   const tellResult = (result: IdentifyResultEvent) => {
     for (const listener of resultListeners) listener({ ...result });
   };
+  const tellChanged = (resultIds: readonly number[]) => {
+    if (resultIds.length === 0) return;
+    for (const listener of changedListeners) listener({ resultIds: [...resultIds] });
+  };
 
   /** Stores one finished track as the store would, and returns its id. */
-  const save = (path: string, artist: string, title: string, decision: IdentifyDecision): number => {
+  const save = (trackId: string, path: string, artist: string, title: string, decision: IdentifyDecision): number => {
     const id = nextResult++;
     const score = decision === "unidentified" ? 0.31 : decision === "autoApply" ? 0.97 : 0.81;
     const changes: IdentifyFieldChange[] =
@@ -120,14 +128,15 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
           : [
               { field: "title", current: title, proposed: `${title} (Extended Mix)` },
               { field: "label", current: "Old Label", proposed: "Mock Records" },
+              { field: "subGenre", current: "", proposed: "Tech House" },
               { field: "artwork", current: "none", proposed: "JPEG from Cover Art Archive" },
             ];
     const state: IdentifyReviewState =
       decision === "unidentified" ? "unidentified" : decision === "autoApply" ? "accepted" : "pending";
     results.set(id, {
       item: {
-        resultId: id, path, state, decision, score: decision === "unidentified" ? null : score,
-        artist, title, changes, updatedUnix: Math.floor(Date.now() / 1000),
+        resultId: id, trackId, path, state, decision, score: decision === "unidentified" ? null : score,
+        artist, title, changes, updatedUnix: Math.floor(Date.now() / 1000), undoable: false,
       },
       existing: {
         artist, title, album: "", label: decision === "review" ? "Old Label" : "", year: null, isrc: "", genre: "",
@@ -182,7 +191,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
           result.decision = "failed";
           result.error = "identify store: this track has an applied result; undo it before identifying again";
         } else {
-          result.resultId = save(path, artist, title, outcome);
+          result.resultId = save(trackId, path, artist, title, outcome);
           result.score = results.get(result.resultId)?.item.score ?? null;
         }
         if (result.decision === "autoApply") progress.identified += 1;
@@ -286,7 +295,79 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
         change.proposed = edit.proposed;
       }
       detail.item.changes = next;
-      return Promise.resolve(touch(detail));
+      const item = touch(detail);
+      tellChanged([resultId]);
+      return Promise.resolve(item);
+    },
+    apply: (items) => {
+      const outcomes = items.map(({ resultId, fields }): IdentifyWriteOutcome => {
+        const detail = changeable(resultId);
+        const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error });
+        if (!detail) return refuse("That identification result is no longer in the store.");
+        if (detail.item.state !== "pending" && detail.item.state !== "accepted") {
+          return refuse(`A ${detail.item.state} result cannot be applied.`);
+        }
+        if (fields.length === 0) return refuse("Choose at least one field to write.");
+        const picked = detail.item.changes.filter((c) => fields.includes(c.field));
+        if (picked.length !== new Set(fields).size) return refuse("That change could not be made to this result.");
+        snapshots.set(resultId, detail.item.changes.map((c) => ({ ...c })));
+        detail.item.changes = detail.item.changes.map((c) => fields.includes(c.field) ? { ...c, current: c.proposed } : c);
+        for (const change of picked) {
+          if (change.field === "artwork") detail.existing.hasArtwork = true;
+          else if (change.field === "year") detail.existing.year = Number(change.proposed) || null;
+          else if (change.field in detail.existing) {
+            (detail.existing as unknown as Record<string, string>)[change.field] = change.proposed;
+          }
+        }
+        detail.item.state = "applied";
+        detail.item.undoable = true;
+        touch(detail);
+        return { resultId, ok: true, error: null };
+      });
+      tellChanged(outcomes.filter((o) => o.ok).map((o) => o.resultId));
+      return Promise.resolve(outcomes);
+    },
+    undo: (resultId) => {
+      const detail = changeable(resultId);
+      const snapshot = snapshots.get(resultId);
+      if (!detail || !detail.item.undoable || !snapshot) {
+        return Promise.resolve({ resultId, ok: false, error: "There is nothing to undo for this result." });
+      }
+      for (const original of snapshot) {
+        const now = detail.item.changes.find((c) => c.field === original.field);
+        if (!now || now.current === original.current) continue;
+        if (original.field === "artwork") detail.existing.hasArtwork = false;
+        else if (original.field === "year") detail.existing.year = Number(original.current) || null;
+        else if (original.field in detail.existing) {
+          (detail.existing as unknown as Record<string, string>)[original.field] = original.current;
+        }
+      }
+      detail.item.changes = detail.item.changes.map((c) => ({
+        ...c, current: snapshot.find((o) => o.field === c.field)?.current ?? c.current,
+      }));
+      snapshots.delete(resultId);
+      detail.item.state = "undone";
+      detail.item.undoable = false;
+      touch(detail);
+      tellChanged([resultId]);
+      return Promise.resolve({ resultId, ok: true, error: null });
+    },
+    acceptAbove: (threshold) => {
+      const accepted: number[] = [];
+      for (const id of current.values()) {
+        const detail = results.get(id);
+        if (!detail || detail.item.state !== "pending" || detail.writeInProgress) continue;
+        if ((detail.item.score ?? -1) < threshold) continue;
+        detail.item.state = "accepted";
+        touch(detail);
+        accepted.push(id);
+      }
+      tellChanged(accepted);
+      return Promise.resolve(accepted.length);
+    },
+    onChanged: (listener) => {
+      changedListeners.add(listener);
+      return () => { changedListeners.delete(listener); };
     },
   };
 }

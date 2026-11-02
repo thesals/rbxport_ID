@@ -125,6 +125,39 @@ describe("mock identify", () => {
     await expect(identify.result(999)).rejects.toMatchObject({ kind: "notFound" });
   });
 
+  it("applies ticked fields, undoes them, and accepts above a threshold", async () => {
+    const identify = createMockIdentify({ tickMs: TICK });
+    const changed: number[][] = [];
+    identify.onChanged((event) => changed.push(event.resultIds));
+    await identify.start(["1", "2", "3", "4"]);
+    await finish(4);
+    const [first, second] = (await identify.queue("needsReview", 0, 10)).items;
+    expect(first?.trackId).toBe("1");
+    expect(first?.undoable).toBe(false);
+
+    const outcomes = await identify.apply([
+      { resultId: first!.resultId, fields: ["title", "label"] },
+      { resultId: 999, fields: ["title"] },
+    ]);
+    expect(outcomes.map((o) => o.ok)).toEqual([true, false]);
+    expect(changed.at(-1)).toEqual([first!.resultId]);
+    const applied = await identify.result(first!.resultId);
+    expect(applied.item).toMatchObject({ state: "applied", undoable: true });
+    expect(applied.existing.label).toBe("Mock Records");
+    expect((await identify.queue("applied", 0, 10)).items.map((i) => i.resultId)).toContain(first!.resultId);
+    expect((await identify.apply([{ resultId: first!.resultId, fields: ["title"] }]))[0]?.ok).toBe(false);
+
+    expect((await identify.undo(first!.resultId)).ok).toBe(true);
+    const undone = await identify.result(first!.resultId);
+    expect(undone.item).toMatchObject({ state: "undone", undoable: false });
+    expect(undone.existing.label).toBe("Old Label");
+    expect((await identify.undo(first!.resultId)).ok).toBe(false);
+
+    expect(await identify.acceptAbove(0.99)).toBe(0);
+    expect(await identify.acceptAbove(0.8)).toBe(1);
+    expect((await identify.result(second!.resultId)).item.state).toBe("accepted");
+  });
+
   it("names tracks from the mock library", async () => {
     const backend = createMockBackend({ trackCount: 10 });
     const view = await backend.openView({ source: { kind: "collection" }, sort: "trackNo", descending: false, query: "" });

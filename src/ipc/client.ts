@@ -14,7 +14,8 @@ import type {
   LinkStatus, MissingExportFile, MissingTracks, PreviewState, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
   TreeNode, ViewHandle,
   TrackDetails, TrackLookups,
-  IdentifyDetail, IdentifyProgress, IdentifyQueue, IdentifyQueueItem, IdentifyResultEvent,
+  IdentifyChangedEvent, IdentifyDetail, IdentifyProgress, IdentifyQueue, IdentifyQueueItem, IdentifyResultEvent,
+  IdentifyWriteOutcome,
 } from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -567,6 +568,12 @@ async function realBackend(): Promise<Backend> {
       result: (resultId) => invoke<IdentifyDetail>("identify_result", { resultId }),
       setState: (resultId, action) => invoke<IdentifyQueueItem>("identify_set_state", { resultId, action }),
       edit: (resultId, changes) => invoke<IdentifyQueueItem>("identify_edit", { resultId, changes: [...changes] }),
+      apply: (items) => invoke<IdentifyWriteOutcome[]>("identify_apply", {
+        items: items.map((item) => ({ resultId: item.resultId, fields: [...item.fields] })),
+      }),
+      undo: (resultId) => invoke<IdentifyWriteOutcome>("identify_undo", { resultId }),
+      acceptAbove: (threshold) => invoke<number>("identify_accept_above", { threshold }),
+      onChanged: (listener) => subscribe<IdentifyChangedEvent>("identify:changed", listener),
     },
     filterValues: (spec) => invoke<FilterValues>("filter_values", { spec }),
     trackDetails: (trackId) => invoke<TrackDetails>("track_details", { track: trackId }),

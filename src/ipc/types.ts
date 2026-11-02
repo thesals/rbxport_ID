@@ -1780,6 +1780,8 @@ export interface IdentifyFieldChange {
 
 export interface IdentifyQueueItem {
   resultId: number;
+  /** The library track the result belongs to. */
+  trackId: string;
   path: string;
   state: IdentifyReviewState;
   decision: IdentifyDecision;
@@ -1789,6 +1791,8 @@ export interface IdentifyQueueItem {
   title: string;
   changes: IdentifyFieldChange[];
   updatedUnix: number;
+  /** Applied, with the original tags snapshotted, so `identify.undo` can restore them. */
+  undoable: boolean;
 }
 
 /** A window of the queue and the filter's total. */
@@ -1866,6 +1870,24 @@ export interface IdentifyFieldEdit {
   proposed: string;
 }
 
+/** One result to write, with the fields the user ticked. */
+export interface IdentifyApplyItem {
+  resultId: number;
+  fields: IdentifyField[];
+}
+
+/** How one apply or undo went; `error` says why when `ok` is false. */
+export interface IdentifyWriteOutcome {
+  resultId: number;
+  ok: boolean;
+  error: string | null;
+}
+
+/** `identify:changed`: results whose state or values changed. */
+export interface IdentifyChangedEvent {
+  resultIds: number[];
+}
+
 export interface IdentifyBackend {
   /**
    * Starts identifying these library tracks in the background and resolves
@@ -1886,4 +1908,14 @@ export interface IdentifyBackend {
   setState(resultId: number, action: IdentifyReviewAction): Promise<IdentifyQueueItem>;
   /** Replaces proposed values; only fields the proposal lists, never artwork. */
   edit(resultId: number, changes: readonly IdentifyFieldEdit[]): Promise<IdentifyQueueItem>;
+  /**
+   * Writes the ticked fields of each result to its file and the library,
+   * snapshotting the originals first. Each item answers for itself.
+   */
+  apply(items: readonly IdentifyApplyItem[]): Promise<IdentifyWriteOutcome[]>;
+  /** Puts an applied result's original tags back. */
+  undo(resultId: number): Promise<IdentifyWriteOutcome>;
+  /** Marks every pending result scoring at least `threshold` accepted; resolves to how many. */
+  acceptAbove(threshold: number): Promise<number>;
+  onChanged(listener: (event: IdentifyChangedEvent) => void): () => void;
 }
