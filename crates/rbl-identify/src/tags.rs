@@ -331,15 +331,89 @@ pub(crate) fn be_u32(bytes: &[u8]) -> usize {
 /// A file's `ID3v2` block and `ID3v1` trailer, either possibly absent.
 type RawBlocks = (Option<Vec<u8>>, Option<Vec<u8>>);
 
+/// A file that keeps its `ID3v2` tag in a chunk rather than at its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Container {
+    /// `FORM` ... `AIFF`/`AIFC`: big-endian chunk sizes, an `ID3 ` chunk.
+    Aiff,
+    /// `RIFF` ... `WAVE`: little-endian chunk sizes, an `id3 ` or `ID3 ` chunk.
+    Wav,
+}
+
+impl Container {
+    /// The container a file's first twelve bytes say it is.
+    pub(crate) fn of(header: &[u8]) -> Option<Self> {
+        match (header.get(..4), header.get(8..12)) {
+            (Some(b"FORM"), Some(b"AIFF" | b"AIFC")) => Some(Self::Aiff),
+            (Some(b"RIFF"), Some(b"WAVE")) => Some(Self::Wav),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn size(self, bytes: [u8; 4]) -> u64 {
+        u64::from(match self {
+            Self::Aiff => u32::from_be_bytes(bytes),
+            Self::Wav => u32::from_le_bytes(bytes),
+        })
+    }
+
+    /// The id a new tag chunk gets: `ID3 ` in AIFF (what rekordbox's AIFF
+    /// downloads carry), lofty's `id3 ` in WAV.
+    pub(crate) fn chunk_id(self) -> &'static [u8; 4] {
+        match self {
+            Self::Aiff => b"ID3 ",
+            Self::Wav => b"id3 ",
+        }
+    }
+}
+
+/// Where a container's ID3 chunk is: the offset of its 8-byte header and the
+/// payload's length. Walks the chunk headers only.
+pub(crate) fn find_id3_chunk<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    container: Container,
+    len: u64,
+) -> std::io::Result<Option<(u64, u64)>> {
+    use std::io::SeekFrom;
+    let mut at = 12_u64;
+    let mut header = [0_u8; 8];
+    while at + 8 <= len {
+        reader.seek(SeekFrom::Start(at))?;
+        reader.read_exact(&mut header)?;
+        let size = container.size([header[4], header[5], header[6], header[7]]);
+        if header[..4].eq_ignore_ascii_case(b"ID3 ") {
+            return Ok((at + 8 + size <= len).then_some((at, size)));
+        }
+        at += 8 + size + (size & 1);
+    }
+    Ok(None)
+}
+
 /// The `ID3v2` block at the start of the file and the `ID3v1` trailer at
-/// its end, byte for byte.
+/// its end, byte for byte. For an AIFF or WAV file, the `v2` block is the
+/// whole payload of its ID3 chunk, and there is no trailer.
 fn read_raw_id3(path: &Path) -> Result<RawBlocks> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
-    let mut header = [0_u8; 10];
-    let v2 = if len >= 10 && file.read_exact(&mut header).is_ok() && &header[..3] == b"ID3" {
+    let mut header = [0_u8; 12];
+    let mut got = 0;
+    while got < header.len() {
+        let n = file.read(&mut header[got..])?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    if let Some(container) = Container::of(&header[..got]) {
+        let Some((at, size)) = find_id3_chunk(&mut file, container, len)? else { return Ok((None, None)) };
+        let mut block = vec![0_u8; usize::try_from(size).unwrap_or(usize::MAX)];
+        file.seek(SeekFrom::Start(at + 8))?;
+        file.read_exact(&mut block)?;
+        return Ok((Some(block), None));
+    }
+    let v2 = if got >= 10 && &header[..3] == b"ID3" {
         // Syncsafe size of everything after the header, plus a 10-byte
         // footer, which only ID3v2.4 has (flag bit 4).
         let size = header[6..10].iter().fold(0_u64, |acc, &b| (acc << 7) | u64::from(b & 0x7f));

@@ -354,3 +354,241 @@ fn wav_and_aiff_files_are_written_and_undone() {
         }
     }
 }
+
+// ------------------------------------------------- synthetic files (run in CI)
+
+/// An `ID3v2.<version>` tag holding `frames` (id, payload) and some padding.
+fn id3_tag(version: u8, frames: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let syncsafe = |n: usize| [21, 14, 7, 0].map(|shift| u8::try_from((n >> shift) & 0x7f).unwrap());
+    let mut body = Vec::new();
+    for (id, payload) in frames {
+        body.extend_from_slice(id.as_bytes());
+        if version == 4 {
+            body.extend_from_slice(&syncsafe(payload.len()));
+        } else {
+            body.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        }
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(payload);
+    }
+    body.extend_from_slice(&[0; 256]);
+    let mut tag = vec![b'I', b'D', b'3', version, 0, 0];
+    tag.extend_from_slice(&syncsafe(body.len()));
+    tag.extend_from_slice(&body);
+    tag
+}
+
+fn latin1(text: &str) -> Vec<u8> {
+    let mut payload = vec![0];
+    payload.extend_from_slice(text.as_bytes());
+    payload
+}
+
+fn comm_frame(lang: &str, description: &str, text: &str) -> (&'static str, Vec<u8>) {
+    let mut payload = vec![0];
+    payload.extend_from_slice(lang.as_bytes());
+    payload.extend_from_slice(description.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(text.as_bytes());
+    ("COMM", payload)
+}
+
+/// The frames of a Beatport-style download: a described iTunNORM and
+/// `ID3v1 Comment` beside the real comment, a catalog number variant, a
+/// private frame and a key and BPM identification must never touch.
+fn store_frames(with_comment: bool) -> Vec<(&'static str, Vec<u8>)> {
+    let mut frames = vec![
+        ("TIT2", latin1("Last Ones Standing")),
+        ("TPE1", latin1("Example")),
+        ("TPUB", latin1("Ministry Of Sound (UK)")),
+        ("TKEY", latin1("8A")),
+        ("TBPM", latin1("126")),
+        ("TXXX", latin1("Catalog #\0ANCD2K10E")),
+        ("PRIV", b"AverageLevel\0\x01\x02\x03\x04".to_vec()),
+        comm_frame("eng", "iTunNORM", " 000012A1 00001189"),
+        comm_frame("eng", "ID3v1 Comment", "Purchased at Beatport"),
+    ];
+    if with_comment {
+        frames.push(comm_frame("Pur", "", "Purchased at Beatport.com"));
+    }
+    frames
+}
+
+/// Silent MPEG-1 layer III frames (128 kb/s, 44.1 kHz).
+fn mpeg_frames() -> Vec<u8> {
+    let mut audio = Vec::new();
+    for _ in 0..40 {
+        audio.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        audio.extend_from_slice(&[0; 413]);
+    }
+    audio
+}
+
+/// `(id, raw frame)` of a tag, for the byte-for-byte comparisons.
+fn tag_frames(tag: &[u8]) -> Vec<(String, Vec<u8>)> {
+    frames(tag).1
+}
+
+/// Checks a write of the synthetic store frames: the version kept, every
+/// frame not changed byte for byte, the catalog variant updated in place,
+/// the comment appended to the description-less COMM only.
+fn check_store_write(old_tag: &[u8], new_tag: &[u8], version: u8) {
+    assert_eq!(new_tag[3], version);
+    let old = tag_frames(old_tag);
+    let new = tag_frames(new_tag);
+    assert_eq!(new.len(), old.len(), "nothing added or lost");
+    for (before, after) in old.iter().zip(&new) {
+        assert_eq!(before.0, after.0, "same frames, same order");
+        let text = String::from_utf8_lossy(&before.1);
+        if text.contains("Catalog #") {
+            assert!(String::from_utf8_lossy(&after.1).ends_with("Catalog #\0ANCD2K10X"));
+        } else if before.0 == "COMM" && !text.contains("iTun") && !text.contains("ID3v1") {
+            assert!(String::from_utf8_lossy(&after.1).ends_with("Purchased at Beatport.com; Tech House"));
+            assert_eq!(&after.1[11..14], b"Pur", "the language is kept");
+        } else {
+            assert_eq!(before.1, after.1, "{} untouched", before.0);
+        }
+    }
+}
+
+fn store_changes() -> [FieldChange; 2] {
+    [
+        change(Field::CatalogNumber, "ANCD2K10E", "ANCD2K10X"),
+        change(Field::SubGenre, "Purchased at Beatport.com", "Purchased at Beatport.com; Tech House"),
+    ]
+}
+
+#[test]
+fn synthetic_mp3s_keep_their_version_frames_and_audio_and_undo_exactly() {
+    let dir = tempfile::tempdir().unwrap();
+    for version in [3, 4] {
+        let path = dir.path().join(format!("v2{version}.mp3"));
+        let tag = id3_tag(version, &store_frames(true));
+        let mut file = tag.clone();
+        file.extend_from_slice(&mpeg_frames());
+        let mut v1 = b"TAG".to_vec();
+        v1.resize(128, b' ');
+        file.extend_from_slice(&v1);
+        std::fs::write(&path, &file).unwrap();
+
+        let before = tags::read(&path).unwrap().snapshot;
+        assert_eq!(rbl_identify::pipeline::current(&before, Field::SubGenre), "Purchased at Beatport.com");
+        let changes = store_changes();
+        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(written.len(), file.len(), "fits in the padding");
+        check_store_write(&tag, &written[..tag.len()], version);
+        assert_eq!(&written[tag.len()..], &file[tag.len()..], "audio and ID3v1 untouched");
+
+        write::restore(&path, &before, &after, &[Field::CatalogNumber, Field::SubGenre]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), file, "v2.{version} undo is byte for byte");
+    }
+}
+
+#[test]
+fn an_mp3_without_a_tag_gets_one_and_loses_it_on_undo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bare.mp3");
+    let file = mpeg_frames();
+    std::fs::write(&path, &file).unwrap();
+    let before = tags::read(&path).unwrap().snapshot;
+    let changes = [change(Field::Title, "", "Bare"), change(Field::SubGenre, "", "Acid")];
+    let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(written[3], 3, "a new tag is ID3v2.3");
+    assert!(written.ends_with(&file));
+    assert_eq!(rbl_identify::pipeline::current(&after, Field::SubGenre), "Acid");
+    write::restore(&path, &before, &after, &[Field::Title, Field::SubGenre]).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), file);
+}
+
+/// A one-second silent AIFF or WAV, its ID3 chunk holding `tag` when given.
+fn container(aiff: bool, tag: Option<&[u8]>) -> Vec<u8> {
+    let rate = 44_100_u32;
+    let data_len = rate * 2;
+    let mut out = Vec::new();
+    let be = |n: u32| n.to_be_bytes();
+    let le = |n: u32| n.to_le_bytes();
+    if aiff {
+        out.extend_from_slice(b"FORM\0\0\0\0AIFFCOMM");
+        out.extend_from_slice(&be(18));
+        out.extend_from_slice(&1_u16.to_be_bytes());
+        out.extend_from_slice(&be(rate));
+        out.extend_from_slice(&16_u16.to_be_bytes());
+        out.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(b"SSND");
+        out.extend_from_slice(&be(8 + data_len));
+        out.resize(out.len() + 8 + data_len as usize, 0);
+    } else {
+        out.extend_from_slice(b"RIFF\0\0\0\0WAVEfmt ");
+        out.extend_from_slice(&le(16));
+        out.extend_from_slice(&1_u16.to_le_bytes());
+        out.extend_from_slice(&1_u16.to_le_bytes());
+        out.extend_from_slice(&le(rate));
+        out.extend_from_slice(&le(rate * 2));
+        out.extend_from_slice(&2_u16.to_le_bytes());
+        out.extend_from_slice(&16_u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&le(data_len));
+        out.resize(out.len() + data_len as usize, 0);
+    }
+    if let Some(tag) = tag {
+        out.extend_from_slice(if aiff { b"ID3 " } else { b"id3 " });
+        let size = u32::try_from(tag.len()).unwrap();
+        out.extend_from_slice(&if aiff { be(size) } else { le(size) });
+        out.extend_from_slice(tag);
+        if tag.len() % 2 == 1 {
+            out.push(0);
+        }
+    }
+    let total = u32::try_from(out.len() - 8).unwrap();
+    out[4..8].copy_from_slice(&if aiff { be(total) } else { le(total) });
+    out
+}
+
+#[test]
+fn aiff_and_wav_id3_chunks_are_edited_frame_by_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    for aiff in [true, false] {
+        let path = dir.path().join(if aiff { "t.aiff" } else { "t.wav" });
+        // As the user's AIFFs: no description-less COMM, only described ones.
+        let tag = id3_tag(3, &store_frames(false));
+        let file = container(aiff, Some(&tag));
+        std::fs::write(&path, &file).unwrap();
+        let before = tags::read(&path).unwrap().snapshot;
+        assert_eq!(
+            rbl_identify::pipeline::current(&before, Field::SubGenre),
+            "",
+            "neither iTunNORM nor the ID3v1 Comment is the comment"
+        );
+        let changes = [change(Field::CatalogNumber, "ANCD2K10E", "ANCD2K10X"), change(Field::SubGenre, "", "Tech House")];
+        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+        assert_eq!(rbl_identify::pipeline::current(&after, Field::SubGenre), "Tech House");
+        let written = std::fs::read(&path).unwrap();
+        // The audio chunk is where it was, byte for byte, and the sizes add up.
+        let audio_end = file.len() - 8 - tag.len() - tag.len() % 2;
+        assert_eq!(&written[8..audio_end], &file[8..audio_end]);
+        let size = if aiff {
+            u32::from_be_bytes(written[4..8].try_into().unwrap())
+        } else {
+            u32::from_le_bytes(written[4..8].try_into().unwrap())
+        };
+        assert_eq!(size as usize, written.len() - 8);
+        // In the chunk: v2.3 kept, every described COMM and other frame kept,
+        // one new description-less COMM.
+        let new_tag = &written[audio_end + 8..];
+        assert_eq!(new_tag[3], 3);
+        let old = tag_frames(&tag);
+        let new = tag_frames(new_tag);
+        assert_eq!(new.len(), old.len() + 1);
+        for (before, after) in old.iter().zip(&new) {
+            if !String::from_utf8_lossy(&before.1).contains("Catalog #") {
+                assert_eq!(before, after);
+            }
+        }
+        assert!(String::from_utf8_lossy(&new.last().unwrap().1).ends_with("\0Tech House"));
+
+        write::restore(&path, &before, &after, &[Field::CatalogNumber, Field::SubGenre]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), file, "undo is byte for byte");
+    }
+}

@@ -40,9 +40,11 @@
 //!
 //! # Other formats
 //!
-//! FLAC, MP4, AIFF, WAV and the rest go through lofty's tag writer, which
+//! FLAC, MP4 and the rest go through lofty's tag writer, which
 //! keeps what it can read of the other fields. Undo there puts the changed
-//! fields' recorded values back, rather than bytes.
+//! fields' recorded values back, rather than bytes, and checks they read
+//! back. Their comment items carry no description, so the comment there is
+//! simply the comment item.
 //!
 //! # On disk
 //!
@@ -51,7 +53,16 @@
 //! over the original, so a crash leaves either the old file or the new one.
 //! On Windows the original creation time is kept; the modification time is
 //! the write's, as for any tag editor. A read-only file, and a file another
-//! program holds open, are refused with a clear message.
+//! program holds open, are refused with a clear message. The rename replaces
+//! the file object, so alternate data streams (`Zone.Identifier`), hard
+//! links and explicit ACLs of the original are not carried over; a crash
+//! between staging and renaming can leave a `.rbxport-tags-*.tmp` beside the
+//! file, which is safe to delete.
+//!
+//! AIFF and WAV keep their ID3 tag in a chunk: it is edited with the same
+//! frame-level editor, the chunk's and the container's sizes set to match,
+//! every other chunk left in place byte for byte, and undo puts the chunk's
+//! recorded bytes back exactly.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -168,6 +179,12 @@ pub fn write(path: &Path, before: &TagSnapshot, edits: &[Edit], artwork: Option<
             replace(path, &rewritten)?;
             true
         }
+        Id3Kind::Chunk(container) => {
+            let tag = chunk::payload(&original, container)?;
+            let new_tag = id3::rewrite_tag(tag, edits, artwork)?;
+            replace(path, &chunk::splice(&original, container, Some(&new_tag))?)?;
+            true
+        }
         Id3Kind::Other => {
             lofty_write(path, edits, artwork)?;
             false
@@ -221,27 +238,41 @@ pub fn restore(path: &Path, before: &TagSnapshot, after: &TagSnapshot, fields: &
              Edit them by hand, or identify the file again.",
         ));
     }
-    // An ID3 tag at the start was written frame by frame: put the recorded
-    // block back (none, for a file that had none), the rest untouched.
+    // An ID3 tag (at the start, or in an AIFF/WAV chunk) was written frame
+    // by frame: put the recorded block back exactly (none, for a file that
+    // had none), everything else untouched.
     let raw_written = after.raw_id3.as_ref().and_then(|r| r.v2.as_ref()).is_some();
     if raw_written {
         let file = std::fs::read(path).map_err(|e| io_error(path, &e))?;
-        let audio_at = id3::tag_len(&file).unwrap_or(0);
-        let mut restored = before
+        let block = before
             .raw_id3
             .as_ref()
             .and_then(|r| r.v2.as_deref())
             .map(|b| base64::engine::general_purpose::STANDARD_NO_PAD.decode(b))
             .transpose()
-            .map_err(|_| refuse("The recorded tags cannot be decoded."))?
-            .unwrap_or_default();
-        restored.extend_from_slice(file.get(audio_at..).unwrap_or_default());
+            .map_err(|_| refuse("The recorded tags cannot be decoded."))?;
+        let restored = if let Some(container) = tags::Container::of(&file) {
+            chunk::splice(&file, container, block.as_deref())?
+        } else {
+            let audio_at = id3::tag_len(&file).unwrap_or(0);
+            let mut restored = block.unwrap_or_default();
+            restored.extend_from_slice(file.get(audio_at..).unwrap_or_default());
+            restored
+        };
         replace(path, &restored)?;
     } else {
         lofty_restore(path, before, fields)?;
     }
     let back = tags::read(path)?.snapshot;
-    if raw_written && back != *before {
+    let landed = if raw_written {
+        back == *before
+    } else {
+        fields.iter().all(|&field| match field {
+            Field::Artwork => back.has_artwork == before.has_artwork,
+            field => current(&back, field) == current(before, field),
+        })
+    };
+    if !landed {
         return Err(refuse("The file's tags did not read back as they were before the write."));
     }
     Ok(())
@@ -252,11 +283,17 @@ enum Id3Kind {
     Tagged,
     /// An MPEG file with no `ID3v2` tag: one is added.
     Untagged,
+    /// An AIFF or WAV file: its ID3 chunk is edited frame by frame (one is
+    /// added to a file without).
+    Chunk(tags::Container),
     /// Anything else: lofty.
     Other,
 }
 
 fn id3_kind(path: &Path, bytes: &[u8]) -> Result<Id3Kind> {
+    if let Some(container) = tags::Container::of(bytes) {
+        return Ok(Id3Kind::Chunk(container));
+    }
     if bytes.starts_with(b"ID3") {
         return match (bytes.get(3), bytes.get(5)) {
             (Some(3 | 4), Some(flags)) if flags & 0x80 == 0 => Ok(Id3Kind::Tagged),
@@ -421,6 +458,71 @@ fn publish(path: &Path, staged: tempfile::NamedTempFile) -> Result<()> {
     replace(path, &bytes)
 }
 
+// ------------------------------------------------------------- AIFF / WAV
+
+mod chunk {
+    use super::refuse;
+    use crate::error::Result;
+    use crate::tags::{find_id3_chunk, Container};
+
+    /// The ID3 chunk's payload; `None` when the file has none.
+    pub(super) fn payload(file: &[u8], container: Container) -> Result<Option<&[u8]>> {
+        let len = file.len() as u64;
+        let found = find_id3_chunk(&mut std::io::Cursor::new(file), container, len)
+            .map_err(|e| refuse(format!("The file's chunks could not be read: {e}")))?;
+        Ok(found.map(|(at, size)| {
+            let start = usize::try_from(at + 8).unwrap_or(usize::MAX);
+            let end = start.saturating_add(usize::try_from(size).unwrap_or(usize::MAX)).min(file.len());
+            &file[start.min(end)..end]
+        }))
+    }
+
+    fn size_bytes(container: Container, size: u32) -> [u8; 4] {
+        match container {
+            Container::Aiff => size.to_be_bytes(),
+            Container::Wav => size.to_le_bytes(),
+        }
+    }
+
+    /// The file with its ID3 chunk's payload replaced by `tag` (the chunk
+    /// added at the end when there was none, removed when `tag` is `None`),
+    /// the chunk's size and pad byte and the container's size set to match.
+    /// Every other chunk is kept byte for byte, in place.
+    pub(super) fn splice(file: &[u8], container: Container, tag: Option<&[u8]>) -> Result<Vec<u8>> {
+        let len = file.len() as u64;
+        let found = find_id3_chunk(&mut std::io::Cursor::new(file), container, len)
+            .map_err(|e| refuse(format!("The file's chunks could not be read: {e}")))?;
+        let usize_of = |n: u64| usize::try_from(n).map_err(|_| refuse("The file is too large."));
+        let (head_end, tail_start, id) = match found {
+            Some((at, size)) => {
+                let at = usize_of(at)?;
+                let mut id = [0_u8; 4];
+                id.copy_from_slice(&file[at..at + 4]);
+                (at, usize_of(at as u64 + 8 + size + (size & 1))?.min(file.len()), id)
+            }
+            None => (file.len(), file.len(), *container.chunk_id()),
+        };
+        let mut out = Vec::with_capacity(file.len() + tag.map_or(0, <[u8]>::len) + 9);
+        out.extend_from_slice(&file[..head_end]);
+        if let Some(tag) = tag {
+            if found.is_none() && out.len() % 2 == 1 {
+                out.push(0); // chunks start on an even offset
+            }
+            let size = u32::try_from(tag.len()).map_err(|_| refuse("The tag is too large."))?;
+            out.extend_from_slice(&id);
+            out.extend_from_slice(&size_bytes(container, size));
+            out.extend_from_slice(tag);
+            if tag.len() % 2 == 1 {
+                out.push(0);
+            }
+        }
+        out.extend_from_slice(&file[tail_start..]);
+        let total = u32::try_from(out.len() - 8).map_err(|_| refuse("The file is too large."))?;
+        out[4..8].copy_from_slice(&size_bytes(container, total));
+        Ok(out)
+    }
+}
+
 // ------------------------------------------------------------- ID3 frames
 
 mod id3 {
@@ -555,10 +657,25 @@ mod id3 {
     /// The file with `edits` made to its `ID3v2` tag (one is added to a file
     /// without), everything else byte for byte.
     pub(super) fn rewrite(file: &[u8], edits: &[Edit], artwork: Option<Image<'_>>) -> Result<Vec<u8>> {
-        let (version, flags, old_size, mut frames, audio_at) = match tag_len(file) {
-            Some(len) => {
-                let (version, flags, size, frames) = parse(file)?;
-                (version, flags, Some(size), frames, len)
+        let audio_at = tag_len(file).unwrap_or(0);
+        let mut out = rewrite_tag((audio_at > 0).then(|| &file[..audio_at]), edits, artwork)?;
+        out.extend_from_slice(&file[audio_at..]);
+        Ok(out)
+    }
+
+    /// A whole `ID3v2` tag (header, frames, padding, footer) with `edits`
+    /// made to `tag`, or a new `ID3v2.3` tag when there is none. Bytes after
+    /// the tag's own end (an AIFF chunk's slack) are kept as padding.
+    pub(super) fn rewrite_tag(tag: Option<&[u8]>, edits: &[Edit], artwork: Option<Image<'_>>) -> Result<Vec<u8>> {
+        let (version, flags, old_size, mut frames, revision) = match tag {
+            Some(tag) => {
+                if !tag.starts_with(b"ID3") || tag.len() < 10 || !matches!(tag[3], 3 | 4) || tag[5] & 0x80 != 0 {
+                    return Err(refuse("This file's ID3 tag (an old version, or unsynchronised) cannot be edited safely."));
+                }
+                let (version, flags, size, frames) = parse(tag)?;
+                let footer = if version == 4 && flags & 0x10 != 0 { 10 } else { 0 };
+                // Room the tag had: its own size, or the whole chunk.
+                (version, flags, Some(size.max(tag.len().saturating_sub(10 + footer))), frames, tag[4])
             }
             None => (3, 0, None, Vec::new(), 0),
         };
@@ -580,10 +697,10 @@ mod id3 {
         let size = u32::try_from(size).map_err(|_| refuse("The tag is too large."))?;
         // The extended header is dropped (its CRC would no longer match).
         let flags = flags & !0x40;
-        let mut out = Vec::with_capacity(10 + body.len() + file.len() - audio_at);
+        let mut out = Vec::with_capacity(10 + body.len() + 10);
         out.extend_from_slice(b"ID3");
         out.push(version);
-        out.push(file.get(4).copied().filter(|_| audio_at > 0).unwrap_or(0));
+        out.push(revision);
         out.push(flags);
         out.extend_from_slice(&syncsafe(size)?);
         out.extend_from_slice(&body);
@@ -592,7 +709,6 @@ mod id3 {
             footer[3..].copy_from_slice(&out[3..10]);
             out.extend_from_slice(&footer);
         }
-        out.extend_from_slice(&file[audio_at..]);
         Ok(out)
     }
 
@@ -886,12 +1002,18 @@ where
     let after = match write(path, &info.snapshot, &edits, image) {
         Ok(after) => after,
         Err(e) => {
-            // The write puts the file back itself, or never touched it.
-            let reason = format!("the write failed: {e}");
-            if store.abandon_application(application, &reason).is_ok() {
-                back_to_pending(store);
+            // Abandoned only when the file is exactly as it was: a write that
+            // landed (or half did) stays open for reconciliation, never
+            // recorded as "not written".
+            if tags::read(path).is_ok_and(|now| now.snapshot == info.snapshot) {
+                if store.abandon_application(application, &format!("the write failed: {e}")).is_ok() {
+                    back_to_pending(store);
+                }
+                return Err(e);
             }
-            return Err(e);
+            return Err(refuse(format!(
+                "{e} The file may hold part of the changes; the write is left open to be checked."
+            )));
         }
     };
     let library_after = match library(&written) {
