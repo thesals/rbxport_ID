@@ -562,7 +562,7 @@ fn identify_and_save(
 /// Saves a finished track (its cover, row and result) in one call, then
 /// drops the cover's bytes: the store holds them now.
 fn save(store: &Store, key: &TrackKey, result: &mut TrackResult) -> rbl_identify::Result<ResultId> {
-    let (_, saved) = store.save_track_result(key, result, false)?;
+    let (_, saved) = store.save_track_result(key, result, None, false)?;
     result.artwork = None;
     Ok(saved)
 }
