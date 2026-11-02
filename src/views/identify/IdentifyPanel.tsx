@@ -76,6 +76,16 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
     if (list.current) list.current.scrollTop = 0;
   }, [filter]);
 
+  // Escape inside the panel is handled on it (below); this catches it when
+  // focus has left with a button that went away, Undo after an undo.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   // Focus starts in the list, so the arrows work at once; it goes back to
   // where it was when the panel closes.
   useEffect(() => {
