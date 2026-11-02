@@ -547,9 +547,13 @@ fn identify_and_save(
     let mut result = identifier.identify(&path).map_err(|e| e.to_string())?;
     let score = result.best().map(|b| b.score);
     let decision = result.decision;
-    let result_id = state.with_store(|store| save(store, &key, &mut result).map_err(store_error)).map_err(|e| {
-        e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message))
-    })?;
+    // A refusal (a track whose result was applied, or has a write open) is
+    // this track's failure, not an internal error to report.
+    let result_id = state
+        .with_store(|store| {
+            save(store, &key, &mut result).map_err(|e| AppError::new(ErrorKind::Malformed, e.to_string()))
+        })
+        .map_err(|e| e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message)))?;
     Ok((path_text, result_id, decision, score))
 }
 
@@ -1348,6 +1352,31 @@ mod tests {
         assert!(state.detail(review.result_id).unwrap().write_in_progress);
         assert_eq!(state.set_review(review.result_id, ReviewAction::Pending).unwrap_err().kind, ErrorKind::ReadOnly);
         assert_eq!(state.edit(review.result_id, &edit("catalogNumber", "Z")).unwrap_err().kind, ErrorKind::ReadOnly);
+    }
+
+    #[test]
+    fn a_track_already_written_fails_alone_and_keeps_its_result() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = IdentifyState::with_root(root.path());
+        let tracks = [track(files.path(), "review.mp3", true), track(files.path(), "unknown.mp3", true)];
+        run(&state, &tracks, &Fake::new(), &AtomicBool::new(false));
+        let review = state.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items.remove(0);
+        state.set_review(review.result_id, ReviewAction::Accept).unwrap();
+        state
+            .with_store(|s| {
+                let application =
+                    s.begin_application(review.result_id, &[], None, &TagSnapshot::default(), None).map_err(store_error)?;
+                let after = TrackKey { path: review.path.clone(), file_size: 2, modified_unix: 1 };
+                s.complete_application(application, &after).map_err(store_error)
+            })
+            .unwrap();
+
+        let events = run(&state, &tracks, &Fake::new(), &AtomicBool::new(false));
+        let Some(JobEvent::Progress(last)) = events.last() else { panic!("no final progress") };
+        assert_eq!((last.state, last.failed, last.unidentified), (JobState::Done, 1, 1));
+        let applied = state.queue(QueueFilter::Applied, 0, 10).unwrap();
+        assert_eq!(applied.items.iter().map(|i| i.result_id).collect::<Vec<_>>(), [review.result_id]);
     }
 
     #[test]
