@@ -7,6 +7,10 @@
 //! measured on every candidate at or above the auto-apply threshold,
 //! whether or not auto-apply was enabled or would have filled only empty
 //! fields: a wrong match that strong must never exist.
+//!
+//! Discogs-fallback candidates ([`CandidateSource::DiscogsText`]) are judged
+//! like any other, and also counted on their own, with how often the
+//! release's label agrees with the ground truth's.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -16,6 +20,7 @@ use serde::Serialize;
 
 use crate::decide;
 use crate::error::{IdentifyError, Result};
+use crate::fallback;
 use crate::mixname::{self, MixAgreement};
 use crate::model::{Candidate, CandidateSource, Decision};
 use crate::normalize;
@@ -33,6 +38,8 @@ pub struct GroundTruth {
     pub artist: String,
     /// The full title, mix included.
     pub title: String,
+    /// The optional `label` column; empty when absent.
+    pub label: String,
     /// `mainstream` and `expect_unidentified`: yes/no, `None` when the cell
     /// (or the column) is empty.
     pub mainstream: Option<bool>,
@@ -67,7 +74,7 @@ impl Verdict {
 }
 
 /// Reads `ground_truth.csv`, keyed by `file`: the required `file`, `artist`
-/// and `title` columns, and the optional `mainstream` and
+/// and `title` columns, and the optional `label`, `mainstream` and
 /// `expect_unidentified` ones.
 pub fn load_ground_truth(path: &Path) -> Result<HashMap<String, GroundTruth>> {
     let text = std::fs::read_to_string(path)?;
@@ -78,6 +85,7 @@ pub fn load_ground_truth(path: &Path) -> Result<HashMap<String, GroundTruth>> {
     let column = |name: &str| optional(name).ok_or_else(|| malformed(&format!("no `{name}` column")));
     let (file, artist, title) = (column("file")?, column("artist")?, column("title")?);
     let (mainstream, expect_unidentified) = (optional("mainstream"), optional("expect_unidentified"));
+    let label = optional("label");
     let cell = |row: &[String], i: usize| row.get(i).cloned().unwrap_or_default();
     let flag = |row: &[String], i: Option<usize>| i.and_then(|i| yes_no(&cell(row, i)));
     Ok(rows
@@ -86,6 +94,7 @@ pub fn load_ground_truth(path: &Path) -> Result<HashMap<String, GroundTruth>> {
             let truth = GroundTruth {
                 artist: cell(&row, artist),
                 title: cell(&row, title),
+                label: label.map(|i| cell(&row, i)).unwrap_or_default(),
                 mainstream: flag(&row, mainstream),
                 expect_unidentified: flag(&row, expect_unidentified),
             };
@@ -153,6 +162,15 @@ pub struct Summary {
     /// other than unidentified anyway (acceptance: none).
     pub expect_unidentified: usize,
     pub expect_unidentified_proposed: usize,
+    /// Tracks sent to review by the Discogs fallback, and of those the
+    /// correct and wrong ones (counted in `correct` and `wrong` too).
+    pub discogs_fallback: usize,
+    pub discogs_fallback_correct: usize,
+    pub discogs_fallback_wrong: usize,
+    /// Fallback tracks whose ground truth names a label, and those whose
+    /// Discogs release has the same label.
+    pub discogs_fallback_with_label: usize,
+    pub discogs_fallback_label_agrees: usize,
 }
 
 impl Summary {
@@ -199,6 +217,20 @@ impl Summary {
         }
         if result.best().is_some_and(|b| b.score >= decide::REVIEW_THRESHOLD && b.candidate.source == CandidateSource::Fingerprint) {
             self.by_fingerprint += 1;
+        }
+        if is_discogs_fallback(result) {
+            self.discogs_fallback += 1;
+            match verdict {
+                Verdict::Correct => self.discogs_fallback_correct += 1,
+                Verdict::Wrong => self.discogs_fallback_wrong += 1,
+                Verdict::Unidentified | Verdict::NoGroundTruth => {}
+            }
+            if let Some(label) = truth.map(|t| t.label.trim()).filter(|l| !l.is_empty()) {
+                self.discogs_fallback_with_label += 1;
+                if result.enrichment.as_ref().is_some_and(|e| fallback::same_label(&e.label, label)) {
+                    self.discogs_fallback_label_agrees += 1;
+                }
+            }
         }
         if result.fingerprint.matches > 0 {
             self.acoustid_matched += 1;
@@ -251,26 +283,45 @@ impl Summary {
             "AcoustID: matched {} tracks, {} with a MusicBrainz recording; winner from the fingerprint on {}",
             self.acoustid_matched, self.acoustid_with_recordings, self.by_fingerprint
         );
+        let _ = writeln!(
+            out,
+            "Discogs fallback (review only): {} tracks, correct {} / wrong {} vs tags; label agrees with ground truth on {} of {} with a label",
+            self.discogs_fallback,
+            self.discogs_fallback_correct,
+            self.discogs_fallback_wrong,
+            self.discogs_fallback_label_agrees,
+            self.discogs_fallback_with_label
+        );
         out
     }
 }
 
+/// Whether the track went to review on a Discogs-fallback candidate.
+fn is_discogs_fallback(result: &TrackResult) -> bool {
+    result.decision != Decision::Unidentified
+        && result.best().is_some_and(|b| b.score >= decide::REVIEW_THRESHOLD && b.candidate.source == CandidateSource::DiscogsText)
+}
+
 /// The per-file CSV: the spec's columns first (file, top candidate, score,
-/// decision, ground-truth match), then the detail behind them. Files that
-/// could not be read get a `Failed` row with the error, so every file is
-/// listed.
+/// decision, ground-truth match), then the detail behind them: the top
+/// candidate's source (`Fingerprint`, `TextSearch`, `DiscogsText`), the
+/// fields the proposal would change, and what Discogs added (release ID,
+/// label, catalog number, year, styles as the sub-genre). Files that could
+/// not be read get a `Failed` row with the error, so every file is listed.
 #[must_use]
 pub fn csv(rows: &[(String, &TrackResult, Verdict)], failures: &[(String, String)]) -> String {
     let header = [
         "file", "top_candidate", "score", "decision", "ground_truth_match", "existing_artist", "existing_title", "top_source",
         "top_mbid", "acoustid", "duration", "text", "mix", "rejected", "acoustid_matches", "acoustid_best", "acoustid_recordings",
-        "runner_up", "runner_up_score", "warnings",
+        "runner_up", "runner_up_score", "proposed_fields", "discogs_release_id", "discogs_label", "discogs_catno",
+        "discogs_year", "sub_genre", "warnings",
     ];
     let mut out = String::from("\u{feff}");
     push_row(&mut out, header.iter().map(|h| (*h).to_owned()));
     for (file, result, verdict) in rows {
         let best = result.best();
         let runner_up = result.candidates.get(1);
+        let enrichment = result.enrichment.as_ref();
         let fmt = |v: f64| format!("{v:.3}");
         push_row(
             &mut out,
@@ -294,6 +345,16 @@ pub fn csv(rows: &[(String, &TrackResult, Verdict)], failures: &[(String, String
                 result.fingerprint.recordings.to_string(),
                 runner_up.map(|r| format!("{} - {}", r.candidate.artist_credit, r.candidate.title)).unwrap_or_default(),
                 runner_up.map(|r| fmt(r.score)).unwrap_or_default(),
+                result
+                    .proposal
+                    .as_ref()
+                    .map(|p| p.changes.iter().map(|c| c.field.as_str()).collect::<Vec<_>>().join("; "))
+                    .unwrap_or_default(),
+                enrichment.and_then(|e| e.discogs_release_id).map(|id| id.to_string()).unwrap_or_default(),
+                enrichment.map(|e| e.label.clone()).unwrap_or_default(),
+                enrichment.map(|e| e.catalog_number.clone()).unwrap_or_default(),
+                enrichment.and_then(|e| e.year).map(|y| y.to_string()).unwrap_or_default(),
+                enrichment.map(|e| e.styles.join("; ")).unwrap_or_default(),
                 result.warnings.join(" | "),
             ],
         );
@@ -454,6 +515,97 @@ mod tests {
         summary.add_failure(None);
         assert_eq!((summary.tracks, summary.failed, summary.mainstream, summary.mainstream_correct), (2, 2, 1, 0));
         assert!(summary.render().contains("mainstream correct: 0 of 1"), "{}", summary.render());
+    }
+
+    fn fallback_result(discogs_label: &str) -> TrackResult {
+        use crate::model::{Enrichment, ExistingTags, Field, FieldChange, Proposal, ScoreBreakdown, Scored, TagSnapshot};
+        let mut candidate = cand("Example Artist", "Fallback Track (Extended Mix)", "", &[]);
+        candidate.recording_mbid = String::new();
+        candidate.acoustid_score = None;
+        candidate.source = CandidateSource::DiscogsText;
+        let fill = |field: Field, proposed: &str| FieldChange { field, current: String::new(), proposed: proposed.into() };
+        TrackResult {
+            path: "x.mp3".into(),
+            existing: ExistingTags::default(),
+            duration_secs: 390.0,
+            fingerprint: crate::pipeline::FingerprintOutcome::default(),
+            candidates: vec![Scored { candidate, score: 0.85, breakdown: ScoreBreakdown::default() }],
+            decision: Decision::Review,
+            snapshot: TagSnapshot::default(),
+            proposal: Some(Proposal::new(
+                vec![fill(Field::CatalogNumber, "=FB001"), fill(Field::SubGenre, "Tech House; Minimal")],
+                None,
+                false,
+            )),
+            enrichment: Some(Enrichment {
+                discogs_release_id: Some(9_000_102),
+                label: discogs_label.into(),
+                catalog_number: "=FB001".into(),
+                year: Some(2019),
+                styles: vec!["Tech House".into(), "Minimal".into()],
+                ..Enrichment::default()
+            }),
+            artwork: None,
+            warnings: vec!["MusicBrainz search: down".into()],
+        }
+    }
+
+    #[test]
+    fn the_csv_carries_the_discogs_columns_and_the_proposed_fields() {
+        let result = fallback_result("Fallback Records");
+        let out = csv(&[("x.mp3".into(), &result, Verdict::Correct)], &[]);
+        let rows = parse_csv(out.trim_start_matches('\u{feff}'));
+        let column = |name: &str| rows[0].iter().position(|h| h == name).unwrap();
+        let row = &rows[1];
+        assert_eq!(row.len(), rows[0].len());
+        assert_eq!(row[column("top_source")], "DiscogsText");
+        assert_eq!(row[column("proposed_fields")], "CatalogNumber; SubGenre");
+        assert_eq!(row[column("discogs_release_id")], "9000102");
+        assert_eq!(row[column("discogs_label")], "Fallback Records");
+        assert_eq!(row[column("discogs_catno")], "'=FB001", "formula cells are still neutralised");
+        assert_eq!(row[column("discogs_year")], "2019");
+        assert_eq!(row[column("sub_genre")], "Tech House; Minimal");
+        assert_eq!(rows[0].last().map(String::as_str), Some("warnings"), "warnings stay last for failure rows");
+        assert_eq!(row.last().map(String::as_str), Some("MusicBrainz search: down"));
+    }
+
+    #[test]
+    fn discogs_fallback_tracks_are_counted_on_their_own() {
+        let truth = GroundTruth {
+            artist: "Example Artist".into(),
+            title: "Fallback Track (Extended Mix)".into(),
+            label: "Fallback Records".into(),
+            ..GroundTruth::default()
+        };
+        let mut summary = Summary::default();
+        let same = fallback_result("Fallback Records");
+        summary.add(&same, judge(&same, Some(&truth)), Some(&truth));
+        let other = fallback_result("Other Records");
+        summary.add(&other, judge(&other, Some(&truth)), Some(&truth));
+        let no_label = GroundTruth { label: String::new(), ..truth.clone() };
+        summary.add(&same, judge(&same, Some(&no_label)), Some(&no_label));
+        assert_eq!(
+            (summary.discogs_fallback, summary.discogs_fallback_correct, summary.discogs_fallback_wrong),
+            (3, 3, 0)
+        );
+        assert_eq!((summary.discogs_fallback_with_label, summary.discogs_fallback_label_agrees), (2, 1));
+        assert_eq!((summary.correct, summary.by_fingerprint), (3, 0));
+        assert!(summary.render().contains("Discogs fallback (review only): 3 tracks, correct 3 / wrong 0"), "{}", summary.render());
+        // An unidentified track with a weak Discogs candidate is not counted.
+        let mut weak = fallback_result("Fallback Records");
+        weak.decision = Decision::Unidentified;
+        weak.candidates[0].score = 0.4;
+        let mut summary = Summary::default();
+        summary.add(&weak, judge(&weak, Some(&truth)), Some(&truth));
+        assert_eq!(summary.discogs_fallback, 0);
+    }
+
+    #[test]
+    fn the_label_column_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gt.csv");
+        std::fs::write(&path, "file,artist,title,label\r\na.mp3,A,T,Fraction Records\r\n").unwrap();
+        assert_eq!(load_ground_truth(&path).unwrap()["a.mp3"].label, "Fraction Records");
     }
 
     #[test]

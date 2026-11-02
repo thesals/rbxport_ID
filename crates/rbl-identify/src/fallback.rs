@@ -155,7 +155,8 @@ fn squash(catno: &str) -> String {
 
 /// Two label names for the same label: close as text, or one the other
 /// with a suffix (`Ministry Of Sound` and `Ministry Of Sound (UK)`).
-fn same_label(a: &str, b: &str) -> bool {
+#[must_use]
+pub fn same_label(a: &str, b: &str) -> bool {
     let (na, nb) = (normalize::normalize(a), normalize::normalize(b));
     if na.is_empty() || nb.is_empty() {
         return false;
