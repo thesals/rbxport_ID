@@ -300,7 +300,8 @@ impl IdentifyState {
         self.with_store(|store| {
             let total = store.count(filter).map_err(store_error)?;
             let items = store.list(filter, offset, limit).map_err(store_error)?;
-            Ok(IdentifyQueueDto { total, items: items.iter().map(queue_item_dto).collect() })
+            let items = items.iter().map(|item| item_dto(store, item)).collect::<AppResult<Vec<_>>>()?;
+            Ok(IdentifyQueueDto { total, items })
         })
     }
 
@@ -318,7 +319,7 @@ impl IdentifyState {
                     mime: a.mime.clone(),
                     bytes: a.bytes,
                 }),
-                item: queue_item_dto(&item),
+                item: item_dto(store, &item)?,
                 candidates: candidates.iter().map(candidate_dto).collect(),
                 enrichment: enrichment.map(|e| EnrichmentDto {
                     discogs_release_id: e.discogs_release_id,
@@ -412,7 +413,7 @@ fn changeable(store: &Store, result: ResultId) -> AppResult<QueueItem> {
 
 fn current_item(store: &Store, result: ResultId) -> AppResult<IdentifyQueueItemDto> {
     let (item, ..) = store.result(result).map_err(store_error)?.ok_or_else(no_such_result)?;
-    Ok(queue_item_dto(&item))
+    item_dto(store, &item)
 }
 
 // ---------------------------------------------------------------- config
@@ -1416,6 +1417,23 @@ fn change_dto(change: &FieldChange) -> FieldChangeDto {
     FieldChangeDto { field: camel(&change.field), current: change.current.clone(), proposed: change.proposed.clone() }
 }
 
+/// A queue row, `undoable` only when undo would go ahead: the result is
+/// applied and its last write recorded the file's tags after it (a write
+/// recorded by a version 1 store did not, and undo refuses it).
+fn item_dto(store: &Store, item: &QueueItem) -> AppResult<IdentifyQueueItemDto> {
+    let mut dto = queue_item_dto(item);
+    if dto.undoable {
+        let last = store.last_application(item.result).map_err(store_error)?;
+        dto.undoable = match last {
+            Some(application) if application.undone_unix.is_none() => {
+                store.application_after_snapshot(application.id).map_err(store_error)?.is_some()
+            }
+            _ => false,
+        };
+    }
+    Ok(dto)
+}
+
 fn queue_item_dto(item: &QueueItem) -> IdentifyQueueItemDto {
     IdentifyQueueItemDto {
         result_id: item.result,
@@ -1740,6 +1758,10 @@ mod tests {
         assert_eq!((last.state, last.failed, last.unidentified), (JobState::Done, 1, 1));
         let applied = state.queue(QueueFilter::Applied, 0, 10).unwrap();
         assert_eq!(applied.items.iter().map(|i| i.result_id).collect::<Vec<_>>(), [review.result_id]);
+        // Written without an after-state (as a version 1 store recorded
+        // writes): undo would refuse it, so it is not offered.
+        assert!(!applied.items[0].undoable);
+        assert!(!state.detail(review.result_id).unwrap().item.undoable);
     }
 
     #[test]
