@@ -799,6 +799,72 @@ fn write_library(
     Ok(())
 }
 
+/// Refuses a write the library record would not take as the user saw it.
+///
+/// - The library track must still point at the file that was identified
+///   (same canonical path): otherwise one file's tags would land on another
+///   track's record.
+/// - Every ticked field the library stores must hold, in the library, the
+///   value the review showed as current (or nothing): rekordbox edits change
+///   only the library, so its title can differ from the tag's, and that
+///   value was never in the diff. Such a field is not overwritten; the whole
+///   item is refused, naming it, so file and library stay in step and the
+///   user can untick it or fix it in rekordbox first. The sub-genre is
+///   exempt: it is appended to the library's comment, which keeps whatever
+///   it says.
+///
+/// Nothing has been written when this refuses.
+fn check_library(
+    writer: &rbl_db::write::Writer,
+    track: &str,
+    file: &str,
+    changes: &[FieldChange],
+    fields: &[Field],
+    before: &[ColumnValue],
+) -> Result<(), String> {
+    let details = rbl_db::details::track_details(writer.library().connection(), track)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "The library track is no longer in the library.".to_owned())?;
+    let library_file = rbl_db::resolve_folder_path(&details.path, None);
+    let same_file = rbl_identify::paths::canonical_key(Path::new(&library_file)).is_ok_and(|key| key == file);
+    if !same_file {
+        return Err("The library track no longer points at this file. Identify the track again.".to_owned());
+    }
+    let isrc = before.iter().find(|v| v.column == "ISRC").map_or(String::new(), |v| match &v.value {
+        StoredValue::Text(text) => text.clone(),
+        _ => String::new(),
+    });
+    let mut differing = Vec::new();
+    for change in changes.iter().filter(|c| fields.contains(&c.field)) {
+        let (in_library, shown) = match change.field {
+            Field::Title => (details.title.clone(), change.current.clone()),
+            Field::Artist => (details.artist.clone(), change.current.clone()),
+            Field::Album => (details.album.clone(), change.current.clone()),
+            Field::Label => (details.label.clone(), change.current.clone()),
+            Field::Genre => (details.genre.clone(), change.current.clone()),
+            Field::Isrc => (isrc.clone(), change.current.clone()),
+            Field::Year => (
+                if details.year == 0 { String::new() } else { details.year.to_string() },
+                change.current.trim().get(..4).unwrap_or(change.current.trim()).to_owned(),
+            ),
+            _ => continue,
+        };
+        let in_library = in_library.trim();
+        if !in_library.is_empty() && in_library != shown.trim() {
+            differing.push(format!("{} (\"{in_library}\" in the library)", lower_first(change.field.as_str())));
+        }
+    }
+    if differing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "The library holds a different value than the review showed for {}. Untick it, or make it match in \
+             the library, and apply again. Nothing was written.",
+            differing.join(", ")
+        ))
+    }
+}
+
 fn library_json(side: &LibrarySide) -> Result<String, String> {
     serde_json::to_string(side).map_err(|e| format!("could not record the library values ({:?})", e.classify()))
 }
@@ -824,6 +890,11 @@ impl IdentifyState {
                 })?;
             let columns: Vec<&str> = fields.iter().filter_map(|f| library_column(*f)).collect();
             let before = writer.track_values(&library.track_id, &columns).map_err(write_error)?;
+            let (stored, ..) = store.result(item.result_id).map_err(store_error)?.ok_or_else(no_such_result)?;
+            let changes = stored.proposal.as_ref().map(|p| p.changes.as_slice()).unwrap_or_default();
+            if let Err(why) = check_library(writer, &library.track_id, &stored.path, changes, &fields, &before) {
+                return Ok(Err(why));
+            }
             let side = LibrarySide { track_id: library.track_id.clone(), values: before.clone() };
             let before_json = library_json(&side).map_err(AppError::internal)?;
             let applied = rbl_identify::write::apply_result(store, item.result_id, &fields, Some(&before_json), |written| {
@@ -1737,18 +1808,98 @@ mod tests {
             .unwrap()
     }
 
+    /// A disposable library holding `audio` as an imported track whose title
+    /// is empty, as the untagged file's is.
+    fn library_with(dir: &Path, audio: &Path) -> (AppState, String) {
+        let location = rbl_db::fixture::build(dir, rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let app = AppState::with_backups(dir.join("backups"));
+        app.set_library(library, false, db.schema().db_version, 0, location);
+        drop(db);
+        let track = app
+            .write_then(
+                |w| {
+                    let id = w.import_file(audio)?;
+                    w.set_field(&id, rbl_db::write::TrackField::Title, "")?;
+                    Ok(id)
+                },
+                |db, id| refresh_after_edit(&app, db, Touched::Tracks).map(|_| id),
+            )
+            .unwrap();
+        (app, track)
+    }
+
+    /// Stores a review result for `audio`, linked to `track` as the job links it.
+    fn identified(identify: &IdentifyState, audio: &Path, track: &str, changes: Vec<FieldChange>) -> ResultId {
+        identify
+            .with_store(|store| {
+                let key = TrackKey::for_file(audio).map_err(store_error)?;
+                let mut track_result = result(audio, Decision::Review);
+                track_result.proposal = Some(Proposal::new(changes, None, true));
+                track_result.artwork = None;
+                let library = LibraryTrack { track_id: track.to_owned(), path: key.path.clone() };
+                Ok(store.save_track_result(&key, &track_result, Some(&library), false).map_err(store_error)?.1)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_library_value_the_review_did_not_show_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let (app, track) = library_with(dir.path(), &audio);
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let changes = vec![
+            FieldChange { field: Field::Title, current: String::new(), proposed: "Song (Extended Mix)".into() },
+            FieldChange { field: Field::Isrc, current: String::new(), proposed: "GBAAA1400001".into() },
+        ];
+        let result = identified(&identify, &audio, &track, changes);
+        // After identification the user retitles the track in the library.
+        app.write_then(|w| w.set_field(&track, rbl_db::write::TrackField::Title, "Song (Edit)"), |_, _| Ok(())).unwrap();
+        let original = std::fs::read(&audio).unwrap();
+
+        let ticked = |fields: &[&str]| [ApplyItemDto { result_id: result, fields: fields.iter().map(|f| (*f).to_owned()).collect() }];
+        let (outcomes, generation) = identify.apply_items(&app, &ticked(&["title", "isrc"]));
+        assert!(!outcomes[0].ok);
+        let error = outcomes[0].error.clone().unwrap_or_default();
+        assert!(error.contains("title") && error.contains("Song (Edit)"), "{error}");
+        assert_eq!(generation, None);
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "nothing written to the file");
+        assert_eq!(library_row(&app, &track).0, "Song (Edit)", "nor to the library");
+        assert_eq!(identify.detail(result).unwrap().item.state, "pending", "still for review");
+
+        // Unticked, the rest is written: the library's ISRC was empty.
+        let (outcomes, _) = identify.apply_items(&app, &ticked(&["isrc"]));
+        assert!(outcomes[0].ok, "{outcomes:?}");
+        assert_eq!(library_row(&app, &track), ("Song (Edit)".to_owned(), library_row(&app, &track).1, Some("GBAAA1400001".to_owned())));
+    }
+
+    #[test]
+    fn a_library_track_that_moved_to_another_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let (app, track) = library_with(dir.path(), &audio);
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let isrc = vec![FieldChange { field: Field::Isrc, current: String::new(), proposed: "GBAAA1400001".into() }];
+        let result = identified(&identify, &audio, &track, isrc);
+        let other = dir.path().join("other.wav");
+        wav(&other);
+        app.write_then(|w| w.relocate(&track, &other), |_, _| Ok(())).unwrap();
+        let (outcomes, _) = identify.apply_items(&app, &[ApplyItemDto { result_id: result, fields: vec!["isrc".into()] }]);
+        assert!(!outcomes[0].ok);
+        assert!(outcomes[0].error.as_deref().unwrap_or_default().contains("no longer points at this file"), "{outcomes:?}");
+        assert_eq!(library_row(&app, &track).2, None);
+    }
+
     #[test]
     fn apply_writes_the_file_and_the_library_record_and_undo_puts_both_back() {
         let dir = tempfile::tempdir().unwrap();
-        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
-        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
-        let (library, _) = rbl_index::load(&db).unwrap();
-        let app = AppState::with_backups(dir.path().join("backups"));
-        app.set_library(library, false, db.schema().db_version, 0, location);
-        drop(db);
-        let track = rbl_db::fixture::track_id(1);
         let audio = dir.path().join("track.wav");
         wav(&audio);
+        let (app, track) = library_with(dir.path(), &audio);
         let original = std::fs::read(&audio).unwrap();
         let before_row = library_row(&app, &track);
 
@@ -1759,17 +1910,7 @@ mod tests {
             FieldChange { field: Field::Isrc, current: String::new(), proposed: "GBAAA1400001".into() },
             FieldChange { field: Field::CatalogNumber, current: String::new(), proposed: "CAT001".into() },
         ];
-        let result = identify
-            .with_store(|store| {
-                // Saved and linked as the job saves it.
-                let key = TrackKey::for_file(&audio).map_err(store_error)?;
-                let mut track_result = result(&audio, Decision::Review);
-                track_result.proposal = Some(Proposal::new(changes.clone(), None, true));
-                track_result.artwork = None;
-                let library = LibraryTrack { track_id: track.clone(), path: key.path.clone() };
-                Ok(store.save_track_result(&key, &track_result, Some(&library), false).map_err(store_error)?.1)
-            })
-            .unwrap();
+        let result = identified(&identify, &audio, &track, changes);
         let item = identify.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items.remove(0);
         assert_eq!((item.result_id, item.track_id.as_str(), item.undoable), (result, track.as_str(), false));
 
@@ -1813,30 +1954,12 @@ mod tests {
     #[test]
     fn undo_is_refused_when_the_file_changed_since_the_write() {
         let dir = tempfile::tempdir().unwrap();
-        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
-        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
-        let (library, _) = rbl_index::load(&db).unwrap();
-        let app = AppState::with_backups(dir.path().join("backups"));
-        app.set_library(library, false, db.schema().db_version, 0, location);
-        drop(db);
-        let track = rbl_db::fixture::track_id(2);
         let audio = dir.path().join("track.wav");
         wav(&audio);
+        let (app, track) = library_with(dir.path(), &audio);
         let identify = IdentifyState::with_root(dir.path().join("identify"));
-        let result = identify
-            .with_store(|store| {
-                let key = TrackKey::for_file(&audio).map_err(store_error)?;
-                let mut track_result = result(&audio, Decision::Review);
-                track_result.proposal = Some(Proposal::new(
-                    vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }],
-                    None,
-                    true,
-                ));
-                track_result.artwork = None;
-                let library = LibraryTrack { track_id: track.clone(), path: key.path.clone() };
-                Ok(store.save_track_result(&key, &track_result, Some(&library), false).map_err(store_error)?.1)
-            })
-            .unwrap();
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let result = identified(&identify, &audio, &track, title);
         let (outcomes, _) = identify.apply_items(&app, &[ApplyItemDto { result_id: result, fields: vec!["title".into()] }]);
         assert!(outcomes[0].ok, "{outcomes:?}");
         // Someone retags the file afterwards.
