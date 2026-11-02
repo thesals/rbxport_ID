@@ -227,6 +227,13 @@ export interface Backend {
   edits: Edits;
 
   /**
+   * Track identification (fork-only; `docs/identify/IDENTIFY_SPEC.md`): the
+   * background job and the review queue. Review changes touch only the
+   * identify store; nothing is written to a file from here yet.
+   */
+  identify: IdentifyBackend;
+
+  /**
    * Called when the library changes underneath us — after an edit, or when
    * Rekordbox itself writes. The argument is the new generation, which
    * invalidates every cached page.
@@ -1711,4 +1718,172 @@ export interface DeviceSettings {
   /** `menuItem` of the sort option shown beside the track name, or null for Not Specified. */
   subColumn: number | null;
   colors: ColorName[];
+}
+
+/** Where an identify job stands. `failed` only when the job itself broke. */
+export type IdentifyJobState = "running" | "done" | "cancelled" | "failed";
+
+/** `identify:progress`: once as each track starts, and once at the end. */
+export interface IdentifyProgress {
+  jobId: number;
+  state: IdentifyJobState;
+  /** Tracks finished, whatever their outcome. */
+  done: number;
+  total: number;
+  /** The track being identified; empty once the job has ended. */
+  currentTitle: string;
+  currentPath: string;
+  /** Finished tracks by outcome; `identified` counts auto-apply decisions. */
+  identified: number;
+  review: number;
+  unidentified: number;
+  failed: number;
+  /** Why the job failed; null otherwise. */
+  message: string | null;
+}
+
+export type IdentifyDecision = "autoApply" | "review" | "unidentified";
+
+/** `identify:result`: one finished track. */
+export interface IdentifyResultEvent {
+  jobId: number;
+  /** The library track id the job was given. */
+  trackId: string;
+  /** For `identify.result`; null when the track failed. */
+  resultId: number | null;
+  path: string;
+  decision: IdentifyDecision | "failed";
+  score: number | null;
+  error: string | null;
+}
+
+export type IdentifyFilter = "unidentified" | "needsReview" | "applied" | "all";
+
+export type IdentifyReviewState =
+  | "unidentified" | "pending" | "accepted" | "rejected" | "applied" | "autoApplied" | "undone";
+
+/**
+ * A tag field identification may propose. Key, BPM, cues, grid, rating,
+ * colour and comments are never among them.
+ */
+export type IdentifyField =
+  | "title" | "artist" | "album" | "label" | "year" | "genre" | "isrc" | "catalogNumber"
+  | "mbRecordingId" | "mbReleaseId" | "mbReleaseGroupId" | "mbArtistId" | "mbReleaseTrackId"
+  | "mbAlbumArtistId" | "discogsReleaseId" | "artwork";
+
+/** One row of the per-field diff: the file's value against the proposal. */
+export interface IdentifyFieldChange {
+  field: IdentifyField;
+  current: string;
+  proposed: string;
+}
+
+export interface IdentifyQueueItem {
+  resultId: number;
+  path: string;
+  state: IdentifyReviewState;
+  decision: IdentifyDecision;
+  score: number | null;
+  /** The file's own artist and title, as last read. */
+  artist: string;
+  title: string;
+  changes: IdentifyFieldChange[];
+  updatedUnix: number;
+}
+
+/** A window of the queue and the filter's total. */
+export interface IdentifyQueue {
+  total: number;
+  items: IdentifyQueueItem[];
+}
+
+export interface IdentifyRelease {
+  mbid: string;
+  title: string;
+  date: string;
+  country: string;
+  label: string;
+  catalogNumber: string;
+  releaseGroupMbid: string;
+  releaseGroupType: string;
+  secondaryTypes: string[];
+}
+
+export interface IdentifyCandidate {
+  recordingMbid: string;
+  artist: string;
+  title: string;
+  disambiguation: string;
+  remixers: string[];
+  lengthMs: number | null;
+  isrcs: string[];
+  genres: string[];
+  releases: IdentifyRelease[];
+  source: "fingerprint" | "textSearch";
+  score: number;
+  acoustidScore: number | null;
+  durationScore: number;
+  textScore: number;
+  mixScore: number;
+  rejected: string | null;
+}
+
+export interface IdentifyDetail {
+  item: IdentifyQueueItem;
+  existing: {
+    artist: string;
+    title: string;
+    album: string;
+    label: string;
+    year: number | null;
+    isrc: string;
+    genre: string;
+    catalogNumber: string;
+    hasArtwork: boolean;
+  };
+  /** Best first. */
+  candidates: IdentifyCandidate[];
+  enrichment: {
+    discogsReleaseId: number | null;
+    releaseTitle: string;
+    label: string;
+    catalogNumber: string;
+    year: number | null;
+    styles: string[];
+    genres: string[];
+  } | null;
+  /** The cover proposed for a file without one. */
+  artwork: { source: "coverArtArchive" | "discogs"; url: string; sha256: string; mime: string; bytes: number } | null;
+  warnings: string[];
+  /** A write to the file is open; review changes are refused until it ends. */
+  writeInProgress: boolean;
+}
+
+export type IdentifyReviewAction = "accept" | "reject" | "pending";
+
+export interface IdentifyFieldEdit {
+  field: IdentifyField;
+  proposed: string;
+}
+
+export interface IdentifyBackend {
+  /**
+   * Starts identifying these library tracks in the background and resolves
+   * to the job id. Refused (`readOnly`) while a job runs, and (`notFound`)
+   * without an AcoustID key and MusicBrainz user agent.
+   */
+  start(trackIds: readonly string[]): Promise<number>;
+  /** Stops the job after the track it is on; a no-op once it has ended. */
+  cancel(jobId: number): Promise<void>;
+  /** The running or last job's progress, for a view that mounts mid-job. */
+  progress(): Promise<IdentifyProgress | null>;
+  onProgress(listener: (progress: IdentifyProgress) => void): () => void;
+  onResult(listener: (result: IdentifyResultEvent) => void): () => void;
+  /** At most 128 rows per call. */
+  queue(filter: IdentifyFilter, offset: number, limit: number): Promise<IdentifyQueue>;
+  result(resultId: number): Promise<IdentifyDetail>;
+  /** Review state in the identify store only; nothing is written to the file. */
+  setState(resultId: number, action: IdentifyReviewAction): Promise<IdentifyQueueItem>;
+  /** Replaces proposed values; only fields the proposal lists, never artwork. */
+  edit(resultId: number, changes: readonly IdentifyFieldEdit[]): Promise<IdentifyQueueItem>;
 }

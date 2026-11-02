@@ -14,6 +14,7 @@ import type {
   LinkStatus, MissingExportFile, MissingTracks, PreviewState, ReferenceStickSettings, RelocateReport, RowDto, ScriptRequest, Tick,
   TreeNode, ViewHandle,
   TrackDetails, TrackLookups,
+  IdentifyDetail, IdentifyProgress, IdentifyQueue, IdentifyQueueItem, IdentifyResultEvent,
 } from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -555,6 +556,17 @@ async function realBackend(): Promise<Backend> {
       addPlaylistArtwork: (playlist, image) => invoke<number>("add_playlist_artwork", { playlist, image }),
       setMyTags: (track, tags) => invoke<EditHistoryState>("set_my_tags", { track, tags }),
       clearArtwork: (track) => invoke<EditHistoryState>("clear_artwork", { track }),
+    },
+    identify: {
+      start: (trackIds) => invoke<number>("identify_start", { trackIds: [...trackIds] }),
+      cancel: (jobId) => invoke<void>("identify_cancel", { jobId }),
+      progress: () => invoke<IdentifyProgress | null>("identify_progress"),
+      onProgress: (listener) => subscribe<IdentifyProgress>("identify:progress", listener),
+      onResult: (listener) => subscribe<IdentifyResultEvent>("identify:result", listener),
+      queue: (filter, offset, limit) => invoke<IdentifyQueue>("identify_queue", { filter, offset, limit }),
+      result: (resultId) => invoke<IdentifyDetail>("identify_result", { resultId }),
+      setState: (resultId, action) => invoke<IdentifyQueueItem>("identify_set_state", { resultId, action }),
+      edit: (resultId, changes) => invoke<IdentifyQueueItem>("identify_edit", { resultId, changes: [...changes] }),
     },
     filterValues: (spec) => invoke<FilterValues>("filter_values", { spec }),
     trackDetails: (trackId) => invoke<TrackDetails>("track_details", { track: trackId }),

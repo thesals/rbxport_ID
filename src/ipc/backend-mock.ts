@@ -24,6 +24,7 @@ import { applyEditFrom, validateEdit, isDynamicFrom, tempoX100, type EditableBea
 import { toCamelot } from "@/lib/camelot";
 import { COLOR_NAMES, wholeBpm } from "@/lib/trackFilter";
 import { referenceDeviceSettings } from "./mock-device-settings";
+import { createMockIdentify } from "./mock-identify";
 
 const ARTISTS = [
   "MORTEN", "ARTBAT", "Meduza", "Vintage Culture", "Tujamo", "UMEK", "Kryder", "Joel Corry",
@@ -2638,6 +2639,12 @@ export function createMockBackend(options: MockOptions = {}): Backend {
           { name: "Components", tags: [{ id: "t-synth", name: "Synth" }, { id: "t-vocal", name: "Vocal" }] },
         ],
       }),
+    identify: createMockIdentify({
+      describe: (trackId) => {
+        const row = all[indexOfId.get(trackId) ?? -1];
+        return row ? { title: row.title, artist: row.artist } : undefined;
+      },
+    }),
   };
 }
 
