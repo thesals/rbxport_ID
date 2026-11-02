@@ -1769,7 +1769,7 @@ export type IdentifyReviewState =
 export type IdentifyField =
   | "title" | "artist" | "album" | "label" | "year" | "genre" | "isrc" | "catalogNumber"
   | "mbRecordingId" | "mbReleaseId" | "mbReleaseGroupId" | "mbArtistId" | "mbReleaseTrackId"
-  | "mbAlbumArtistId" | "discogsReleaseId" | "artwork";
+  | "mbAlbumArtistId" | "discogsReleaseId" | "subGenre" | "artwork";
 
 /** One row of the per-field diff: the file's value against the proposal. */
 export interface IdentifyFieldChange {
@@ -1819,7 +1819,7 @@ export interface IdentifyCandidate {
   isrcs: string[];
   genres: string[];
   releases: IdentifyRelease[];
-  source: "fingerprint" | "textSearch";
+  source: "fingerprint" | "textSearch" | "discogsText";
   score: number;
   acoustidScore: number | null;
   durationScore: number;

@@ -32,7 +32,7 @@ use rbl_identify::model::{Decision, Field, FieldChange, Proposal, Scored};
 use rbl_identify::musicbrainz::MusicBrainzClient;
 use rbl_identify::pipeline::{self, Services, Settings, TrackResult};
 use rbl_identify::ratelimit::Limiters;
-use rbl_identify::store::{Filter, QueueItem, ResultId, ReviewState, Store, TrackKey};
+use rbl_identify::store::{Filter, QueueItem, Reconciliation, ResultId, ReviewState, Store, TrackKey};
 use rbl_identify::transport::{HttpTransport, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -213,13 +213,15 @@ impl IdentifyState {
         if !self.store_path().is_file() {
             return;
         }
-        // TODO(phase 4): reconcile each open write (rbl-identify's reconcile
-        // helper: compare the file with its before-snapshot, then complete or
-        // abandon). Until then they are only counted; review commands on
-        // those tracks are refused by the store while they stay open.
-        match self.with_store(|store| store.open_applications().map_err(store_error)) {
-            Ok(open) if open.is_empty() => {}
-            Ok(open) => tracing::warn!(count = open.len(), "identify: tag writes left open by an earlier run"),
+        // A write whose file still holds its before-snapshot never happened
+        // and is abandoned; any other stays open for the user (the review
+        // UI, Phase 4) and its track refuses review changes meanwhile.
+        match self.with_store(|store| store.reconcile_open_applications_from_files().map_err(store_error)) {
+            Ok(outcomes) if outcomes.is_empty() => {}
+            Ok(outcomes) => {
+                let open = outcomes.iter().filter(|o| matches!(o, Reconciliation::NeedsUser { .. })).count();
+                tracing::warn!(abandoned = outcomes.len() - open, open, "identify: tag writes left open by an earlier run");
+            }
             Err(e) => tracing::warn!(error = %e, "identify: the store could not be checked on startup"),
         }
     }
@@ -537,13 +539,13 @@ fn identify_and_save(
     track: &JobTrack,
 ) -> Result<(String, ResultId, Decision, Option<f64>), String> {
     let raw = track.path.as_deref().filter(|p| !p.is_empty()).ok_or("The library holds no file for this track.")?;
-    let path = canonical(Path::new(raw)).map_err(|e| format!("The file could not be found: {e}"))?;
-    let path_text = path.to_str().ok_or("The file's path is not valid Unicode.")?.to_owned();
-    let meta = std::fs::metadata(&path).map_err(|e| format!("The file could not be read: {e}"))?;
-    if !meta.is_file() {
-        return Err("The path is not a file.".to_owned());
+    if !Path::new(raw).is_file() {
+        return Err("The file could not be found, or is not a file.".to_owned());
     }
-    let key = TrackKey { path: path_text.clone(), file_size: meta.len(), modified_unix: modified_unix(&meta) };
+    // The canonical path, size and time: one store key per file.
+    let key = TrackKey::for_file(Path::new(raw)).map_err(|e| format!("The file could not be read: {e}"))?;
+    let path_text = key.path.clone();
+    let path = PathBuf::from(&path_text);
     let mut result = identifier.identify(&path).map_err(|e| e.to_string())?;
     let score = result.best().map(|b| b.score);
     let decision = result.decision;
@@ -557,62 +559,12 @@ fn identify_and_save(
     Ok((path_text, result_id, decision, score))
 }
 
-/// Saves a finished track: its row, its cover (whose bytes are dropped
-/// once stored), then its result.
-///
-/// TODO: use rbl-identify's artwork-persisting save helper once it lands.
+/// Saves a finished track (its cover, row and result) in one call, then
+/// drops the cover's bytes: the store holds them now.
 fn save(store: &Store, key: &TrackKey, result: &mut TrackResult) -> rbl_identify::Result<ResultId> {
-    let track = store.upsert_track(key, result.duration_secs, None, &result.existing)?;
-    if let Some(image) = result.artwork.take() {
-        store.put_artwork(&image.bytes, &image.mime)?;
-    }
-    store.save_result(
-        track,
-        result.decision,
-        &result.candidates,
-        result.proposal.as_ref(),
-        result.enrichment.as_ref(),
-        &result.warnings,
-        false,
-    )
-}
-
-/// One spelling per file for the store's key: absolute, links resolved,
-/// and on Windows without the `\\?\` prefix when the plain form is valid.
-///
-/// TODO: use rbl-identify's path-canonicalising helper once it lands.
-fn canonical(path: &Path) -> std::io::Result<PathBuf> {
-    std::fs::canonicalize(path).map(strip_verbatim)
-}
-
-#[cfg(windows)]
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    // MAX_PATH: a longer path needs the prefix to be opened at all.
-    const MAX_PATH: usize = 260;
-    let Some(text) = path.to_str() else { return path };
-    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-        let plain = format!(r"\\{unc}");
-        if plain.len() < MAX_PATH {
-            return PathBuf::from(plain);
-        }
-    } else if let Some(disk) = text.strip_prefix(r"\\?\") {
-        if disk.len() < MAX_PATH && disk.as_bytes().get(1) == Some(&b':') {
-            return PathBuf::from(disk);
-        }
-    }
-    path
-}
-
-#[cfg(not(windows))]
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    path
-}
-
-fn modified_unix(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    let (_, saved) = store.save_track_result(key, result, false)?;
+    result.artwork = None;
+    Ok(saved)
 }
 
 /// Starts the job thread, which emits its events and frees the job slot
@@ -982,7 +934,7 @@ pub struct CandidateDto {
     pub isrcs: Vec<String>,
     pub genres: Vec<String>,
     pub releases: Vec<ReleaseDto>,
-    /// `fingerprint` or `textSearch`.
+    /// `fingerprint`, `textSearch` or `discogsText`.
     pub source: String,
     pub score: f64,
     pub acoustid_score: Option<f64>,
@@ -1165,7 +1117,8 @@ mod tests {
         let art_ref = artwork.as_ref().map(|image| ArtworkRef {
             source: ArtworkSource::CoverArtArchive,
             url: image.url.clone(),
-            sha256: String::new(),
+            // The real hash: the store refuses a proposal naming other bytes.
+            sha256: Store::open_in_memory().unwrap().put_artwork(&image.bytes, &image.mime).unwrap(),
             mime: image.mime.clone(),
             bytes: image.bytes.len() as u64,
         });
@@ -1421,14 +1374,5 @@ mod tests {
         assert_eq!(parse_field("catalogNumber"), Some(Field::CatalogNumber));
         assert_eq!(parse_field("bpm"), None);
         assert_eq!(parse_field(""), None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn a_canonical_windows_path_drops_the_verbatim_prefix_when_it_can() {
-        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\C:\Music\a.mp3")), PathBuf::from(r"C:\Music\a.mp3"));
-        assert_eq!(strip_verbatim(PathBuf::from(r"\\?\UNC\nas\share\a.mp3")), PathBuf::from(r"\\nas\share\a.mp3"));
-        let long = format!(r"\\?\C:\{}", "a".repeat(300));
-        assert_eq!(strip_verbatim(PathBuf::from(&long)), PathBuf::from(&long), "a long path keeps its prefix");
     }
 }
