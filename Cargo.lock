@@ -4168,6 +4168,7 @@ dependencies = [
  "rbl-deck",
  "rbl-devices",
  "rbl-export",
+ "rbl-identify",
  "rbl-index",
  "rbl-link",
  "rbl-onelibrary",

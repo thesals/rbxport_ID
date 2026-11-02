@@ -45,6 +45,8 @@ rbl-onelibrary = { path = "../crates/rbl-onelibrary" }
 # Backup archives' manifest, summary and sizes, and the restore journal
 # RBXport Restore shares.
 rbl-backup = { path = "../crates/rbl-backup" }
+# Track identification (fork-only; docs/identify/IDENTIFY_SPEC.md).
+rbl-identify = { path = "../crates/rbl-identify" }
 # The diagnostics readout in the title bar: this process's CPU and memory.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 parking_lot = "0.12"

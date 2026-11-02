@@ -17,6 +17,7 @@ mod usb_import;
 pub mod cues;
 pub mod details;
 pub mod grid;
+pub mod identify;
 mod durable;
 mod backups;
 mod backup_copy;
@@ -408,6 +409,7 @@ pub fn run() {
         .manage(Arc::new(crate::grid::GridEditor::default()))
         .manage(Arc::new(crate::update::Updates::default()))
         .manage(crate::test_port::TestPort::default())
+        .manage(Arc::new(crate::identify::IdentifyState::default()))
         .setup(|app| {
             screen_cache::initialize(app.handle());
             // Listens only in a debug build asked to (`RBXPORT_TEST_PORT`).
@@ -416,6 +418,12 @@ pub fn run() {
             // scriptable classes, before any Apple Event can arrive.
             crate::scripting::install(app.handle());
             spawn_library_load(app.handle().clone());
+            // Identification's store: writes an earlier run left open are
+            // found before anything else touches it.
+            {
+                let identify = Arc::clone(app.state::<Arc<crate::identify::IdentifyState>>().inner());
+                tauri::async_runtime::spawn_blocking(move || identify.reconcile_on_startup());
+            }
             // Join the network on start: a passive watcher that hears every
             // player and mixer and reports them, so the shell can offer LINK
             // the moment one appears. Nothing is transmitted until LINK is on.
@@ -506,6 +514,13 @@ pub fn run() {
             commands::export_playlist,
             commands::export_progress,
             commands::cancel_export,
+            identify::identify_start,
+            identify::identify_cancel,
+            identify::identify_progress,
+            identify::identify_queue,
+            identify::identify_result,
+            identify::identify_set_state,
+            identify::identify_edit,
             commands::list_devices,
             commands::track_beats,
             // The decks. The audio device is not opened until one of these
