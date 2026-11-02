@@ -141,12 +141,13 @@ pub fn read(path: &Path) -> Result<FileInfo> {
     // not look absent, or a proposal would count as filling an empty field
     // and auto-apply could overwrite it. Such a field is taken from the raw
     // frame instead.
-    let raw_fields = raw_v2.as_deref().map(id3v2_fields).unwrap_or_default();
-    if raw_v2.is_some() {
-        // The comment is exactly the first description-less COMM frame.
+    let raw_fields = raw_v2.as_deref().and_then(id3v2_fields);
+    if raw_fields.is_some() {
+        // The comment is exactly the first description-less COMM frame of a
+        // block that was scanned; otherwise the reader's comment stands.
         values.remove(&Field::SubGenre);
     }
-    for (field, frame) in raw_fields {
+    for (field, frame) in raw_fields.unwrap_or_default() {
         values.entry(field).or_insert_with(|| vec![frame]);
     }
     let has_artwork = tagged.tags().iter().any(|t| t.picture_count() > 0);
@@ -184,25 +185,26 @@ pub const UNREADABLE: &str = "<unreadable>";
 /// The fields an `ID3v2` block holds, straight from its frames: one entry
 /// per frame that maps to a [`Field`], with the frame's text decoded
 /// leniently (or [`UNREADABLE`]). Frame names are as stored: an `ID3v2.3`
-/// file shows `TYER` where the tag reader reports `TDRC`. Versions before
-/// 2.3 (three-character frame IDs) yield nothing.
-fn id3v2_fields(block: &[u8]) -> Vec<(Field, FrameValues)> {
-    let Some(&version) = block.get(3) else { return Vec::new() };
+/// file shows `TYER` where the tag reader reports `TDRC`. `None` when the
+/// block is not scanned at all: versions before 2.3 (three-character frame
+/// IDs) and whole-tag unsynchronisation.
+fn id3v2_fields(block: &[u8]) -> Option<Vec<(Field, FrameValues)>> {
+    let &version = block.get(3)?;
     if !(3..=4).contains(&version) || block.len() < 10 {
-        return Vec::new();
+        return None;
     }
     let flags = block[5];
     if flags & 0x80 != 0 {
         // Whole-tag unsynchronisation: frames would need un-escaping first.
         // Rare; the reader's own values stand for such a tag.
-        return Vec::new();
+        return None;
     }
     let body_end = block.len().min(10 + syncsafe(&block[6..10]));
     let mut at = 10;
     if flags & 0x40 != 0 {
         // Extended header: v2.3 gives its size without the 4 size bytes,
         // v2.4 as a syncsafe size including them.
-        let Some(size_bytes) = block.get(10..14) else { return Vec::new() };
+        let size_bytes = block.get(10..14)?;
         at += if version == 4 { syncsafe(size_bytes) } else { 4 + be_u32(size_bytes) };
     }
     let mut found = Vec::new();
@@ -218,7 +220,7 @@ fn id3v2_fields(block: &[u8]) -> Vec<(Field, FrameValues)> {
         }
         at += 10 + size;
     }
-    found
+    Some(found)
 }
 
 /// The field a frame holds, with its values, when it is one identification
@@ -238,9 +240,14 @@ fn frame_field(id: &str, data: &[u8]) -> Option<(Field, FrameValues)> {
             // Encoding, three bytes of language, then description and text.
             let (&encoding, rest) = data.split_first()?;
             let mut text_data = vec![encoding];
-            text_data.extend_from_slice(rest.get(3..)?);
-            let (description, text) = split_once_text(&text_data)?;
-            let text = text.trim_end_matches(' ').to_owned();
+            text_data.extend_from_slice(rest.get(3..).unwrap_or_default());
+            let Some((description, text)) = split_once_text(&text_data) else {
+                // Not decodable, so not known to be described or empty: it
+                // may be the comment, and must not look absent (a proposal
+                // would then write over it).
+                return Some((Field::SubGenre, FrameValues { frame: "COMM".to_owned(), values: vec![UNREADABLE.to_owned()] }));
+            };
+            let text = text.trim_end_matches('\0').to_owned();
             // A described COMM (iTunNORM, ID3v1 Comment) is not the comment,
             // and an empty one says nothing.
             if !description.is_empty() || text.is_empty() {
@@ -457,7 +464,7 @@ mod tests {
             ("TPUB", latin1("Ministry Of Sound (UK)")),
             ("TCOM", latin1("not a field we change")),
         ]);
-        let found = id3v2_fields(&block);
+        let found = id3v2_fields(&block).unwrap();
         let get = |field: Field| found.iter().find(|(f, _)| *f == field).map(|(_, v)| v.clone());
         assert_eq!(get(Field::Year), Some(FrameValues { frame: "TDRC".into(), values: vec!["2010-00-00".into()] }));
         assert_eq!(
@@ -489,7 +496,7 @@ mod tests {
             ("COMM", utf16),
             comm("eng", "", "second"),
         ]);
-        let found: Vec<_> = id3v2_fields(&block).into_iter().filter(|(f, _)| *f == Field::SubGenre).collect();
+        let found: Vec<_> = id3v2_fields(&block).unwrap().into_iter().filter(|(f, _)| *f == Field::SubGenre).collect();
         assert_eq!(found.len(), 2, "described and empty COMM frames are not the comment");
         assert_eq!(found[0].1, FrameValues { frame: "COMM".into(), values: vec!["Purchased at Beatport.com".into()] });
     }
@@ -499,9 +506,16 @@ mod tests {
         let mut utf16 = vec![1, 0xFF, 0xFE];
         utf16.extend("Röyksopp".encode_utf16().flat_map(u16::to_le_bytes));
         let block = id3v23(&[("TPE1", utf16), ("TALB", vec![9, b'x'])]);
-        let found = id3v2_fields(&block);
+        let found = id3v2_fields(&block).unwrap();
         assert_eq!(found[0].1.values, vec!["Röyksopp".to_owned()]);
         assert_eq!(found[1].1.values, vec![UNREADABLE.to_owned()], "an unknown encoding is present, not absent");
-        assert!(id3v2_fields(b"ID3\x02\x00\x00\x00\x00\x00\x00").is_empty(), "v2.2 is not scanned");
+        assert_eq!(id3v2_fields(b"ID3\x02\x00\x00\x00\x00\x00\x00"), None, "v2.2 is not scanned");
+        assert_eq!(id3v2_fields(b"ID3\x03\x00\x80\x00\x00\x00\x00"), None, "nor an unsynchronised tag");
+        // An undecodable COMM may be the comment: it reads as unreadable.
+        let block = id3v23(&[("COMM", vec![9, b'e', b'n', b'g', b'x'])]);
+        assert_eq!(
+            id3v2_fields(&block).unwrap(),
+            vec![(Field::SubGenre, FrameValues { frame: "COMM".into(), values: vec![UNREADABLE.into()] })]
+        );
     }
 }

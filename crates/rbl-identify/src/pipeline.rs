@@ -510,7 +510,13 @@ pub fn propose(
         .map(str::to_owned)
         .or_else(|| discogs.and_then(|e| e.year).map(|y| y.to_string()));
     let styles = discogs.map(|e| e.styles.join("; ")).filter(|s| !s.is_empty());
-    let sub_genre = styles.as_deref().map(|s| crate::comment::append(&current(snapshot, Field::SubGenre), s));
+    // An unreadable comment is never appended to: the write could not keep
+    // what it says.
+    let comment = current(snapshot, Field::SubGenre);
+    let sub_genre = styles
+        .as_deref()
+        .filter(|_| !comment.contains(crate::tags::UNREADABLE))
+        .map(|s| crate::comment::append(&comment, s));
     let genre = match genre {
         GenrePolicy::FillEmpty => fill_only(snapshot, Field::Genre, styles),
         GenrePolicy::Replace => styles,
@@ -805,6 +811,10 @@ mod tests {
         let done = snapshot(&[(Field::SubGenre, "COMM", "Purchased at Beatport.com; tech house; Minimal")]);
         let kept = propose(&file(""), &done, &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
         assert_eq!(change_for(&kept, Field::SubGenre), None);
+        // A comment that could not be read is never appended to.
+        let unreadable = snapshot(&[(Field::SubGenre, "COMM", crate::tags::UNREADABLE)]);
+        let skipped = propose(&file(""), &unreadable, &c, Some(&enrichment), None, GenrePolicy::FillEmpty);
+        assert_eq!(change_for(&skipped, Field::SubGenre), None);
         // No styles, no sub-genre.
         let none = propose(&file(""), &TagSnapshot::default(), &c, Some(&Enrichment::default()), None, GenrePolicy::FillEmpty);
         assert_eq!(change_for(&none, Field::SubGenre), None);

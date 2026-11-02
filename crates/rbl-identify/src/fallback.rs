@@ -281,7 +281,7 @@ pub fn propose(snapshot: &TagSnapshot, enrichment: &Enrichment) -> Proposal {
     let styles = enrichment.styles.join(crate::comment::SEPARATOR);
     let comment = pipeline::current(snapshot, Field::SubGenre);
     let appended = crate::comment::append(&comment, &styles);
-    if appended != comment {
+    if appended != comment && !comment.contains(crate::tags::UNREADABLE) {
         changes.push(FieldChange { field: Field::SubGenre, current: comment, proposed: appended });
     }
     Proposal::new(changes, None, snapshot.has_artwork)
