@@ -13,7 +13,7 @@ import type { TreeNode } from "@/ipc/types";
 import styles from "./TreeView.module.css";
 import { DeviceIcon, EjectIcon, FolderIcon, HistoryIcon, ListIcon, NoteIcon, SmartListIcon } from "@/components/icons";
 import { ContextMenu } from "@/components/ContextMenu";
-import { treeMenu } from "@/lib/contextMenus";
+import { allTracksMenu, treeMenu } from "@/lib/contextMenus";
 import {
   branchIds, childrenOf, containerOf, emptySources, newlyClosed, nodesForSource, sourceOf,
   subtreeIds, toggle, visibleNodes, searchTree, type TreeSearchScope, type Source,
@@ -224,8 +224,9 @@ const Row = memo(function Row({
       data-move={moveEdge ?? undefined}
       onContextMenu={(e) => {
         // Only the kinds that have a menu: the fixed roots and the device
-        // nodes are not playlists and have nothing to offer.
-        if ((node.kind !== "collection" && node.kind !== "playlist" && node.kind !== "smartPlaylist" && node.kind !== "folder") || !onMenu) return;
+        // nodes are not playlists and have nothing to offer. All Tracks has
+        // the fork's identify menu.
+        if ((node.kind !== "collection" && node.kind !== "playlist" && node.kind !== "smartPlaylist" && node.kind !== "folder" && node.kind !== "allTracks") || !onMenu) return;
         e.preventDefault();
         onMenu(node, { x: e.clientX, y: e.clientY });
       }}
@@ -364,6 +365,10 @@ export interface TreeViewProps {
   onEjectDevice?: (node: TreeNode) => void;
   ejectingDeviceId?: string | null;
   deviceBusy?: boolean;
+  /** Fork-only: identify a node's tracks (All Tracks, a playlist or a folder). Absent, no entry is offered. */
+  onIdentify?: ((node: TreeNode) => void) | undefined;
+  /** Fork-only: open the identify review queue. */
+  onReviewIdentify?: (() => void) | undefined;
 }
 
 export const TreeView = memo(function TreeView({
@@ -374,6 +379,7 @@ export const TreeView = memo(function TreeView({
   onCreateSmartPlaylist, onEditSmartPlaylist, onAddArtwork, onAddToShortcut, onSortItems,
   railShortcuts, onOpenShortcut, onDeleteShortcut,
   onEjectDevice, ejectingDeviceId, deviceBusy = false,
+  onIdentify, onReviewIdentify,
 }: TreeViewProps) {
   const { advanced: { doubleClickToEdit }, view } = usePreferences();
   // Browse › FontSize and Line Space apply to the tree as they do the list.
@@ -567,7 +573,10 @@ export const TreeView = memo(function TreeView({
             droppable={Boolean(dragging) && node.kind === "playlist"}
             onDropTracks={onDropTracks}
             onDropFiles={onDropFiles}
-            onMenu={(node, at) => setMenu({ ...at, node })}
+            onMenu={(node, at) => {
+              if (node.kind === "allTracks" && !onIdentify) return;
+              setMenu({ ...at, node });
+            }}
             count={showCounts && node.kind === "playlist" ? node.childCount : undefined}
             renaming={!readOnly && node.id === renamingId}
             onRename={readOnly ? undefined : onRenameNode}
@@ -599,10 +608,11 @@ export const TreeView = memo(function TreeView({
         <ContextMenu
           x={menu.x}
           y={menu.y}
-          rows={treeMenu(
+          rows={menu.node.kind === "allTracks" ? allTracksMenu() : treeMenu(
             menu.node.kind === "collection" ? "collection" : menu.node.kind === "folder" ? "folder" : menu.node.kind === "smartPlaylist" ? "smartPlaylist" : "playlist",
+            { identify: onIdentify !== undefined },
           )}
-          label={menu.node.kind === "folder" ? "Folder" : menu.node.kind === "collection" ? "Playlists" : "Playlist"}
+          label={menu.node.kind === "folder" ? "Folder" : menu.node.kind === "collection" ? "Playlists" : menu.node.kind === "allTracks" ? "All Tracks" : "Playlist"}
           context={{ inPlaylist: true, hasFile: true, readOnly }}
           onChoose={(action) => {
             switch (action) {
@@ -641,6 +651,12 @@ export const TreeView = memo(function TreeView({
                 break;
               case "delete":
                 onDeleteNode?.(menu.node);
+                break;
+              case "identify":
+                onIdentify?.(menu.node);
+                break;
+              case "identifyReview":
+                onReviewIdentify?.();
                 break;
               default:
                 break;

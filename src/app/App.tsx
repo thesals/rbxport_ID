@@ -1,5 +1,7 @@
 import { useBackupProgress } from "@/store/useBackupProgress";
 import { useExportProgress } from "@/store/useExportProgress";
+import { useIdentifyJob } from "@/store/useIdentifyJob";
+import { errorMessage } from "@/lib/errorMessage";
 import { reportStartupPaint } from "@/lib/startup";
 import { useShowWindowWhenReady } from "@/lib/windowReady";
 import { waveformKindOf } from "@/canvas";
@@ -89,6 +91,10 @@ const UpdateManager = lazy(() => import("@/views/update/UpdateManager").then(m =
 const Preferences = lazy(() => import("@/views/settings/Preferences").then(m => ({ default: m.Preferences })));
 const SyncManager = lazy(() => import("@/views/sync/SyncManager").then(m => ({ default: m.SyncManager })));
 const SmartPlaylistEditor = lazy(() => import("@/views/tree/SmartPlaylistEditor").then(m => ({ default: m.SmartPlaylistEditor })));
+const IdentifyPanel = lazy(() => import("@/views/identify/IdentifyPanel").then(m => ({ default: m.IdentifyPanel })));
+
+/** Track ids read per call when a whole playlist or library is identified, so each answer stays small. */
+const IDENTIFY_IDS_PER_CALL = 2048;
 
 const SHOW_MAIN_SUPPORT = true;
 
@@ -1616,6 +1622,41 @@ function AppBody() {
     [readOnly, refuse],
   );
 
+  // Track identification (fork-only; docs/identify/IDENTIFY_SPEC.md). The
+  // job runs in the backend; the review queue is drawn over the window and
+  // loaded the first time it opens. Identifying writes nothing to the
+  // library, so it is offered while the library is read-only; applying a
+  // result is a write, refused there as any other is.
+  const identifyJob = useIdentifyJob();
+  const [identifyOpen, setIdentifyOpen] = useState(false);
+  const openIdentify = useCallback(() => setIdentifyOpen(true), []);
+  const identifyTracks = useEventCallback((ids: readonly string[]) => {
+    if (ids.length === 0) return;
+    // Opened either way: a refused start says why at the top of the panel.
+    void identifyJob.start(ids).then(() => setIdentifyOpen(true));
+  });
+  /** Every track a node holds — All Tracks, a playlist, a folder — read a window at a time. */
+  const identifyNode = useEventCallback((node: TreeNode) => {
+    void (async () => {
+      try {
+        const backend = await getBackend();
+        const handle = await backend.openView(specForNode(node, "", null));
+        const ids: string[] = [];
+        for (let from = 0; from < handle.len; from += IDENTIFY_IDS_PER_CALL) {
+          const to = Math.min(handle.len, from + IDENTIFY_IDS_PER_CALL) - 1;
+          ids.push(...await backend.viewIdsInRange(handle.viewId, from, to));
+        }
+        if (ids.length === 0) {
+          refuse(t("There are no tracks here to identify."));
+          return;
+        }
+        identifyTracks(ids);
+      } catch (e) {
+        refuse(errorMessage(e));
+      }
+    })();
+  });
+
   // Import from a picker: files (Import) or whole folders (Import Folder). Both
   // land the same way — pick, import, refresh the tree, queue Auto Analysis —
   // so the only difference is which native picker opens and the status wording.
@@ -2211,7 +2252,7 @@ function AppBody() {
     onComment: commentTrack, onResetPlayCount: resetPlayCount, onConvertMemoryCues: convertMemoryCues,
     onRemoveFromCollection: removeFromCollection, onImportToCollection: importToCollection,
     onAnalysisLock: analysisLock, onAddToPlaylist: addToPlaylist, onAddToTagList: addToTagList,
-    onRemoveFromTagList: removeFromTagList, onReloadTag: reloadTag, onExportTrack: exportTrackTo,
+    onRemoveFromTagList: removeFromTagList, onReloadTag: reloadTag, onIdentify: identifyTracks, onExportTrack: exportTrackTo,
     playlists: menuPlaylists, devices: menuDevices, onEditField: editTrackField,
     onEditBlocked: readOnly ? explainEditLock : undefined, onFocusedRow: setPlayerTrack,
     onSelectedRow: setSelectedRow, pendingEdits, readOnly, dragging: draggedTracks !== null,
@@ -2221,7 +2262,7 @@ function AppBody() {
   }), [
     layout, loadTrack, showInformation, revealTrack, rateTrack, commentTrack, resetPlayCount,
     convertMemoryCues, removeFromCollection, importToCollection, analysisLock, addToPlaylist,
-    addToTagList, removeFromTagList, reloadTag, exportTrackTo, menuPlaylists, menuDevices,
+    addToTagList, removeFromTagList, reloadTag, identifyTracks, exportTrackTo, menuPlaylists, menuDevices,
     editTrackField, readOnly, explainEditLock, pendingEdits, draggedTracks, addDraggedTo,
     removeTracksFromPlaylist, removeTracksFromHistory, reorderPlaylist, importDroppedFilesTo,
     analyseTracks, refuse,
@@ -2391,6 +2432,8 @@ function AppBody() {
           onEjectDevice={(node) => { void ejectDeviceFromTree(node); }}
           ejectingDeviceId={ejectingDeviceId}
           deviceBusy={syncing || exportRunning || ejectingDeviceId !== null}
+          onIdentify={identifyNode}
+          onReviewIdentify={openIdentify}
         />
         <div
           className={styles.splitter}
@@ -2435,6 +2478,7 @@ function AppBody() {
           onAddToTagList={addToTagList}
           onRemoveFromTagList={removeFromTagList}
           onReloadTag={reloadTag}
+          onIdentify={identifyTracks}
           onExportTrack={exportTrackTo}
           playlists={menuPlaylists}
           devices={menuDevices}
@@ -2561,6 +2605,10 @@ function AppBody() {
         <SyncManager onClose={() => setSyncOpen(false)} onSynced={refreshDevices} />
       ) : null}
       {reportOpen ? <ReportBug onClose={() => setReportOpen(false)} /> : null}
+      {identifyOpen ? (
+        <IdentifyPanel job={identifyJob} readOnly={readOnly} readOnlyReason={refusal(advancedPrefs.protectLibrary)}
+          onClose={() => setIdentifyOpen(false)} />
+      ) : null}
       {smartEditor ? (
         <SmartPlaylistEditor
           title={smartEditor.mode === "create" ? "Create New Intelligent Playlist" : "Edit the Intelligent Playlist"}
@@ -2624,6 +2672,9 @@ function AppBody() {
         onOpenProtection={!playerError && !loadError && note?.failed && note.text === refusal(true) && advancedPrefs.protectLibrary
           ? () => openPreferences("libraryProtection") : undefined}
         onCancelAnalysis={analysis.running ? analysis.cancel : undefined}
+        identifyProgress={identifyJob.running && identifyJob.progress ? identifyJob.progress : undefined}
+        onOpenIdentify={openIdentify}
+        onCancelIdentify={identifyJob.running ? identifyJob.cancel : undefined}
         analysisFailures={analysis.state.failed.length}
         selection={selectionText}
         readOnly={readOnly}

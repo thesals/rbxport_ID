@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { useTooltip } from "@/store/usePreferences";
 import { refusal } from "@/lib/menu";
 import type { ExportProgress } from "@/ipc/types";
+import { useTranslation } from "@/i18n";
 
 export interface StatusBarProps {
   exports?: readonly (ExportProgress & { name: string })[];
@@ -39,6 +40,12 @@ export interface StatusBarProps {
   analysisFailures?: number;
   /** A short-lived status-bar action, such as a downloaded update. */
   updateNotice?: ReactNode;
+  /** Fork-only: a running identify job, so it can be followed and stopped. */
+  identifyProgress?: { done: number; total: number; currentTitle: string } | undefined;
+  /** Opens the identify review queue. */
+  onOpenIdentify?: (() => void) | undefined;
+  /** Present only while an identify job runs. */
+  onCancelIdentify?: (() => void) | undefined;
 }
 
 export function StatusBar({
@@ -61,8 +68,14 @@ export function StatusBar({
   onCancelAnalysis,
   analysisFailures = 0,
   updateNotice,
+  identifyProgress,
+  onOpenIdentify,
+  onCancelIdentify,
 }: StatusBarProps) {
   const tip = useTooltip();
+  const t = useTranslation();
+  const identifyPercent = identifyProgress && identifyProgress.total > 0
+    ? Math.min(100, Math.max(0, Math.floor(identifyProgress.done / identifyProgress.total * 100))) : 0;
   const analysisPercent = analysisProgress && analysisProgress.total > 0
     ? Math.min(100, Math.max(0, Math.floor(analysisProgress.completed / analysisProgress.total * 100))) : 0;
   const backupPercent = backupProgress && backupProgress.totalBytes > 0
@@ -139,6 +152,17 @@ export function StatusBar({
           max={100} value={analysisPercent} />
         <span className={styles.backupPercent}>({analysisPercent}%)</span>
       </span> : <span className={styles.activity}>{activity}</span>}
+      {identifyProgress ? <span className={styles.analysisMeter}>
+        {onCancelIdentify ? (
+          <button type="button" className={styles.stop} aria-label={t("Stop identifying")} onClick={onCancelIdentify}>
+            {t("Stop")}
+          </button>
+        ) : null}
+        <button type="button" className={styles.identify} title={identifyProgress.currentTitle} onClick={onOpenIdentify}>
+          {t("Identifying {done} of {total}", { done: identifyProgress.done, total: identifyProgress.total })}
+        </button>
+        <progress className={styles.backupProgress} aria-label={t("Identification progress")} max={100} value={identifyPercent} />
+      </span> : null}
       {analysisFailures > 0 ? (
         <span
           className={styles.failures}

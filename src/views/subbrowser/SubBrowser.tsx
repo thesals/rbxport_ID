@@ -54,7 +54,7 @@ export type SubListProps = Pick<
   "onDragTracks" | "onDragError" | "players" | "onLoadTrack" | "onShowInformation" | "onShowInFinder"
   | "onRate" | "onComment" | "pendingEdits" | "readOnly" | "dragging" | "onDropTracks"
   | "onResetPlayCount" | "onConvertMemoryCues" | "onRemoveFromCollection" | "onImportToCollection"
-  | "onAnalysisLock" | "onAddToPlaylist" | "onAddToTagList" | "onRemoveFromTagList" | "onReloadTag"
+  | "onAnalysisLock" | "onAddToPlaylist" | "onAddToTagList" | "onRemoveFromTagList" | "onReloadTag" | "onIdentify"
   | "onExportTrack" | "playlists" | "devices" | "onEditField" | "onEditBlocked" | "onFocusedRow"
   | "onSelectedRow"
 > & {

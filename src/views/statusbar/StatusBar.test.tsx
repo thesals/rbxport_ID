@@ -47,6 +47,23 @@ it("names read-only as a library state", () => {
   expect(badge?.title).toContain("Editing is locked while rekordbox is running");
 });
 
+it("follows a running identify job, opens its queue and stops it", () => {
+  const onOpenIdentify = vi.fn();
+  const onCancelIdentify = vi.fn();
+  act(() => root.render(<StatusBar identifyProgress={{ done: 3, total: 12, currentTitle: "Strings of Life" }}
+    onOpenIdentify={onOpenIdentify} onCancelIdentify={onCancelIdentify} />));
+
+  const buttons = Array.from(host.querySelectorAll("button"));
+  const readout = buttons.find(candidate => candidate.textContent === "Identifying 3 of 12");
+  expect(readout?.title).toBe("Strings of Life");
+  expect(host.querySelector<HTMLProgressElement>('progress[aria-label="Identification progress"]')?.value).toBe(25);
+  act(() => readout?.click());
+  act(() => buttons.find(candidate => candidate.getAttribute("aria-label") === "Stop identifying")?.click());
+
+  expect(onOpenIdentify).toHaveBeenCalledOnce();
+  expect(onCancelIdentify).toHaveBeenCalledOnce();
+});
+
 it("offers the support action when it is available", () => {
   const onSupport = vi.fn();
   act(() => root.render(<StatusBar onSupport={onSupport} />));

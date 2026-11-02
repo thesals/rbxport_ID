@@ -125,6 +125,18 @@
 }
 .stop:hover { border-color: var(--c-accent); }
 
+/* The identify job's readout, which opens its review queue. */
+.identify {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: default;
+}
+.identify:hover { color: var(--c-icon-on); text-decoration: underline; }
+
 .failures { margin-left: 8px; flex: none; color: var(--c-text-dim); font-size: var(--f-size-sm); }
 
 /* The progress readout changes width as it counts; giving it the slack keeps

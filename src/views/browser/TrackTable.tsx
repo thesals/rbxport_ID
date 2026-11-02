@@ -737,6 +737,8 @@ export interface TrackTableProps {
   onRemoveFromTagList?: (ids: readonly string[]) => void;
   /** Reload Tag: the files' tags read again. */
   onReloadTag?: (ids: readonly string[]) => void;
+  /** Fork-only: identify these tracks. Absent, the menu has no Identify entry. */
+  onIdentify?: ((ids: readonly string[]) => void) | undefined;
   /** Export Track › one of `devices`. */
   onExportTrack?: (device: string, ids: readonly string[]) => void;
   /** What Add To Playlist and Export Track offer. */
@@ -794,7 +796,7 @@ export const TrackTable = memo(function TrackTable({
   libraryGeneration, pendingEdits, onSelectedTracks, onAnalyse,
   onShowInformation, onShowInFinder, onRemoveFromPlaylist, onRemoveFromHistory, onResetPlayCount,
   onRemoveFromCollection, onConvertMemoryCues, readOnly = false,
-  onImportToCollection, onAnalysisLock, onAddToPlaylist, onAddToTagList, onRemoveFromTagList, onExportTrack, onReloadTag,
+  onImportToCollection, onAnalysisLock, onAddToPlaylist, onAddToTagList, onRemoveFromTagList, onExportTrack, onReloadTag, onIdentify,
   playlists = [], devices = [],
   players = 0, onLoadTrack, onSelectedRow, filterOpen = false, onToggleFilter, filterBar,
   trafficLight, onTrafficLight, trafficKey = null,
@@ -1503,6 +1505,7 @@ export const TrackTable = memo(function TrackTable({
           rows={trackMenuFor(players, playlists, devices, {
             tagList: spec.source.kind === "tagList",
             explorer: spec.source.kind === "folder",
+            identify: onIdentify !== undefined,
           })}
           label="Track"
           context={{
@@ -1540,6 +1543,9 @@ export const TrackTable = memo(function TrackTable({
                 break;
               case "reloadTag":
                 onReloadTag?.(ids);
+                break;
+              case "identify":
+                onIdentify?.(ids);
                 break;
               case "analyse":
                 onAnalyse?.();
