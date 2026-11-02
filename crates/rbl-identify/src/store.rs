@@ -402,6 +402,21 @@ pub enum Outcome {
     Abandoned { reason: String, completed_unix: i64 },
 }
 
+/// What [`Store::reconcile_open_applications`] made of one open application.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reconciliation {
+    /// The file still held exactly its before-snapshot: the write never
+    /// happened, and the application is now abandoned.
+    Abandoned { application: ApplicationId },
+    /// Left open: the user must decide (the file may hold the changes, part
+    /// of them, someone else's, or be unreadable). `reason` says which.
+    NeedsUser { application: Box<Application>, reason: String },
+}
+
+/// The abandon reason recorded for an application reconciliation found
+/// unchanged.
+pub const RECONCILED_UNCHANGED: &str = "reconciled at startup: the file still held its tags from before the write";
+
 /// The columns [`application_row`] reads, from `applications a`,
 /// `results r`, `tracks t` and `application_outcomes o` (left joined).
 const APPLICATION_COLUMNS: &str = "a.id, a.result_id, t.path, a.changes_json, a.artwork_json, a.library_snapshot, \
@@ -922,9 +937,61 @@ impl Store {
     /// 4. Anything else (a partial write, or the file changed since): put
     ///    the before-snapshot back, then abandon; if that is impossible, leave
     ///    the application open and tell the user. Never guess.
+    ///
+    /// [`Store::reconcile_open_applications`] does step 2 and leaves every
+    /// other case open for the user.
     pub fn open_applications(&self) -> Result<Vec<Application>> {
         let query = format!("SELECT {APPLICATION_COLUMNS} FROM {APPLICATION_FROM} WHERE o.application_id IS NULL ORDER BY a.id");
         self.applications(&query, [])
+    }
+
+    /// The startup pass over [`Store::open_applications`]: for each, reads
+    /// the file's tags now with `read_current` and compares them with the
+    /// before-snapshot, exactly (raw ID3 bytes included).
+    ///
+    /// - Unchanged: the write never happened, so the application is
+    ///   abandoned ([`Reconciliation::Abandoned`]).
+    /// - Anything else (the changes are there, partly there, the file was
+    ///   changed by something else, or it cannot be read): the application
+    ///   stays open and is returned as [`Reconciliation::NeedsUser`]. Nothing
+    ///   is completed or restored on a guess; while it is open the track
+    ///   cannot be identified again or written.
+    ///
+    /// Only a store error stops the pass; a file that cannot be read is one
+    /// more case for the user.
+    pub fn reconcile_open_applications<F>(&self, mut read_current: F) -> Result<Vec<Reconciliation>>
+    where
+        F: FnMut(&Application) -> Result<TagSnapshot>,
+    {
+        let mut outcomes = Vec::new();
+        for application in self.open_applications()? {
+            let Some(before) = self.application_snapshot(application.id)? else {
+                outcomes.push(Reconciliation::NeedsUser {
+                    application: Box::new(application),
+                    reason: "no tag snapshot was recorded before the write".to_owned(),
+                });
+                continue;
+            };
+            let reason = match read_current(&application) {
+                Ok(now) if now == before => None,
+                Ok(_) => Some("the file's tags are not the ones recorded before the write".to_owned()),
+                Err(e) => Some(format!("the file could not be read: {e}")),
+            };
+            match reason {
+                None => {
+                    self.abandon_application(application.id, RECONCILED_UNCHANGED)?;
+                    outcomes.push(Reconciliation::Abandoned { application: application.id });
+                }
+                Some(reason) => outcomes.push(Reconciliation::NeedsUser { application: Box::new(application), reason }),
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// [`Store::reconcile_open_applications`] reading each file's tags from
+    /// disk at its stored path.
+    pub fn reconcile_open_applications_from_files(&self) -> Result<Vec<Reconciliation>> {
+        self.reconcile_open_applications(|application| Ok(crate::tags::read(Path::new(&application.path))?.snapshot))
     }
 
     /// What the last written application of a result wrote; empty when
@@ -1969,6 +2036,73 @@ mod tests {
         assert_eq!(store.track_id(path).unwrap(), Some(track));
         // Another spelling is another key: the store does not normalise.
         assert_eq!(store.track_id("C:/Music/Röyksopp/Track.mp3").unwrap(), None);
+    }
+
+    /// A track with an accepted result and a write begun but not finished.
+    fn interrupted(store: &Store, path: &str, before: &TagSnapshot) -> (ResultId, ApplicationId) {
+        let (_, result) = reviewed(store, path, 0.8);
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let app = store.begin_application(result, &proposal().changes, None, before, None).unwrap();
+        (result, app)
+    }
+
+    #[test]
+    fn reconciling_abandons_only_writes_that_left_the_file_untouched() {
+        let store = Store::open_in_memory().unwrap();
+        let (untouched_result, untouched) = interrupted(&store, "untouched.mp3", &snapshot("T"));
+        let (_, written) = interrupted(&store, "written.mp3", &snapshot("T"));
+        let (_, unreadable) = interrupted(&store, "gone.mp3", &snapshot("T"));
+        // Same values, different raw bytes: not unchanged.
+        let mut raw_differs = snapshot("T");
+        raw_differs.raw_id3 = Some(RawId3 { v2: Some(BASE64.encode("ID3 other")), v1: None });
+        let (_, raw) = interrupted(&store, "raw.mp3", &snapshot("T"));
+
+        let outcomes = store
+            .reconcile_open_applications(|app| match app.path.as_str() {
+                "untouched.mp3" => Ok(snapshot("T")),
+                "written.mp3" => Ok(snapshot("New Title")),
+                "raw.mp3" => Ok(raw_differs.clone()),
+                _ => Err(IdentifyError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))),
+            })
+            .unwrap();
+
+        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes[0], Reconciliation::Abandoned { application: untouched });
+        let needs: Vec<(ApplicationId, &str)> = outcomes[1..]
+            .iter()
+            .map(|o| match o {
+                Reconciliation::NeedsUser { application, reason } => (application.id, reason.as_str()),
+                Reconciliation::Abandoned { .. } => panic!("{o:?}"),
+            })
+            .collect();
+        assert_eq!(needs[0], (written, "the file's tags are not the ones recorded before the write"));
+        assert_eq!(needs[1].0, unreadable);
+        assert!(needs[1].1.starts_with("the file could not be read"), "{}", needs[1].1);
+        assert_eq!(needs[2].0, raw);
+        // The untouched one is recorded as abandoned, and its result is free again.
+        let abandoned = store.application(untouched).unwrap().unwrap();
+        assert!(matches!(abandoned.outcome, Some(Outcome::Abandoned { ref reason, .. }) if reason == RECONCILED_UNCHANGED));
+        store.set_state(untouched_result, ReviewState::Pending).unwrap();
+        // The rest stay open, untouched by the pass.
+        let open: Vec<ApplicationId> = store.open_applications().unwrap().iter().map(|a| a.id).collect();
+        assert_eq!(open, [written, unreadable, raw]);
+        // A second pass with nothing changed leaves them as they are.
+        let again = store.reconcile_open_applications(|_| Ok(snapshot("New Title"))).unwrap();
+        assert_eq!(again.len(), 3);
+        assert_eq!(store.open_applications().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn reconciling_from_files_leaves_a_missing_file_to_the_user() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.mp3");
+        let (_, app) = interrupted(&store, missing.to_str().unwrap(), &snapshot("T"));
+        let outcomes = store.reconcile_open_applications_from_files().unwrap();
+        assert!(matches!(&outcomes[..], [Reconciliation::NeedsUser { application, .. }] if application.id == app));
+        assert_eq!(store.open_applications().unwrap().len(), 1);
+        assert_eq!(store.reconcile_open_applications(|_| Ok(snapshot("T"))).unwrap().len(), 1);
+        assert_eq!(store.reconcile_open_applications(|_| Ok(snapshot("T"))).unwrap(), Vec::new(), "nothing left open");
     }
 
     #[test]
