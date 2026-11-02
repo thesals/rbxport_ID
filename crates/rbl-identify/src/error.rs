@@ -24,6 +24,11 @@ pub enum IdentifyError {
     /// The identify store (its own SQLite file, never rekordbox's).
     #[error("identify store: {0}")]
     Store(String),
+    /// A tag write or undo refused or failed: the file changed since it
+    /// was read, is read-only or in use, or its tag cannot be written
+    /// safely. Says why, never a tag value.
+    #[error("{0}")]
+    Write(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

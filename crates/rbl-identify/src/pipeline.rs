@@ -612,7 +612,7 @@ fn fill_only(snapshot: &TagSnapshot, field: Field, value: Option<String>) -> Opt
 
 /// A field's current value as the review screen shows it: every value of
 /// every frame holding it, joined with "; ". Empty when absent.
-pub(crate) fn current(snapshot: &TagSnapshot, field: Field) -> String {
+pub fn current(snapshot: &TagSnapshot, field: Field) -> String {
     snapshot
         .values
         .get(&field)

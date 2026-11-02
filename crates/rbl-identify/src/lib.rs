@@ -29,5 +29,6 @@ pub mod score;
 pub mod store;
 pub mod tags;
 pub mod transport;
+pub mod write;
 
 pub use error::{IdentifyError, Result};

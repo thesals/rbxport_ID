@@ -29,7 +29,7 @@ pub struct FileInfo {
 /// The keys a field is read from, in order of preference. The first that
 /// holds a value wins for [`ExistingTags`]; the snapshot records the one
 /// that was found. `Catalog #` is a ripping-tool spelling seen in the wild.
-fn keys(field: Field) -> Vec<ItemKey> {
+pub(crate) fn keys(field: Field) -> Vec<ItemKey> {
     match field {
         Field::Title => vec![ItemKey::TrackTitle],
         Field::Artist => vec![ItemKey::TrackArtist],
@@ -96,7 +96,7 @@ fn frames(tag: &Tag, field: Field) -> Vec<FrameValues> {
 
 /// A key as the tag format names it: `TPUB`, `TXXX:Catalog #`,
 /// `CATALOGNUMBER`. ID3 user-defined text frames are written `TXXX:<name>`.
-fn frame_name(key: &ItemKey, tag_type: TagType) -> String {
+pub(crate) fn frame_name(key: &ItemKey, tag_type: TagType) -> String {
     let native = match key {
         ItemKey::Unknown(name) => Some(name.as_str()),
         _ => key.map_key(tag_type, true),
@@ -225,7 +225,7 @@ fn id3v2_fields(block: &[u8]) -> Option<Vec<(Field, FrameValues)>> {
 
 /// The field a frame holds, with its values, when it is one identification
 /// may change.
-fn frame_field(id: &str, data: &[u8]) -> Option<(Field, FrameValues)> {
+pub(crate) fn frame_field(id: &str, data: &[u8]) -> Option<(Field, FrameValues)> {
     let (name, values) = match id {
         "TXXX" => {
             let (description, value) = split_once_text(data)?;
@@ -305,7 +305,7 @@ fn decode_text(data: &[u8]) -> Option<String> {
 }
 
 /// A `TXXX` payload: description and value, in the frame's encoding.
-fn split_once_text(data: &[u8]) -> Option<(String, String)> {
+pub(crate) fn split_once_text(data: &[u8]) -> Option<(String, String)> {
     let text = decode_text(data)?;
     let (description, value) = text.split_once('\0').unwrap_or((text.as_str(), ""));
     // In UTF-16 each string has its own BOM; the first was consumed when
@@ -320,11 +320,11 @@ fn split_values(text: &str) -> Vec<String> {
     text.trim_end_matches('\0').split('\0').map(str::to_owned).collect()
 }
 
-fn syncsafe(bytes: &[u8]) -> usize {
+pub(crate) fn syncsafe(bytes: &[u8]) -> usize {
     bytes.iter().fold(0_usize, |acc, &b| (acc << 7) | usize::from(b & 0x7f))
 }
 
-fn be_u32(bytes: &[u8]) -> usize {
+pub(crate) fn be_u32(bytes: &[u8]) -> usize {
     bytes.iter().fold(0_usize, |acc, &b| (acc << 8) | usize::from(b))
 }
 

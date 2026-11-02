@@ -39,5 +39,7 @@ rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"]
 # The 0.10.9 already in the lock.
 sha2 = "0.10"
 
-[dev-dependencies]
+# The tag writer stages each file beside the original and renames it over.
 tempfile = "3"
+
+[dev-dependencies]
