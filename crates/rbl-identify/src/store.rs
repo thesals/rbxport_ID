@@ -1122,6 +1122,58 @@ impl Store {
         )))
     }
 
+    /// The user's edits to a proposal before it is written: each
+    /// `(field, value)` replaces that field's proposed text. Only fields the
+    /// proposal already lists can be edited, and never artwork (an image is
+    /// not text). Returns the proposal as now stored.
+    ///
+    /// Refused unless the result is its track's current one and `Pending` or
+    /// `Accepted`, and while the track has a write open. The candidates are
+    /// kept, so what the services proposed can always be derived again.
+    pub fn edit_proposal(&self, result: ResultId, edits: &[(Field, String)]) -> Result<Proposal> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let from = current_state(&tx, result)?;
+        if !matches!(from, ReviewState::Pending | ReviewState::Accepted) {
+            return Err(IdentifyError::Store(format!(
+                "result {result} is {}; only a pending or accepted result can be edited",
+                from.as_str()
+            )));
+        }
+        let (track, proposal): (TrackId, Option<String>) = tx
+            .query_row("SELECT track_id, proposal_json FROM results WHERE id = ?1", [result], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(|e| sql("read the result", &e))?;
+        if has_open_application(&tx, track)? {
+            return Err(IdentifyError::Store(format!(
+                "result {result}: a write is in progress; it must be completed or abandoned first"
+            )));
+        }
+        let mut proposal: Proposal = match proposal {
+            Some(json) => from_json(&json, "proposal")?,
+            None => return Err(IdentifyError::Store(format!("result {result} has no proposal to edit"))),
+        };
+        for (field, value) in edits {
+            if *field == Field::Artwork {
+                return Err(IdentifyError::Store("artwork cannot be edited as text".to_owned()));
+            }
+            let change = proposal
+                .changes
+                .iter_mut()
+                .find(|c| c.field == *field)
+                .ok_or_else(|| IdentifyError::Store(format!("result {result} proposes no change to {field:?}")))?;
+            change.proposed.clone_from(value);
+        }
+        let json = to_json(&proposal, "proposal")?;
+        tx.execute(
+            "UPDATE results SET proposal_json = ?2, updated_unix = ?3 WHERE id = ?1",
+            params![result, json, now_unix()],
+        )
+        .map_err(|e| sql("store the edited proposal", &e))?;
+        tx.commit().map_err(|e| sql("commit the edit", &e))?;
+        Ok(proposal)
+    }
+
     /// Bulk accept: every current `Pending` result scoring at least
     /// `threshold` becomes `Accepted`. Returns them, best first.
     pub fn accept_at_or_above(&self, threshold: f64) -> Result<Vec<ResultId>> {
