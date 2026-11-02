@@ -1138,6 +1138,7 @@ mod tests {
             existing: ExistingTags { artist: "Deepack".into(), title: "The Music".into(), ..ExistingTags::default() },
             duration_secs: 300.0,
             fingerprint: FingerprintOutcome::default(),
+            encoded_fingerprint: None,
             candidates: if reviewed { vec![candidate()] } else { Vec::new() },
             decision,
             snapshot: TagSnapshot::default(),

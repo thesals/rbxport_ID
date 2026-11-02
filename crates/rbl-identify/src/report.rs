@@ -529,6 +529,7 @@ mod tests {
             existing: ExistingTags::default(),
             duration_secs: 390.0,
             fingerprint: crate::pipeline::FingerprintOutcome::default(),
+            encoded_fingerprint: None,
             candidates: vec![Scored { candidate, score: 0.85, breakdown: ScoreBreakdown::default() }],
             decision: Decision::Review,
             snapshot: TagSnapshot::default(),

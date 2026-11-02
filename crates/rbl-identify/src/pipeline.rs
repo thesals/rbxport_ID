@@ -82,6 +82,11 @@ pub struct TrackResult {
     pub existing: ExistingTags,
     pub duration_secs: f64,
     pub fingerprint: FingerprintOutcome,
+    /// The Chromaprint fingerprint (compressed, as AcoustID takes it), for
+    /// the store; `None` when it could not be computed. Not serialised: it
+    /// runs to kilobytes and the evaluation has no use for it.
+    #[serde(skip)]
+    pub encoded_fingerprint: Option<String>,
     /// Ranked, best first.
     pub candidates: Vec<Scored>,
     pub decision: Decision,
@@ -133,6 +138,7 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
 
     // 2. Fingerprint and AcoustID.
     let mut outcome = FingerprintOutcome::default();
+    let mut encoded_fingerprint = None;
     match fingerprint::fingerprint_file(path) {
         Ok(print) => {
             let seconds = duration_secs.round().clamp(0.0, f64::from(u32::MAX));
@@ -145,6 +151,7 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
                 }
                 Err(e) => warnings.push(format!("AcoustID: {e}")),
             }
+            encoded_fingerprint = Some(print.encoded);
         }
         Err(e) => warnings.push(format!("fingerprint: {e}")),
     }
@@ -192,6 +199,7 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
                             snapshot: info.snapshot,
                             duration_secs,
                             fingerprint: outcome,
+                            encoded_fingerprint,
                             candidates: ranked,
                             decision,
                             proposal: Some(proposal),
@@ -245,6 +253,7 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
         snapshot: info.snapshot,
         duration_secs,
         fingerprint: outcome,
+        encoded_fingerprint,
         candidates: ranked,
         decision,
         proposal,

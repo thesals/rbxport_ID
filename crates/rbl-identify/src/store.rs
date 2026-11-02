@@ -2146,6 +2146,7 @@ mod tests {
             existing: tags("T"),
             duration_secs: 360.0,
             fingerprint: crate::pipeline::FingerprintOutcome::default(),
+            encoded_fingerprint: None,
             candidates: vec![scored("T", 0.8)],
             decision: Decision::Review,
             snapshot: snapshot("T"),
