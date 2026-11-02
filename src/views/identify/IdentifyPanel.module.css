@@ -172,6 +172,16 @@
 .badge[data-state="rejected"],
 .badge[data-state="unidentified"] { border-color: var(--c-text-dim); color: var(--c-text-dim); }
 
+.confirm {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 8px;
+}
+.confirm .hint { flex: 1; min-width: 240px; color: var(--c-text); }
+
 .empty,
 .detailEmpty { padding: 16px; color: var(--c-text-dim); }
 

@@ -8,8 +8,8 @@
  * closing this panel leaves it running and reopening it picks it up. Below,
  * the queue under one of four filters, a window of rows at a time, and the
  * chosen result in full beside it. Bulk accept marks every pending result at
- * or above a threshold accepted; Apply accepted then writes them, each with
- * every field that would change.
+ * or above a threshold accepted; Apply accepted then fills the empty fields
+ * of those results, after saying what it will do (see `bulkPlan`).
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -22,7 +22,7 @@ import type { IdentifyJob } from "@/store/useIdentifyJob";
 import { useElementSize } from "@/store/useElementSize";
 import { IdentifyDetailPane } from "./IdentifyDetailPane";
 import {
-  FILTERS, decisionLabel, defaultFields, filterLabel, formatScore, stateLabel, trackName, type Translate,
+  FILTERS, bulkPlan, decisionLabel, filterLabel, formatScore, stateLabel, trackName, type BulkPlan, type Translate,
 } from "./identifyText";
 import { useIdentifyQueue } from "./useIdentifyQueue";
 import styles from "./IdentifyPanel.module.css";
@@ -63,6 +63,7 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
   const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
   const [bulkNote, setBulkNote] = useState<{ text: string; failed: boolean } | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [plan, setPlan] = useState<BulkPlan | null>(null);
   const window_ = visibleWindow(scrollTop, listSize.height || 480, ROW_H, queue.total ?? 0);
   const { show } = queue;
 
@@ -131,9 +132,11 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
     }
   };
 
-  const applyAccepted = async () => {
+  /** Reads every accepted result and works out what a bulk write would fill, for the user to confirm. */
+  const planAccepted = async () => {
     setBulkBusy(true);
     setBulkNote(null);
+    setPlan(null);
     try {
       const backend = await getBackend();
       // Every accepted result, read a page at a time.
@@ -143,9 +146,29 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
         accepted.push(...page.items.filter((item) => item.state === "accepted"));
         if (page.items.length === 0 || offset + page.items.length >= page.total) break;
       }
-      const items: IdentifyApplyItem[] = accepted
-        .map((item) => ({ resultId: item.resultId, fields: defaultFields(item) }))
-        .filter((item) => item.fields.length > 0);
+      // Artwork fills only a file without any, which only the detail says.
+      const withArt = new Set<number>();
+      for (const item of accepted) {
+        if (!item.changes.some((change) => change.field === "artwork")) continue;
+        if ((await backend.identify.result(item.resultId)).existing.hasArtwork) withArt.add(item.resultId);
+      }
+      const next = bulkPlan(accepted, (id) => withArt.has(id));
+      if (next.items.length === 0 && next.leftForReview === 0) setBulkNote({ text: t("No accepted results to apply."), failed: false });
+      else setPlan(next);
+    } catch (e) {
+      setBulkNote({ text: errorMessage(e), failed: true });
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  const applyPlan = async (confirmed: BulkPlan) => {
+    setBulkBusy(true);
+    setBulkNote(null);
+    setPlan(null);
+    try {
+      const backend = await getBackend();
+      const items: IdentifyApplyItem[] = confirmed.items;
       let written = 0;
       let failed = 0;
       let firstError: string | null = null;
@@ -159,7 +182,7 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
         }
       }
       const text = items.length === 0
-        ? t("No accepted results to apply.")
+        ? t("Nothing was written.")
         : failed === 0
           ? t("{count} applied.", { count: written })
           : t("{count} applied, {failed} failed: {reason}", { count: written, failed, reason: firstError ?? "" });
@@ -286,11 +309,25 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
             className={styles.small}
             disabled={bulkBusy || readOnly}
             title={readOnly ? readOnlyReason : undefined}
-            onClick={() => void applyAccepted()}
+            onClick={() => void planAccepted()}
           >
             {t("Apply accepted")}
           </button>
         </div>
+        {plan ? (
+          <div className={styles.confirm} role="group" aria-label={t("Apply accepted")}>
+            <p className={styles.hint}>
+              {t("Fill {fields} empty fields in {results} results. {left} results with overwrites or a sub-genre are left for individual review.", {
+                fields: plan.fields, results: plan.items.length, left: plan.leftForReview,
+              })}
+            </p>
+            <button type="button" className={styles.small} disabled={bulkBusy || readOnly || plan.items.length === 0}
+              onClick={() => void applyPlan(plan)}>
+              {t("Apply")}
+            </button>
+            <button type="button" className={styles.small} onClick={() => setPlan(null)}>{t("Cancel")}</button>
+          </div>
+        ) : null}
         {bulkNote ? (
           <p className={bulkNote.failed ? styles.error : styles.note} role={bulkNote.failed ? "alert" : "status"}>{bulkNote.text}</p>
         ) : null}

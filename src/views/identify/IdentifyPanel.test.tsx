@@ -164,12 +164,33 @@ describe("IdentifyPanel", () => {
     await click(button("Accept above"));
     expect(host.textContent).toContain("2 results accepted.");
     await click(button("Apply accepted"));
-    // The two accepted, plus the auto-apply match the mock leaves accepted.
+    // Nothing is written before the counts are confirmed. Of the three
+    // accepted (the two above plus the auto-apply match the mock leaves
+    // accepted), only the auto-apply match just fills empty fields; the two
+    // reviews overwrite a title and add a sub-genre, so they wait.
+    expect(apply).not.toHaveBeenCalled();
+    expect(host.textContent).toContain(
+      "Fill 2 empty fields in 1 results. 2 results with overwrites or a sub-genre are left for individual review.");
+    await click(button("Apply"));
     expect(apply).toHaveBeenCalledTimes(1);
-    expect(apply.mock.calls[0]?.[0]).toHaveLength(3);
-    expect(host.textContent).toContain("3 applied.");
+    expect(apply.mock.calls[0]?.[0]).toEqual([{ resultId: expect.any(Number) as number, fields: ["label", "catalogNumber"] }]);
+    expect(host.textContent).toContain("1 applied.");
     await click(byText("[role=tab]", "Applied (undoable)"));
-    expect(options()).toHaveLength(3);
+    expect(options()).toHaveLength(1);
+    await click(byText("[role=tab]", "All"));
+    expect(options().filter((row) => row.textContent?.includes("Accepted"))).toHaveLength(2);
+  });
+
+  it("drops a bulk write the user does not confirm", async () => {
+    await identifyFive();
+    const apply = vi.spyOn(identify, "apply");
+    await render();
+    await click(button("Apply accepted"));
+    expect(host.textContent).toContain("Fill 2 empty fields in 1 results.");
+    const cancels = [...host.querySelectorAll<HTMLButtonElement>("[role=group] button")].filter((b) => b.textContent === "Cancel");
+    await click(cancels[0]);
+    expect(host.textContent).not.toContain("Fill 2 empty fields");
+    expect(apply).not.toHaveBeenCalled();
   });
 
   it("moves through the list with the arrows and closes on Escape", async () => {

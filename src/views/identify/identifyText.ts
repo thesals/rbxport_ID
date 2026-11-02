@@ -92,6 +92,43 @@ export function defaultFields(item: Pick<IdentifyQueueItem, "changes">): Identif
   return item.changes.filter(changes).map((change) => change.field);
 }
 
+/**
+ * What Apply accepted would write. Bulk only fills: a field the file has
+ * empty, and artwork for a file without any. An overwrite of a value the
+ * file has, and the sub-genre (an addition to the comment), are written only
+ * from a result's own review, with the user's ticks — so a result that has
+ * either is left out of the bulk write entirely and stays accepted for that
+ * review, rather than being marked applied with them unwritten.
+ */
+export interface BulkPlan {
+  items: { resultId: number; fields: IdentifyField[] }[];
+  /** Fields the items fill, all told. */
+  fields: number;
+  /** Accepted results left for their own review. */
+  leftForReview: number;
+}
+
+export function bulkPlan(
+  accepted: readonly Pick<IdentifyQueueItem, "resultId" | "changes">[],
+  /** Whether the file already has artwork, for results proposing some. */
+  hasArtwork: (resultId: number) => boolean,
+): BulkPlan {
+  const plan: BulkPlan = { items: [], fields: 0, leftForReview: 0 };
+  for (const item of accepted) {
+    const wanted = item.changes.filter(changes);
+    const fills = wanted.filter((change) =>
+      change.field === "artwork" ? !hasArtwork(item.resultId)
+        : change.field !== "subGenre" && change.current.trim() === "");
+    if (fills.length < wanted.length) {
+      plan.leftForReview += 1;
+    } else if (fills.length > 0) {
+      plan.items.push({ resultId: item.resultId, fields: fills.map((change) => change.field) });
+      plan.fields += fills.length;
+    }
+  }
+  return plan;
+}
+
 /** "Artist – Title", or whichever of the two the file has. */
 export function trackName(item: Pick<IdentifyQueueItem, "artist" | "title" | "path">): string {
   const name = [item.artist, item.title].filter((part) => part.trim() !== "").join(" – ");
