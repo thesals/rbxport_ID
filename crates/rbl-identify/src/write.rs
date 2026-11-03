@@ -413,20 +413,53 @@ pub(crate) fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
         // Best effort: the tags are what matter.
         let _ = staged.as_file().set_times(std::fs::FileTimes::new().set_created(created));
     }
-    staged.persist(path).map_err(|e| {
-        let locked = matches!(e.error.raw_os_error(), Some(5 | 32 | 33))
-            || e.error.kind() == std::io::ErrorKind::PermissionDenied;
-        if locked {
-            refuse("The file is open in another program (a player, or rekordbox). Close it and try again.")
-        } else {
-            refuse(format!("The file could not be replaced: {}", e.error))
-        }
-    })?;
+    staged.persist(path).map_err(|e| replace_error(&e.error, held_open(path)))?;
     #[cfg(unix)]
     if let Ok(dir) = std::fs::File::open(parent) {
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+/// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION`: another program
+/// has the file open (or part of it locked).
+const SHARING_VIOLATION: i32 = 32;
+const LOCK_VIOLATION: i32 = 33;
+
+/// Why renaming the staged file over the track failed, in the user's terms:
+/// only a sharing or lock violation is "open in another program". Windows
+/// answers a rename over a file another program holds open with ACCESS
+/// DENIED rather than a sharing violation, so access denied counts as open
+/// elsewhere only when `held_open` (a probe that hit a sharing violation)
+/// says so; otherwise it is a read-only file or missing rights, said as such.
+fn replace_error(e: &std::io::Error, held_open: bool) -> IdentifyError {
+    let open_elsewhere = || refuse("The file is open in another program (a player, or rekordbox). Close it and try again.");
+    match e.raw_os_error() {
+        Some(SHARING_VIOLATION | LOCK_VIOLATION) => open_elsewhere(),
+        _ if e.kind() == std::io::ErrorKind::PermissionDenied && held_open => open_elsewhere(),
+        _ if e.kind() == std::io::ErrorKind::PermissionDenied => refuse(
+            "The file could not be replaced: access was denied. It may be read-only, or you may not have permission \
+             to change it or its folder.",
+        ),
+        _ => refuse(format!("The file could not be replaced: {e}")),
+    }
+}
+
+/// Whether another program has `path` open: opening it with no sharing at
+/// all fails with a sharing violation exactly then. Windows only; elsewhere
+/// an open file never blocks the rename.
+fn held_open(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let probe = std::fs::OpenOptions::new().read(true).share_mode(0).open(path);
+        matches!(probe.map_err(|e| e.raw_os_error()), Err(Some(SHARING_VIOLATION | LOCK_VIOLATION)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 // ------------------------------------------------------------------ lofty
@@ -1127,6 +1160,34 @@ pub fn undo_result(store: &Store, result: ResultId) -> Result<Undone> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_sharing_and_lock_violations_read_as_open_elsewhere() {
+        let text = |e: std::io::Error, held: bool| replace_error(&e, held).to_string();
+        for code in [SHARING_VIOLATION, LOCK_VIOLATION] {
+            assert!(text(std::io::Error::from_raw_os_error(code), false).contains("open in another program"), "{code}");
+        }
+        let denied = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let plain = text(denied(), false);
+        assert!(plain.contains("access was denied") && !plain.contains("open in another program"), "{plain}");
+        assert!(text(denied(), true).contains("open in another program"), "denied because a player holds it");
+        assert!(text(std::io::Error::other("disk full"), true).contains("disk full"));
+    }
+
+    #[test]
+    fn a_file_nobody_holds_is_not_reported_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mp3");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!held_open(&file));
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            let player = std::fs::OpenOptions::new().read(true).share_mode(1).open(&file).unwrap();
+            assert!(held_open(&file));
+            drop(player);
+        }
+    }
 
     #[test]
     fn only_our_exact_temp_names_match() {
