@@ -1272,14 +1272,22 @@ pub enum Retried {
     /// and the result is back in review with the warning, which says why.
     /// `returned` is whether the result's state changed.
     Dropped { warning: String, returned: bool },
+    /// It is no longer the result's waiting write (cancelled, replaced, or
+    /// already made by another pass): nothing was tried.
+    NoLongerWaiting,
 }
 
 /// Tries a waiting write again, through exactly [`apply_result`]'s path and
 /// checks: the file must still hold, in every field to write, the value the
-/// review saw. Stops, still waiting, once `deadline` passes, before the
-/// file is changed. A store failure is the only error; the waiting write is
-/// then kept.
+/// review saw. `waiting` is only which one to try: it is read again here,
+/// and tried only while it is still the result's waiting write, with the
+/// fields it holds now ([`Retried::NoLongerWaiting`] otherwise). Stops,
+/// still waiting, once `deadline` passes, before the file is changed. A
+/// store failure is the only error; the waiting write is then kept.
 pub fn retry_waiting(store: &Store, waiting: &WaitingWrite, deadline: Deadline<'_>) -> Result<Retried> {
+    let Some(waiting) = store.waiting_write(waiting.result)?.filter(|w| w.id == waiting.id) else {
+        return Ok(Retried::NoLongerWaiting);
+    };
     if deadline.passed() {
         return Ok(Retried::StillWaiting(out_of_time().to_string()));
     }
@@ -1418,7 +1426,7 @@ mod tests {
     // ------------------------------------------------- waiting writes
 
     use crate::model::{Decision, ExistingTags, Proposal};
-    use crate::store::ResultId;
+    use crate::store::{Filter, ResultId};
     use std::time::Duration;
 
     /// `secs` seconds of silent 16-bit mono WAV.
@@ -1458,6 +1466,39 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with(TEMP_PREFIX))
             .collect()
+    }
+
+    /// A pass that read the list before the user cancelled (and accepted
+    /// again with fewer fields) never writes the stale one: it is skipped
+    /// quietly, and the current one is written with its own fields.
+    #[test]
+    fn a_stale_waiting_write_is_skipped_after_a_cancel_and_a_new_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("a.wav");
+        wav(&audio, 1);
+        let original = std::fs::read(&audio).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let result = reviewed(&store, &audio);
+        store.defer_write(result, &[Field::Title, Field::CatalogNumber], OPEN_ELSEWHERE).unwrap();
+        let stale = store.waiting_writes().unwrap().remove(0);
+
+        store.cancel_waiting(result).unwrap();
+        assert_eq!(retry_waiting(&store, &stale, Deadline::NONE).unwrap(), Retried::NoLongerWaiting);
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "a cancelled write is never made");
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Pending);
+
+        // Accepted again with only the catalog number, the file still held.
+        store.defer_write(result, &[Field::CatalogNumber], OPEN_ELSEWHERE).unwrap();
+        assert_eq!(retry_waiting(&store, &stale, Deadline::NONE).unwrap(), Retried::NoLongerWaiting);
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        let fresh = store.waiting_write(result).unwrap().unwrap();
+        assert_eq!(fresh.fields, [Field::CatalogNumber]);
+        assert!(matches!(retry_waiting(&store, &fresh, Deadline::NONE).unwrap(), Retried::Written(_)));
+        let now = tags::read(&audio).unwrap().snapshot;
+        assert_eq!((current(&now, Field::CatalogNumber).as_str(), current(&now, Field::Title).as_str()), ("CAT001", ""));
+        // A second pass holding the same (now made) write skips it quietly.
+        assert_eq!(retry_waiting(&store, &fresh, Deadline::NONE).unwrap(), Retried::NoLongerWaiting);
+        assert_eq!(store.count(Filter::Waiting).unwrap(), 0);
     }
 
     /// A clock that moves one second each time it is read.
@@ -1513,7 +1554,7 @@ mod tests {
                     assert_eq!(store.waiting_write(result).unwrap(), None);
                     return;
                 }
-                other @ Retried::Dropped { .. } => panic!("budget {budget}: {other:?}"),
+                other @ (Retried::Dropped { .. } | Retried::NoLongerWaiting) => panic!("budget {budget}: {other:?}"),
             }
         }
         panic!("never written");

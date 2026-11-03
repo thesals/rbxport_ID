@@ -393,6 +393,9 @@ impl IdentifyState {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
+            // Read again under the lock: only the result's waiting write as
+            // it is now is tried (one cancelled or replaced meanwhile, or
+            // made by an overlapping pass, is skipped quietly).
             let tried = self.with_store_until(deadline, true, |store| {
                 Ok(rbl_identify::write::retry_waiting(store, waiting, self.deadline(deadline)).map_err(store_error))
             });
@@ -409,6 +412,7 @@ impl IdentifyState {
                     }
                     IdentifyWriteOutcomeDto::failed(waiting.result, warning)
                 }
+                Some(Ok(Ok(Retried::NoLongerWaiting))) => continue,
                 Some(Ok(Err(e)) | Err(e)) => IdentifyWriteOutcomeDto::failed(waiting.result, message_of(&e)),
             };
             outcomes.push(outcome);
@@ -2761,6 +2765,40 @@ mod tests {
         changed.sort_unstable();
         assert_eq!(changed, [waiting, asked]);
         assert_eq!(identify.detail(waiting).unwrap().item.state, "applied");
+    }
+
+    /// Two passes at once (Retry now during the start pass, say) make each
+    /// waiting write once, and neither reports a false error.
+    #[cfg(windows)]
+    #[test]
+    fn overlapping_passes_write_each_waiting_write_once_without_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let identify = Arc::new(IdentifyState::with_root(dir.path().join("identify")));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let mut results = Vec::new();
+        for n in 0..6 {
+            let audio = dir.path().join(format!("track{n}.wav"));
+            wav(&audio);
+            let result = identified(&identify, &audio, &n.to_string(), title.clone());
+            let held = hold(&audio, FILE_SHARE_READ);
+            assert!(identify.apply_items(&ticked(result, &["title"]))[0].deferred);
+            drop(held);
+            results.push(result);
+        }
+        let passes: Vec<_> = (0..2)
+            .map(|_| {
+                let identify = Arc::clone(&identify);
+                std::thread::spawn(move || identify.retry_waiting(None, &[]).0)
+            })
+            .collect();
+        let outcomes: Vec<IdentifyWriteOutcomeDto> = passes.into_iter().flat_map(|p| p.join().unwrap()).collect();
+        assert!(outcomes.iter().all(|o| o.ok), "no false errors: {outcomes:?}");
+        let mut written: Vec<ResultId> = outcomes.iter().map(|o| o.result_id).collect();
+        written.sort_unstable();
+        assert_eq!(written, results, "each one written exactly once");
+        for result in results {
+            assert_eq!(identify.detail(result).unwrap().item.state, "applied");
+        }
     }
 
     /// The exit pass is bounded: with no time left nothing is tried and the
