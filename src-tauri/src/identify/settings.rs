@@ -223,19 +223,26 @@ impl Sources {
     /// The non-secret settings; the defaults when the file is absent or
     /// unreadable, a threshold out of range brought back into it.
     pub(crate) fn stored(&self) -> Stored {
-        let path = self.settings_json();
-        let mut stored = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<Stored>(&bytes).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "identify: settings.json is unreadable; using the defaults");
-                Stored::default()
-            }),
-            Err(_) => Stored::default(),
+        self.read_stored().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "identify: settings.json is unreadable; using the defaults");
+            Stored::default()
+        })
+    }
+
+    /// `settings.json` as saved (the defaults when there is none), a
+    /// threshold out of range brought back into it; an error when the file
+    /// is there but cannot be read or parsed.
+    fn read_stored(&self) -> Result<Stored, String> {
+        let mut stored = match std::fs::read(self.settings_json()) {
+            Ok(bytes) => serde_json::from_slice::<Stored>(&bytes).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stored::default(),
+            Err(e) => return Err(e.to_string()),
         };
         if !stored.auto_apply_threshold.is_finite() {
             stored.auto_apply_threshold = AUTO_APPLY_THRESHOLD;
         }
         stored.auto_apply_threshold = stored.auto_apply_threshold.clamp(AUTO_APPLY_THRESHOLD, 1.0);
-        stored
+        Ok(stored)
     }
 
     pub(crate) fn dto(&self) -> IdentifySettingsDto {
@@ -257,6 +264,10 @@ impl Sources {
     /// written when any part is refused. `before_write` runs once, just
     /// before the first file is written, so a caller holding state built
     /// from the old settings can drop it even if a later write fails.
+    ///
+    /// `settings.json` is rewritten only when a non-secret setting changes,
+    /// and then refused (never reset to the defaults) when the file there
+    /// cannot be read.
     pub(crate) fn save(&self, update: &IdentifySettingsUpdateDto, before_write: impl FnOnce()) -> AppResult<()> {
         if let Some(t) = update.auto_apply_threshold {
             if !valid_threshold(t) {
@@ -273,17 +284,32 @@ impl Sources {
             let agent = agent.trim();
             changes.push((MB_USER_AGENT, (!agent.is_empty()).then(|| agent.to_owned())));
         }
-        let mut stored = self.stored();
-        if let Some(policy) = update.genre_policy {
-            stored.genre_policy = policy;
-        }
-        if let Some(on) = update.auto_apply {
-            stored.auto_apply = on;
-        }
-        if let Some(t) = update.auto_apply_threshold {
-            stored.auto_apply_threshold = t;
-        }
-        let json = Some(serde_json::to_vec_pretty(&stored).map_err(|e| AppError::internal(format!("identify settings: {e}")))?);
+        let non_secret = update.genre_policy.is_some() || update.auto_apply.is_some() || update.auto_apply_threshold.is_some();
+        let json = if non_secret {
+            let mut stored = self.read_stored().map_err(|e| {
+                AppError::new(
+                    ErrorKind::Malformed,
+                    format!(
+                        "The identification settings file {} cannot be read, so it was not changed. Fix or delete it, \
+                         then save again.",
+                        self.settings_json().display()
+                    ),
+                )
+                .with_detail(e)
+            })?;
+            if let Some(policy) = update.genre_policy {
+                stored.genre_policy = policy;
+            }
+            if let Some(on) = update.auto_apply {
+                stored.auto_apply = on;
+            }
+            if let Some(t) = update.auto_apply_threshold {
+                stored.auto_apply_threshold = t;
+            }
+            Some(serde_json::to_vec_pretty(&stored).map_err(|e| AppError::internal(format!("identify settings: {e}")))?)
+        } else {
+            None
+        };
 
         // Everything is checked (and the new file built) before anything is
         // written.
@@ -562,11 +588,27 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_settings_json_is_refused_not_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sources(dir.path(), &[], Vec::new());
+        std::fs::write(dir.path().join(SETTINGS_FILE), "{ hand edited").unwrap();
+        let error = s.save(&update(r#"{"autoApply":true}"#), || panic!("nothing is written")).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Malformed);
+        assert!(error.message.contains(SETTINGS_FILE), "{}", error.message);
+        assert_eq!(std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap(), "{ hand edited");
+        // A key alone is saved, and leaves the file as it is.
+        s.save(&update(r#"{"acoustidKey":"k"}"#), || {}).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap(), "{ hand edited");
+        assert_eq!(s.resolve(ACOUSTID_KEY).map(|r| r.1), Some(KeySource::Settings));
+    }
+
+    #[test]
     fn before_write_runs_once_before_any_write_and_not_for_a_refusal() {
         let dir = tempfile::tempdir().unwrap();
         let s = sources(dir.path(), &[], Vec::new());
         let calls = std::cell::Cell::new(0);
         s.save(&update(r#"{"autoApplyThreshold":0.1}"#), || calls.set(calls.get() + 1)).unwrap_err();
+        s.save(&update("{}"), || calls.set(calls.get() + 1)).unwrap();
         assert_eq!(calls.get(), 0);
         s.save(&update(r#"{"autoApply":true,"acoustidKey":"k"}"#), || {
             assert!(!dir.path().join(SETTINGS_FILE).exists() && !s.env_file().exists(), "before anything is written");
