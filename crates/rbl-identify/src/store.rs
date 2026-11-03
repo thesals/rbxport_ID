@@ -35,6 +35,12 @@
 //! of version 2 (`library_snapshot`, `library_after`) are kept for writes
 //! an older build recorded, but nothing writes them any more.
 //!
+//! Version 4 adds waiting writes ([`WaitingWrite`]): a write refused
+//! because another program had the file open is kept, with the fields to
+//! write, and made once the file is free. Its result stays `Accepted`
+//! meanwhile. Like every record of a write it is insert-only: a waiting
+//! write and the row saying how it ended are never changed.
+//!
 //! Snapshots are taken only for writes, not for every track scanned: the raw
 //! ID3 block includes embedded artwork, and a whole library of those would
 //! run to gigabytes. They are stored as JSON for the parsed values and as
@@ -59,7 +65,7 @@ use crate::pipeline::TrackResult;
 
 /// The schema this build creates and understands, kept in
 /// `PRAGMA user_version`. A newer file is refused rather than guessed at.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// `PRAGMA application_id` of an identify store ("RBID"), so a SQLite file
 /// that belongs to something else is recognised and refused.
@@ -251,12 +257,94 @@ WHEN EXISTS (SELECT 1 FROM rekordbox_imports WHERE result_id = NEW.result_id)
 BEGIN SELECT RAISE(ABORT, 'an imported rekordbox record is a permanent record'); END;
 ";
 
+/// Version 4, on top of version 3: waiting writes. Insert-only.
+const SCHEMA_V4: &str = r"
+-- A write refused because another program had the file open, kept to be
+-- made once the file is free: the result and exactly the fields to write
+-- (the ones the user ticked, or auto-apply chose). Its result stays Accepted
+-- meanwhile. One row each, never updated or deleted; how it ended is in
+-- waiting_write_ends, and none there means it is still waiting. A result has
+-- at most one waiting write at a time.
+CREATE TABLE waiting_writes (
+    id           INTEGER PRIMARY KEY,
+    result_id    INTEGER NOT NULL REFERENCES results(id),
+    -- Vec<Field>, JSON.
+    fields_json  TEXT    NOT NULL,
+    -- Why it is waiting, in the user's terms.
+    reason       TEXT    NOT NULL,
+    since_unix   INTEGER NOT NULL
+);
+CREATE INDEX waiting_writes_result ON waiting_writes(result_id);
+CREATE TRIGGER waiting_writes_never_update BEFORE UPDATE ON waiting_writes
+BEGIN SELECT RAISE(ABORT, 'a waiting write is a permanent record'); END;
+CREATE TRIGGER waiting_writes_never_delete BEFORE DELETE ON waiting_writes
+BEGIN SELECT RAISE(ABORT, 'a waiting write is a permanent record'); END;
+CREATE TRIGGER waiting_writes_never_replace BEFORE INSERT ON waiting_writes
+WHEN EXISTS (SELECT 1 FROM waiting_writes WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a waiting write is a permanent record'); END;
+
+-- How a waiting write ended: 'written' (made), 'dropped' (refused when it
+-- was tried, or its result went back to review), 'cancelled' (by the user)
+-- or 'superseded' (a newer waiting write for the same result). One row
+-- each, never updated or deleted.
+CREATE TABLE waiting_write_ends (
+    waiting_id  INTEGER PRIMARY KEY REFERENCES waiting_writes(id),
+    outcome     TEXT    NOT NULL CHECK (outcome IN ('written', 'dropped', 'cancelled', 'superseded')),
+    reason      TEXT,
+    ended_unix  INTEGER NOT NULL
+);
+CREATE TRIGGER waiting_write_ends_never_update BEFORE UPDATE ON waiting_write_ends
+BEGIN SELECT RAISE(ABORT, 'a waiting write outcome is a permanent record'); END;
+CREATE TRIGGER waiting_write_ends_never_delete BEFORE DELETE ON waiting_write_ends
+BEGIN SELECT RAISE(ABORT, 'a waiting write outcome is a permanent record'); END;
+CREATE TRIGGER waiting_write_ends_never_replace BEFORE INSERT ON waiting_write_ends
+WHEN EXISTS (SELECT 1 FROM waiting_write_ends WHERE waiting_id = NEW.waiting_id)
+BEGIN SELECT RAISE(ABORT, 'a waiting write outcome is a permanent record'); END;
+";
+
 /// A track's row id in the store.
 pub type TrackId = i64;
 /// An identification result's row id in the store.
 pub type ResultId = i64;
 /// The row id of one recorded write.
 pub type ApplicationId = i64;
+/// The row id of one waiting write.
+pub type WaitingId = i64;
+
+/// A write kept until its file is free ([`Store::defer_write`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingWrite {
+    pub id: WaitingId,
+    pub result: ResultId,
+    /// The file, as the track is keyed.
+    pub path: String,
+    /// Exactly the fields to write.
+    pub fields: Vec<Field>,
+    /// Why it is waiting, in the user's terms.
+    pub reason: String,
+    pub since_unix: i64,
+}
+
+/// How a waiting write ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitingEnd {
+    Written,
+    /// Refused when it was tried, or its result went back to review.
+    Dropped,
+    Cancelled,
+    Superseded,
+}
+
+impl WaitingEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Dropped => "dropped",
+            Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
+        }
+    }
+}
 
 /// Which file a track is, and the state it was in when read. Size and
 /// modification time tell a changed file.
@@ -442,6 +530,8 @@ pub enum Filter {
     NeedsReview,
     /// `Applied` and `AutoApplied`: the undoable ones.
     Applied,
+    /// Results with a waiting write, newest first.
+    Waiting,
     All,
 }
 
@@ -452,7 +542,16 @@ impl Filter {
             Self::Unidentified => "r.state = 'Unidentified'",
             Self::NeedsReview => "r.state = 'Pending'",
             Self::Applied => "r.state IN ('Applied', 'AutoApplied')",
+            Self::Waiting => "w.id IS NOT NULL",
             Self::All => "1",
+        }
+    }
+
+    /// The order the filter lists in.
+    fn order(self) -> &'static str {
+        match self {
+            Self::Waiting => "w.since_unix DESC, w.id DESC",
+            _ => "r.score IS NULL, r.score DESC, t.path, r.id",
         }
     }
 }
@@ -478,6 +577,8 @@ pub struct QueueItem {
     /// Where the proposed (best) candidate came from; `None` without a
     /// proposal.
     pub source: Option<CandidateSource>,
+    /// The write waiting for the file to be free; `None` without one.
+    pub waiting: Option<WaitingWrite>,
 }
 
 /// A result in full: its queue row, all its candidates (best first), the
@@ -550,6 +651,14 @@ pub const RECONCILED_UNCHANGED: &str = "reconciled at startup: the file still he
 /// How the abandon reason of an application closed as unknown begins.
 pub const RECONCILED_UNKNOWN: &str = "unknown: reconciled at startup, the file held neither its tags from before the write nor \
      exactly the written ones";
+
+/// The warning a result closed as unknown at startup carries.
+pub const RECONCILED_UNKNOWN_WARNING: &str =
+    "A write to this file was interrupted and what it left could not be told. Check the file's tags.";
+
+/// Why a review change is refused while a write is waiting.
+const WAITING_REFUSAL: &str = "A write to this file is waiting for the file to be closed in the other program. \
+     Cancel the waiting write first.";
 
 /// A file as reconciliation reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,7 +753,17 @@ impl RawApplication {
 
 const QUEUE_COLUMNS: &str = "t.id, r.id, t.path, r.state, r.decision, r.score, t.existing_json, r.proposal_json, r.updated_unix, \
      r.library_track_id, r.library_path, \
-     CASE WHEN r.proposal_json IS NOT NULL THEN json_extract(r.candidates_json, '$[0].candidate.source') END";
+     CASE WHEN r.proposal_json IS NOT NULL THEN json_extract(r.candidates_json, '$[0].candidate.source') END, \
+     w.id, w.since_unix, w.reason, w.fields_json";
+
+/// What [`QUEUE_COLUMNS`] selects from: a result, its track and its
+/// waiting write, if it has one.
+const QUEUE_FROM: &str = "results r JOIN tracks t ON t.id = r.track_id \
+     LEFT JOIN waiting_writes w ON w.result_id = r.id \
+         AND NOT EXISTS (SELECT 1 FROM waiting_write_ends e WHERE e.waiting_id = w.id)";
+
+/// How many columns [`QUEUE_COLUMNS`] selects.
+const QUEUE_COLUMN_COUNT: usize = 16;
 
 fn queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawQueueItem> {
     Ok(RawQueueItem {
@@ -660,6 +779,10 @@ fn queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawQueueItem> {
         library_track_id: row.get(9)?,
         library_path: row.get(10)?,
         source: row.get(11)?,
+        waiting_id: row.get(12)?,
+        waiting_since: row.get(13)?,
+        waiting_reason: row.get(14)?,
+        waiting_fields: row.get(15)?,
     })
 }
 
@@ -677,11 +800,27 @@ struct RawQueueItem {
     library_track_id: Option<String>,
     library_path: Option<String>,
     source: Option<String>,
+    waiting_id: Option<WaitingId>,
+    waiting_since: Option<i64>,
+    waiting_reason: Option<String>,
+    waiting_fields: Option<String>,
 }
 
 impl RawQueueItem {
     fn decode(self) -> Result<QueueItem> {
+        let waiting = match (self.waiting_id, self.waiting_fields) {
+            (Some(id), Some(fields)) => Some(WaitingWrite {
+                id,
+                result: self.result,
+                path: self.path.clone(),
+                fields: from_json(&fields, "waiting fields")?,
+                reason: self.waiting_reason.unwrap_or_default(),
+                since_unix: self.waiting_since.unwrap_or_default(),
+            }),
+            _ => None,
+        };
         Ok(QueueItem {
+            waiting,
             track: self.track,
             result: self.result,
             path: self.path,
@@ -788,6 +927,9 @@ impl Store {
         }
         if from <= 2 {
             tx.execute_batch(SCHEMA_V3).map_err(|e| sql("migrate the schema to version 3", &e))?;
+        }
+        if from <= 3 {
+            tx.execute_batch(SCHEMA_V4).map_err(|e| sql("migrate the schema to version 4", &e))?;
         }
         tx.pragma_update(None, "application_id", APPLICATION_ID).map_err(|e| sql("set the application id", &e))?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(|e| sql("set the schema version", &e))?;
@@ -1055,6 +1197,9 @@ impl Store {
                 "result {result}: a write is in progress; it must be completed or abandoned first"
             )));
         }
+        if open_waiting(&tx, result)?.is_some() {
+            return Err(IdentifyError::Store(WAITING_REFUSAL.to_owned()));
+        }
         if !from.may_become(state) {
             return Err(IdentifyError::Store(format!(
                 "result {result} cannot go from {} to {}",
@@ -1186,6 +1331,7 @@ impl Store {
         )
         .map_err(|e| sql("update the track", &e))?;
         set_state_unchecked(&tx, result, to)?;
+        end_waiting(&tx, result, WaitingEnd::Written, None)?;
         tx.commit().map_err(|e| sql("commit the outcome", &e))
     }
 
@@ -1285,7 +1431,7 @@ impl Store {
                 }
                 FileNow::Read { .. } => "the file's tags are neither the ones from before the write nor the written ones".to_owned(),
             };
-            self.close_unknown(&application, &unknown)?;
+            self.close_unknown(&application, &unknown, RECONCILED_UNKNOWN_WARNING)?;
             outcomes.push(Reconciliation::Unknown { application: id, reason: unknown });
         }
         Ok(outcomes)
@@ -1293,22 +1439,17 @@ impl Store {
 
     /// Closes an open application as unknown and returns its result to
     /// review: pending, and an auto-apply decided `Review`.
-    fn close_unknown(&self, application: &Application, why: &str) -> Result<()> {
-        self.abandon_application(application.id, &format!("{RECONCILED_UNKNOWN} ({why})"))?;
-        let reason = "A write to this file was interrupted and what it left could not be told. Check the file's tags.";
-        let (item, ..) = self.result(application.result)?.ok_or_else(|| IdentifyError::Store("no result".to_owned()))?;
-        let current: bool = self
-            .conn
-            .query_row("SELECT is_current FROM results WHERE id = ?1", [application.result], |r| r.get(0))
-            .map_err(|e| sql("read the result", &e))?;
-        if !current || item.state != ReviewState::Accepted {
-            return Ok(());
-        }
-        if item.decision == Decision::AutoApply {
-            self.demote_auto_apply(application.result, reason)
-        } else {
-            self.set_state(application.result, ReviewState::Pending)
-        }
+    fn close_unknown(&self, application: &Application, why: &str, warning: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        open_application(&tx, application.id)?;
+        tx.execute(
+            "INSERT INTO application_outcomes (application_id, outcome, reason, completed_unix)
+             VALUES (?1, 'abandoned', ?2, ?3)",
+            params![application.id, format!("{RECONCILED_UNKNOWN} ({why})"), now_unix()],
+        )
+        .map_err(|e| sql("record the outcome", &e))?;
+        return_to_review(&tx, application.result, Some(warning))?;
+        tx.commit().map_err(|e| sql("commit the outcome", &e))
     }
 
     /// [`Store::reconcile_open_applications`] reading each file's tags from
@@ -1367,11 +1508,12 @@ impl Store {
     /// by path.
     pub fn list(&self, filter: Filter, offset: u32, limit: u32) -> Result<Vec<QueueItem>> {
         let query = format!(
-            "SELECT {QUEUE_COLUMNS} FROM results r JOIN tracks t ON t.id = r.track_id
+            "SELECT {QUEUE_COLUMNS} FROM {QUEUE_FROM}
              WHERE r.is_current = 1 AND {}
-             ORDER BY r.score IS NULL, r.score DESC, t.path, r.id
+             ORDER BY {}
              LIMIT ?1 OFFSET ?2",
-            filter.condition()
+            filter.condition(),
+            filter.order()
         );
         let mut stmt = self.conn.prepare(&query).map_err(|e| sql("list the queue", &e))?;
         let rows = stmt
@@ -1384,7 +1526,7 @@ impl Store {
 
     /// How many current results the filter takes.
     pub fn count(&self, filter: Filter) -> Result<u64> {
-        let query = format!("SELECT COUNT(*) FROM results r WHERE r.is_current = 1 AND {}", filter.condition());
+        let query = format!("SELECT COUNT(*) FROM {QUEUE_FROM} WHERE r.is_current = 1 AND {}", filter.condition());
         let n: i64 = self.conn.query_row(&query, [], |r| r.get(0)).map_err(|e| sql("count the queue", &e))?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
@@ -1394,12 +1536,13 @@ impl Store {
     pub fn result(&self, id: ResultId) -> Result<Option<ResultDetail>> {
         let query = format!(
             "SELECT {QUEUE_COLUMNS}, r.candidates_json, r.enrichment_json, r.warnings_json
-             FROM results r JOIN tracks t ON t.id = r.track_id WHERE r.id = ?1"
+             FROM {QUEUE_FROM} WHERE r.id = ?1"
         );
+        let at = QUEUE_COLUMN_COUNT;
         let row = self
             .conn
             .query_row(&query, [id], |r| {
-                Ok((queue_item(r)?, r.get::<_, String>(12)?, r.get::<_, Option<String>>(13)?, r.get::<_, String>(14)?))
+                Ok((queue_item(r)?, r.get::<_, String>(at)?, r.get::<_, Option<String>>(at + 1)?, r.get::<_, String>(at + 2)?))
             })
             .optional()
             .map_err(|e| sql("read the result", &e))?;
@@ -1447,6 +1590,9 @@ impl Store {
                 "result {result}: a write is in progress; it must be completed or abandoned first"
             )));
         }
+        if open_waiting(&tx, result)?.is_some() {
+            return Err(IdentifyError::Store(WAITING_REFUSAL.to_owned()));
+        }
         let mut proposal: Proposal = match proposal {
             Some(json) => from_json(&json, "proposal")?,
             None => return Err(IdentifyError::Store(format!("result {result} has no proposal to edit"))),
@@ -1488,10 +1634,8 @@ impl Store {
     pub fn demote_auto_apply(&self, result: ResultId, reason: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
         let from = current_state(&tx, result)?;
-        let (track, decision, warnings): (TrackId, String, String) = tx
-            .query_row("SELECT track_id, decision, warnings_json FROM results WHERE id = ?1", [result], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
+        let (track, decision): (TrackId, String) = tx
+            .query_row("SELECT track_id, decision FROM results WHERE id = ?1", [result], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(|e| sql("read the result", &e))?;
         if from != ReviewState::Accepted || parse_decision(&decision)? != Decision::AutoApply {
             return Err(IdentifyError::Store(format!("result {result} is not an unwritten auto-apply")));
@@ -1501,13 +1645,7 @@ impl Store {
                 "result {result}: a write is in progress; it must be completed or abandoned first"
             )));
         }
-        let mut warnings: Vec<String> = from_json(&warnings, "warnings")?;
-        warnings.push(reason.to_owned());
-        tx.execute(
-            "UPDATE results SET decision = 'Review', state = 'Pending', warnings_json = ?2, updated_unix = ?3 WHERE id = ?1",
-            params![result, to_json(&warnings, "warnings")?, now_unix()],
-        )
-        .map_err(|e| sql("demote the auto-apply", &e))?;
+        return_to_review(&tx, result, Some(reason))?;
         tx.commit().map_err(|e| sql("commit the demotion", &e))
     }
 
@@ -1538,6 +1676,117 @@ impl Store {
         }
         tx.commit().map_err(|e| sql("commit the accepts", &e))?;
         Ok(ids)
+    }
+
+    /// Keeps a write refused because another program has the file open, to
+    /// be made once it is free: the result (current, `Pending` or
+    /// `Accepted`; a pending one is accepted) and exactly the `fields` to
+    /// write, with `reason`. A result keeps one waiting write: one already
+    /// waiting with the same fields is kept as it is (its time too), one
+    /// with other fields is superseded. Refused while the track has a write
+    /// open. Returns the waiting write's id.
+    pub fn defer_write(&self, result: ResultId, fields: &[Field], reason: &str) -> Result<WaitingId> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let from = current_state(&tx, result)?;
+        if !matches!(from, ReviewState::Pending | ReviewState::Accepted) {
+            return Err(IdentifyError::Store(format!("result {result} is {}; it cannot wait to be written", from.as_str())));
+        }
+        let track: TrackId = tx
+            .query_row("SELECT track_id FROM results WHERE id = ?1", [result], |r| r.get(0))
+            .map_err(|e| sql("read the result", &e))?;
+        if has_open_application(&tx, track)? {
+            return Err(IdentifyError::Store(format!(
+                "result {result}: a write is in progress; it must be completed or abandoned first"
+            )));
+        }
+        if from == ReviewState::Pending {
+            set_state_unchecked(&tx, result, ReviewState::Accepted)?;
+        }
+        if let Some(existing) = open_waiting(&tx, result)? {
+            if existing.fields == fields {
+                tx.commit().map_err(|e| sql("commit the waiting write", &e))?;
+                return Ok(existing.id);
+            }
+            end_waiting(&tx, result, WaitingEnd::Superseded, None)?;
+        }
+        let id = tx
+            .query_row(
+                "INSERT INTO waiting_writes (result_id, fields_json, reason, since_unix) VALUES (?1, ?2, ?3, ?4) RETURNING id",
+                params![result, to_json(fields, "waiting fields")?, reason, now_unix()],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql("record the waiting write", &e))?;
+        tx.commit().map_err(|e| sql("commit the waiting write", &e))?;
+        Ok(id)
+    }
+
+    /// Every write still waiting, oldest first.
+    pub fn waiting_writes(&self) -> Result<Vec<WaitingWrite>> {
+        type Row = (WaitingId, ResultId, String, String, String, i64);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT w.id, w.result_id, t.path, w.fields_json, w.reason, w.since_unix
+                 FROM waiting_writes w JOIN results r ON r.id = w.result_id JOIN tracks t ON t.id = r.track_id
+                 WHERE NOT EXISTS (SELECT 1 FROM waiting_write_ends e WHERE e.waiting_id = w.id)
+                 ORDER BY w.id",
+            )
+            .map_err(|e| sql("read the waiting writes", &e))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .map_err(|e| sql("read the waiting writes", &e))?
+            .collect::<rusqlite::Result<Vec<Row>>>()
+            .map_err(|e| sql("read the waiting writes", &e))?;
+        rows.into_iter()
+            .map(|(id, result, path, fields, reason, since_unix)| {
+                Ok(WaitingWrite { id, result, path, fields: from_json(&fields, "waiting fields")?, reason, since_unix })
+            })
+            .collect()
+    }
+
+    /// The write waiting for this result, if there is one.
+    pub fn waiting_write(&self, result: ResultId) -> Result<Option<WaitingWrite>> {
+        open_waiting(&self.conn, result)
+    }
+
+    /// Ends a result's waiting write unmade because it was refused when it
+    /// was tried (`warning` says why), and returns the result to review:
+    /// `Pending`, an auto-apply decided `Review`, `warning` added to its
+    /// warnings. A result that is no longer current or accepted, or whose
+    /// track has a write open, keeps its state. Returns whether the result's
+    /// state changed.
+    pub fn drop_waiting(&self, result: ResultId, warning: &str) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        if open_waiting(&tx, result)?.is_none() {
+            return Err(IdentifyError::Store(format!("result {result} has no waiting write")));
+        }
+        let changed = is_reviewable_again(&tx, result)?;
+        if changed {
+            return_to_review(&tx, result, Some(warning))?;
+        } else {
+            end_waiting(&tx, result, WaitingEnd::Dropped, Some(warning))?;
+        }
+        tx.commit().map_err(|e| sql("commit the dropped write", &e))?;
+        Ok(changed)
+    }
+
+    /// The user cancels a result's waiting write: it ends unmade and the
+    /// result goes back to review (`Pending`, an auto-apply decided
+    /// `Review`). Refused when it has none, and while its track has a write
+    /// open.
+    pub fn cancel_waiting(&self, result: ResultId) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        if open_waiting(&tx, result)?.is_none() {
+            return Err(IdentifyError::Store(format!("result {result} has no waiting write")));
+        }
+        if !is_reviewable_again(&tx, result)? {
+            return Err(IdentifyError::Store(format!(
+                "result {result}: a write is in progress; it must be completed or abandoned first"
+            )));
+        }
+        end_waiting(&tx, result, WaitingEnd::Cancelled, None)?;
+        return_to_review(&tx, result, None)?;
+        tx.commit().map_err(|e| sql("commit the cancel", &e))
     }
 
     /// The rekordbox record imported with a result; `None` for a result
@@ -1640,6 +1889,21 @@ fn save_result(conn: &Connection, id: TrackId, new: &NewResult<'_>, allow_replac
     if has_open_application(conn, id)? {
         return Err(IdentifyError::Store(format!(
             "track {id} has a write in progress; complete or abandon it before identifying again"
+        )));
+    }
+    let waiting: Option<WaitingId> = conn
+        .query_row(
+            "SELECT w.id FROM waiting_writes w JOIN results r ON r.id = w.result_id
+             WHERE r.track_id = ?1 AND NOT EXISTS (SELECT 1 FROM waiting_write_ends e WHERE e.waiting_id = w.id)
+             LIMIT 1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| sql("read the waiting writes", &e))?;
+    if waiting.is_some() {
+        return Err(IdentifyError::Store(format!(
+            "track {id} has a write waiting for the file to be closed; cancel it before identifying again"
         )));
     }
     if let Some(state) = current.as_deref().map(ReviewState::parse).transpose()? {
@@ -1753,6 +2017,81 @@ fn has_open_application(conn: &Connection, track: TrackId) -> Result<bool> {
     .optional()
     .map(|r| r.is_some())
     .map_err(|e| sql("read the applications", &e))
+}
+
+/// A result's write still waiting, if it has one.
+fn open_waiting(conn: &Connection, result: ResultId) -> Result<Option<WaitingWrite>> {
+    let row: Option<(WaitingId, String, String, String, i64)> = conn
+        .query_row(
+            "SELECT w.id, t.path, w.fields_json, w.reason, w.since_unix
+             FROM waiting_writes w JOIN results r ON r.id = w.result_id JOIN tracks t ON t.id = r.track_id
+             WHERE w.result_id = ?1 AND NOT EXISTS (SELECT 1 FROM waiting_write_ends e WHERE e.waiting_id = w.id)
+             ORDER BY w.id DESC LIMIT 1",
+            [result],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()
+        .map_err(|e| sql("read the waiting write", &e))?;
+    row.map(|(id, path, fields, reason, since_unix)| {
+        Ok(WaitingWrite { id, result, path, fields: from_json(&fields, "waiting fields")?, reason, since_unix })
+    })
+    .transpose()
+}
+
+/// Ends every write still waiting for `result` as `outcome`.
+fn end_waiting(conn: &Connection, result: ResultId, outcome: WaitingEnd, reason: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO waiting_write_ends (waiting_id, outcome, reason, ended_unix)
+         SELECT w.id, ?2, ?3, ?4 FROM waiting_writes w
+         WHERE w.result_id = ?1 AND NOT EXISTS (SELECT 1 FROM waiting_write_ends e WHERE e.waiting_id = w.id)",
+        params![result, outcome.as_str(), reason, now_unix()],
+    )
+    .map_err(|e| sql("end the waiting write", &e))?;
+    Ok(())
+}
+
+/// Whether a result may go back to review: current, `Accepted`, and its
+/// track has no write open.
+fn is_reviewable_again(conn: &Connection, result: ResultId) -> Result<bool> {
+    let row: Option<(String, bool, TrackId)> = conn
+        .query_row("SELECT state, is_current, track_id FROM results WHERE id = ?1", [result], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()
+        .map_err(|e| sql("read the result", &e))?;
+    let Some((state, current, track)) = row else { return Ok(false) };
+    Ok(current && ReviewState::parse(&state)? == ReviewState::Accepted && !has_open_application(conn, track)?)
+}
+
+/// Returns a result that was going to be written to review, inside the
+/// caller's transaction: `Pending`, an auto-apply decided `Review` (a later
+/// write is then the user's, recorded `Applied`), `warning` (if any) added
+/// to its warnings, and any waiting write ended as dropped. A result that
+/// is not current or not `Accepted` keeps its state.
+fn return_to_review(conn: &Connection, result: ResultId, warning: Option<&str>) -> Result<()> {
+    end_waiting(conn, result, WaitingEnd::Dropped, warning)?;
+    let row: Option<(String, bool, String)> = conn
+        .query_row("SELECT state, is_current, warnings_json FROM results WHERE id = ?1", [result], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()
+        .map_err(|e| sql("read the result", &e))?;
+    let Some((state, true, warnings)) = row else { return Ok(()) };
+    if ReviewState::parse(&state)? != ReviewState::Accepted {
+        return Ok(());
+    }
+    let mut warnings: Vec<String> = from_json(&warnings, "warnings")?;
+    if let Some(warning) = warning {
+        warnings.push(warning.to_owned());
+    }
+    conn.execute(
+        "UPDATE results SET state = 'Pending', warnings_json = ?2, updated_unix = ?3,
+                decision = CASE decision WHEN 'AutoApply' THEN 'Review' ELSE decision END
+         WHERE id = ?1",
+        params![result, to_json(&warnings, "warnings")?, now_unix()],
+    )
+    .map_err(|e| sql("return the result to review", &e))?;
+    Ok(())
 }
 
 /// An application that exists and has no outcome yet: its result, track and
@@ -2450,7 +2789,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(store.has_table("rekordbox_imports").unwrap());
         let (_, old) = store.save_track_result(&key("a.mp3"), &track_result(None, None), None, false).unwrap();
         assert_eq!(store.rekordbox_record(old).unwrap(), None);
@@ -3016,5 +3355,114 @@ mod tests {
         }
         let bad = from_json::<ExistingTags>(r#"{"artist": 5, "title": "SECRET-TAG"}"#, "existing tags").unwrap_err();
         assert!(!bad.to_string().contains("SECRET"), "{bad}");
+    }
+
+    #[test]
+    fn a_version_3_store_gains_waiting_writes_and_keeps_its_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identify.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 4);
+        assert!(store.has_table("waiting_writes").unwrap() && store.has_table("waiting_write_ends").unwrap());
+        let (_, result) = reviewed(&store, "a.mp3", 0.8);
+        assert_eq!(store.waiting_writes().unwrap(), []);
+        assert_eq!(store.result(result).unwrap().unwrap().0.waiting, None);
+    }
+
+    #[test]
+    fn a_deferred_write_waits_accepted_and_shows_in_the_queue() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, first) = reviewed(&store, "a.mp3", 0.8);
+        let (_, second) = reviewed(&store, "b.mp3", 0.9);
+        reviewed(&store, "c.mp3", 0.95);
+        let id = store.defer_write(first, &[Field::Label], "open elsewhere").unwrap();
+        let (item, ..) = store.result(first).unwrap().unwrap();
+        assert_eq!(item.state, ReviewState::Accepted, "a pending result is accepted");
+        let waiting = item.waiting.unwrap();
+        assert_eq!((waiting.id, waiting.fields.as_slice(), waiting.reason.as_str()), (id, &[Field::Label][..], "open elsewhere"));
+        // The same fields again keep the waiting write; others supersede it.
+        assert_eq!(store.defer_write(first, &[Field::Label], "again").unwrap(), id);
+        store.set_state(second, ReviewState::Accepted).unwrap();
+        let later = store.defer_write(second, &[Field::Label, Field::Artwork], "open").unwrap();
+        let replaced = store.defer_write(second, &[Field::Artwork], "open").unwrap();
+        assert_ne!(later, replaced);
+        assert_eq!(store.waiting_writes().unwrap().iter().map(|w| w.id).collect::<Vec<_>>(), [id, replaced]);
+        // Newest first under its own filter; the others are not listed there.
+        let listed: Vec<ResultId> = store.list(Filter::Waiting, 0, 10).unwrap().iter().map(|i| i.result).collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&first) && listed.contains(&second));
+        assert_eq!(store.count(Filter::Waiting).unwrap(), 2);
+        assert_eq!(store.count(Filter::All).unwrap(), 3, "no row twice");
+        assert_eq!(store.count(Filter::NeedsReview).unwrap(), 1);
+        // Waiting and its end are permanent records.
+        for statement in ["DELETE FROM waiting_writes", "UPDATE waiting_writes SET reason = ''", "DELETE FROM waiting_write_ends"] {
+            assert!(store.conn.execute(statement, []).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
+    fn the_waiting_filter_lists_newest_first() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, old) = reviewed(&store, "a.mp3", 0.95);
+        let (_, new) = reviewed(&store, "b.mp3", 0.6);
+        store.defer_write(old, &[Field::Label], "x").unwrap();
+        store.conn.execute("DROP TRIGGER waiting_writes_never_update", []).unwrap();
+        store.conn.execute("UPDATE waiting_writes SET since_unix = 1", []).unwrap();
+        store.defer_write(new, &[Field::Label], "x").unwrap();
+        let listed: Vec<ResultId> = store.list(Filter::Waiting, 0, 10).unwrap().iter().map(|i| i.result).collect();
+        assert_eq!(listed, [new, old]);
+    }
+
+    #[test]
+    fn a_waiting_result_refuses_review_changes_and_reidentifying_until_cancelled() {
+        let store = Store::open_in_memory().unwrap();
+        let (track, result) = reviewed(&store, "a.mp3", 0.8);
+        store.defer_write(result, &[Field::Label], "open").unwrap();
+        for to in [ReviewState::Pending, ReviewState::Rejected] {
+            let error = store.set_state(result, to).unwrap_err().to_string();
+            assert!(error.contains("Cancel the waiting write"), "{error}");
+        }
+        assert!(store.edit_proposal(result, &[(Field::Label, "X".into())]).is_err());
+        assert!(store.save_result(track, Decision::Review, &[], None, None, &[], true).is_err());
+        store.cancel_waiting(result).unwrap();
+        let (item, _, _, warnings) = store.result(result).unwrap().unwrap();
+        assert_eq!((item.state, item.waiting, warnings.len()), (ReviewState::Pending, None, 0));
+        assert!(store.cancel_waiting(result).is_err(), "nothing waits now");
+        store.set_state(result, ReviewState::Rejected).unwrap();
+    }
+
+    #[test]
+    fn a_dropped_waiting_write_returns_its_result_to_review_with_the_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        let auto = store.save_result(track, Decision::AutoApply, &[], Some(&proposal()), None, &[], false).unwrap();
+        store.defer_write(auto, &[Field::Label], "open").unwrap();
+        assert!(store.drop_waiting(auto, "the label changed").unwrap());
+        let (item, _, _, warnings) = store.result(auto).unwrap().unwrap();
+        assert_eq!((item.state, item.decision, item.waiting), (ReviewState::Pending, Decision::Review, None));
+        assert_eq!(warnings, ["the label changed"]);
+        assert!(store.drop_waiting(auto, "again").is_err());
+    }
+
+    #[test]
+    fn a_write_that_lands_ends_its_waiting_write() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        let auto = store.save_result(track, Decision::AutoApply, &[], Some(&proposal()), None, &[], false).unwrap();
+        store.defer_write(auto, &[Field::Label], "open").unwrap();
+        record_applied(&store, auto, &proposal().changes[..1], None, &snapshot("T"), &key("a.mp3"), None).unwrap();
+        let (item, ..) = store.result(auto).unwrap().unwrap();
+        assert_eq!((item.state, item.waiting), (ReviewState::AutoApplied, None), "still the auto-apply's write");
+        assert_eq!(store.waiting_writes().unwrap(), []);
+        let ended: String = store.conn.query_row("SELECT outcome FROM waiting_write_ends", [], |r| r.get(0)).unwrap();
+        assert_eq!(ended, "written");
     }
 }

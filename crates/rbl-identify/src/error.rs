@@ -29,6 +29,19 @@ pub enum IdentifyError {
     /// safely. Says why, never a tag value.
     #[error("{0}")]
     Write(String),
+    /// A write refused because another program has the file open (a
+    /// player, rekordbox): it can be made once the file is free.
+    #[error("{0}")]
+    InUse(String),
+    /// A write refused because the file's tags are no longer the ones the
+    /// proposal was reviewed against.
+    #[error("{0}")]
+    Changed(String),
+    /// A write that could not be made now because the file is open in
+    /// another program, and that the store keeps as a waiting write, to be
+    /// made when the file is free. Says so, in the user's terms.
+    #[error("{0}")]
+    Deferred(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
