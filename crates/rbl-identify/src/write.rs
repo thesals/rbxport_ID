@@ -1,5 +1,8 @@
 //! Writing accepted changes to a file's tags, and putting them back.
 //!
+//! Only the audio file is ever written: identification is one-way and never
+//! changes the rekordbox library (it only reads it, into its own store).
+//!
 //! Nothing here is ever called without the user: a write happens only on an
 //! explicit apply (or auto-apply, off by default and only for fill-only
 //! proposals), and always as the second step of a recorded application
@@ -78,7 +81,7 @@ use lofty::tag::Tag;
 use crate::error::{IdentifyError, Result};
 use crate::model::{ArtworkRef, Field, FieldChange, TagSnapshot};
 use crate::pipeline::current;
-use crate::store::{ApplicationId, LibraryTrack, ResultId, ReviewState, Store, TrackKey};
+use crate::store::{ApplicationId, ResultId, ReviewState, Store, TrackKey};
 use crate::tags;
 
 /// One planned change to a file.
@@ -901,40 +904,28 @@ pub struct Applied {
     pub application: ApplicationId,
     /// The file's tags after the write.
     pub after: TagSnapshot,
-    /// What the library callback reported it left.
-    pub library_after: Option<String>,
 }
 
 /// Writes the ticked `fields` of a result to its file, as one recorded
-/// application, and then lets `library` update the library record:
+/// application. The file only: identification never writes to the
+/// rekordbox library.
 ///
 /// 1. the result must be its track's current one, `Pending` or `Accepted`
 ///    (a pending one is accepted by this call), and every field must be in
 ///    its proposal;
 /// 2. the file's tags are read and the changes planned against them
 ///    ([`plan`]: refused if the file changed since it was identified);
-/// 3. [`Store::begin_application`] records the plan, the file's tags now
-///    and `library_before` BEFORE the file is touched;
+/// 3. [`Store::begin_application`] records the plan and the file's tags
+///    now BEFORE the file is touched;
 /// 4. the file is written ([`write`]);
-/// 5. `library` is called with the changes written (the planned ones, the
-///    sub-genre's being the comment as written); it returns what the library
-///    now holds, for undo;
-/// 6. [`Store::complete_application_with`] records the outcome.
+/// 5. [`Store::complete_application_with`] records the outcome and the
+///    file's tags after the write.
 ///
-/// On any failure after step 3 the file is put back and the application
-/// abandoned (left open, for reconciliation, only if even that fails), and
-/// a result this call accepted goes back to `Pending`, so a later bulk
-/// apply cannot write fields the user did not tick.
-pub fn apply_result<F>(
-    store: &Store,
-    result: ResultId,
-    fields: &[Field],
-    library_before: Option<&str>,
-    library: F,
-) -> Result<Applied>
-where
-    F: FnOnce(&[FieldChange]) -> std::result::Result<Option<String>, String>,
-{
+/// On a failed write the application is abandoned when the file is exactly
+/// as it was (left open, for reconciliation, otherwise), and a result this
+/// call accepted goes back to `Pending`, so a later bulk apply cannot write
+/// fields the user did not tick.
+pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result<Applied> {
     let (item, ..) = store.result(result)?.ok_or_else(|| refuse("That identification result is no longer in the store."))?;
     let accepted_here = match item.state {
         ReviewState::Accepted => false,
@@ -991,7 +982,7 @@ where
             let _ = store.set_state(result, ReviewState::Pending);
         }
     };
-    let application = match store.begin_application(result, &written, art_ref, &info.snapshot, library_before) {
+    let application = match store.begin_application(result, &written, art_ref, &info.snapshot, None) {
         Ok(id) => id,
         Err(e) => {
             back_to_pending(store);
@@ -1016,47 +1007,24 @@ where
             )));
         }
     };
-    let library_after = match library(&written) {
-        Ok(after) => after,
-        Err(message) => {
-            let fields: Vec<Field> = written.iter().map(|c| c.field).collect();
-            match restore(path, &info.snapshot, &after, &fields) {
-                Ok(()) => {
-                    if store.abandon_application(application, "the library could not be updated").is_ok() {
-                        back_to_pending(store);
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "identify: a write could not be put back after a library failure"),
-            }
-            return Err(refuse(format!("The library record could not be updated: {message}")));
-        }
-    };
     let key = TrackKey::for_file(path)?;
     let file_after = TrackKey { path: item.path.clone(), ..key };
-    store.complete_application_with(application, &file_after, Some(&after), library_after.as_deref())?;
-    Ok(Applied { application, after, library_after })
+    store.complete_application_with(application, &file_after, Some(&after), None)?;
+    Ok(Applied { application, after })
 }
 
 /// What [`undo_result`] restored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Undone {
     pub application: ApplicationId,
-    /// The library side recorded before the write and after it, for the
-    /// caller that put it back.
-    pub library_before: Option<String>,
-    pub library_after: Option<String>,
 }
 
 /// Undoes a result's write: its track's latest written application. The
 /// file's tags are put back exactly ([`restore`]: refused if the file has
-/// changed since the write), then `library` puts the library record back
-/// (given the recorded before and after values); if that fails the file
-/// gets the written tags again and the undo is refused. Then the undo is
-/// recorded ([`Store::record_undo`]).
-pub fn undo_result<F>(store: &Store, result: ResultId, library: F) -> Result<Undone>
-where
-    F: FnOnce(Option<&str>, Option<&str>) -> std::result::Result<(), String>,
-{
+/// changed since the write), then the undo is recorded
+/// ([`Store::record_undo`]). The file only: a library side recorded by an
+/// older build (which also wrote the rekordbox library) is ignored.
+pub fn undo_result(store: &Store, result: ResultId) -> Result<Undone> {
     let (item, ..) = store.result(result)?.ok_or_else(|| refuse("That identification result is no longer in the store."))?;
     if !item.state.is_applied() {
         return Err(refuse("Only an applied result can be undone."));
@@ -1072,26 +1040,7 @@ where
         .ok_or_else(|| refuse("The tags after this write were not recorded, so it cannot be checked and undone."))?;
     let path = Path::new(&item.path);
     let fields: Vec<Field> = application.changes.iter().map(|c| c.field).collect();
-    let written = std::fs::read(path).map_err(|e| io_error(path, &e))?;
     restore(path, &before, &after, &fields)?;
-    if let Err(message) = library(application.library_snapshot.as_deref(), application.library_after.as_deref()) {
-        // Keep file and library in step: the file gets its written tags back.
-        if tags::read(path).is_ok_and(|now| now.snapshot == before) {
-            if let Err(e) = replace(path, &written) {
-                tracing::warn!(error = %e, "identify: an undone file could not be rewritten after a library failure");
-            }
-        }
-        return Err(refuse(format!("The library record could not be put back: {message}")));
-    }
     store.record_undo(application.id)?;
-    Ok(Undone {
-        application: application.id,
-        library_before: application.library_snapshot,
-        library_after: application.library_after,
-    })
-}
-
-/// The library track a result was identified for, when the store knows it.
-pub fn library_track(store: &Store, result: ResultId) -> Result<Option<LibraryTrack>> {
-    Ok(store.result(result)?.and_then(|(item, ..)| item.library))
+    Ok(Undone { application: application.id })
 }

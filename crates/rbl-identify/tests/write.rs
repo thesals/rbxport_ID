@@ -224,7 +224,7 @@ fn pending(store: &Store, path: &Path, changes: Vec<FieldChange>) -> i64 {
 }
 
 #[test]
-fn an_applied_result_is_recorded_both_ways_and_undone_through_the_store() {
+fn an_applied_result_is_recorded_and_undone_through_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let Some(path) = copy(dir.path(), "5538816_Heart_Original_Mix.mp3") else { return };
     let original = std::fs::read(&path).unwrap();
@@ -238,15 +238,12 @@ fn an_applied_result_is_recorded_both_ways_and_undone_through_the_store() {
         vec![change(Field::Label, &label, "New Label"), change(Field::SubGenre, &comment, &format!("{comment}; Deep House"))],
     );
 
-    // Only the ticked field is written, and the library hears exactly it.
-    let mut heard = Vec::new();
-    let applied = write::apply_result(&store, result, &[Field::SubGenre], Some("{\"before\":1}"), |written| {
-        heard = written.to_vec();
-        Ok(Some("{\"after\":1}".into()))
-    })
-    .unwrap();
-    assert_eq!(heard.len(), 1);
-    assert_eq!(heard[0].proposed, format!("{comment}; Deep House"));
+    // Only the ticked field is written.
+    let applied = write::apply_result(&store, result, &[Field::SubGenre]).unwrap();
+    assert_eq!(
+        store.application(applied.application).unwrap().unwrap().changes[0].proposed,
+        format!("{comment}; Deep House")
+    );
     assert_eq!(rbl_identify::pipeline::current(&applied.after, Field::Label), label, "unticked");
     let item = store.result(result).unwrap().unwrap().0;
     assert_eq!(item.state, ReviewState::Applied);
@@ -254,20 +251,14 @@ fn an_applied_result_is_recorded_both_ways_and_undone_through_the_store() {
     assert_eq!(store.application_after_snapshot(applied.application).unwrap(), Some(applied.after.clone()));
     assert_eq!(store.list(Filter::Applied, 0, 10).unwrap().len(), 1);
 
-    let mut restored = None;
-    write::undo_result(&store, result, |before, after| {
-        restored = Some((before.map(str::to_owned), after.map(str::to_owned)));
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(restored, Some((Some("{\"before\":1}".into()), Some("{\"after\":1}".into()))));
+    write::undo_result(&store, result).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), original, "byte for byte");
     assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Undone);
-    assert!(write::undo_result(&store, result, |_, _| Ok(())).is_err(), "once");
+    assert!(write::undo_result(&store, result).is_err(), "once");
 }
 
 #[test]
-fn a_failed_apply_puts_the_file_back_and_returns_the_result_to_pending() {
+fn a_refused_apply_leaves_the_file_and_the_result_as_they_were() {
     let dir = tempfile::tempdir().unwrap();
     let Some(path) = copy(dir.path(), "5538816_Heart_Original_Mix.mp3") else { return };
     let original = std::fs::read(&path).unwrap();
@@ -276,22 +267,15 @@ fn a_failed_apply_puts_the_file_back_and_returns_the_result_to_pending() {
     let label = rbl_identify::pipeline::current(&before, Field::Label);
     let result = pending(&store, &path, vec![change(Field::Label, &label, "New Label"), change(Field::Isrc, "x", "y")]);
 
-    // The library refuses (rekordbox started, say): file back, write abandoned.
-    let error = write::apply_result(&store, result, &[Field::Label], None, |_| Err("rekordbox is running".into())).unwrap_err();
-    assert!(error.to_string().contains("rekordbox is running"), "{error}");
-    assert_eq!(std::fs::read(&path).unwrap(), original);
-    assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Pending, "the implicit accept is undone");
-    assert_eq!(store.open_applications().unwrap().len(), 0);
-
     // A stale field (the file's ISRC is not "x") is refused before anything.
-    let error = write::apply_result(&store, result, &[Field::Label, Field::Isrc], None, |_| Ok(None)).unwrap_err();
+    let error = write::apply_result(&store, result, &[Field::Label, Field::Isrc]).unwrap_err();
     assert!(error.to_string().contains("changed since"), "{error}");
     assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Pending);
     // A field the proposal does not list is refused.
-    assert!(write::apply_result(&store, result, &[Field::Genre], None, |_| Ok(None)).is_err());
+    assert!(write::apply_result(&store, result, &[Field::Genre]).is_err());
     // A rejected result is not written.
     store.set_state(result, ReviewState::Rejected).unwrap();
-    assert!(write::apply_result(&store, result, &[Field::Label], None, |_| Ok(None)).is_err());
+    assert!(write::apply_result(&store, result, &[Field::Label]).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
