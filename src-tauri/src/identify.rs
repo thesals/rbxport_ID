@@ -1878,6 +1878,55 @@ mod tests {
         assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
     }
 
+    /// Holds `path` open the way a player does, with `share` (`FILE_SHARE_*`).
+    #[cfg(windows)]
+    fn hold(path: &Path, share: u32) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new().read(true).share_mode(share).open(path).unwrap()
+    }
+
+    #[cfg(windows)]
+    const FILE_SHARE_READ: u32 = 0x1;
+    #[cfg(windows)]
+    const FILE_SHARE_DELETE: u32 = 0x4;
+
+    /// A player holding the file open, sharing read only or read and delete:
+    /// Windows refuses the rename over it either way (an open handle blocks
+    /// replacing the file even when it shares delete), so apply answers with
+    /// the "open in another program" message, the file is unchanged, the
+    /// write is abandoned (the result back to review, no write left open)
+    /// and no staged file stays behind. Once closed, it goes through.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_a_player_holds_open_is_refused_and_left_as_it_was() {
+        for share in [FILE_SHARE_READ, FILE_SHARE_READ | FILE_SHARE_DELETE] {
+            let dir = tempfile::tempdir().unwrap();
+            let audio = dir.path().join("track.wav");
+            wav(&audio);
+            let original = std::fs::read(&audio).unwrap();
+            let identify = IdentifyState::with_root(dir.path().join("identify"));
+            let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+            let result = identified(&identify, &audio, "42", title);
+
+            let held = hold(&audio, share);
+            let outcome = identify.apply_items(&ticked(result, &["title"])).remove(0);
+            assert!(!outcome.ok, "share {share:#x}");
+            let error = outcome.error.unwrap_or_default();
+            assert!(error.contains("open in another program"), "share {share:#x}: {error}");
+            assert_eq!(std::fs::read(&audio).unwrap(), original, "share {share:#x}: byte for byte");
+            drop(held);
+            assert_eq!(identify.detail(result).unwrap().item.state, "pending", "share {share:#x}");
+            assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
+            let names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(names.iter().all(|n| !n.starts_with(".rbxport-tags-")), "no staged file left: {names:?}");
+            let applied = identify.apply_items(&ticked(result, &["title"])).remove(0);
+            assert!(applied.ok, "share {share:#x}: {applied:?}");
+        }
+    }
+
     #[test]
     fn model_names_reach_the_frontend_in_camel_case_and_back() {
         assert_eq!(camel(&Field::CatalogNumber), "catalogNumber");
