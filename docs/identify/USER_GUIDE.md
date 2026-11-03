@@ -38,6 +38,12 @@ To enter them, open **Preferences → Identify**, then save.
 
 Each service's rate limit is built in, so a large batch takes a while. MusicBrainz allows one request a second.
 
+### Write tags to audio files
+
+**Write tags to audio files** is off by default. While it's off, identification only reads your files: proposals are saved for review, but nothing is written to any file. That includes Accept, Apply accepted, Undo, auto-apply and waiting writes. You can still review, reject and edit results, and mark them accepted with **Accept above**; they wait until writing is turned on.
+
+Turning it on asks you to confirm first. Waiting writes stay queued while it's off and are tried again once you turn it on.
+
 ### Genre
 
 - **Fill an empty Genre with the Discogs styles** (default). A genre you've already set is never proposed for change.
@@ -48,7 +54,7 @@ Whichever you choose, the styles are also offered for the comment, for review.
 
 ### Auto-apply
 
-Auto-apply is off by default. When it's on, a result is written to the file during the run, without review, only if all of these are true:
+Auto-apply is off by default, and works only while **Write tags to audio files** is on. When it's on, a result is written to the file during the run, without review, only if all of these are true:
 
 - the match came from the audio fingerprint, not a text search or Discogs;
 - the confidence score is at least the level you set, from 90% (the default) to 100%;
