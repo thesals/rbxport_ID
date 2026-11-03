@@ -172,6 +172,7 @@
 .badge[data-state="applied"],
 .badge[data-state="autoApplied"] { border-color: var(--c-meter-green); }
 .badge[data-state="accepted"] { border-color: var(--c-accent); }
+.badge[data-state="waiting"] { border-style: dashed; border-color: var(--c-accent); }
 .badge[data-state="rejected"],
 .badge[data-state="unidentified"] { border-color: var(--c-text-dim); color: var(--c-text-dim); }
 
@@ -220,6 +221,15 @@
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .error { margin: 0; padding: 0 12px 6px; color: var(--c-error); }
 .detail .error { padding: 0; }
+.detail .note { padding: 0; }
+.waiting {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px dashed var(--c-accent);
+  border-radius: 2px;
+}
 
 .subhead { margin: 4px 0; font-size: 1em; color: var(--c-text-dim); font-weight: 400; }
 .warnings { margin: 0; padding-left: 18px; }

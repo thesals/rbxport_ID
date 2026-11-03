@@ -63,6 +63,44 @@ test("identify a selection, review a result, apply ticked fields and undo", asyn
   await expect(panel).toHaveCount(0);
 });
 
+test("a write to a file in use waits under Waiting for file, then Retry now writes it", async ({ page }) => {
+  await page.goto("/?writable=1");
+  await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  const rows = page.getByRole("row").filter({ has: page.getByRole("gridcell") });
+  await rows.nth(0).click();
+  await rows.nth(4).click({ modifiers: ["Shift"] });
+  await page.locator('[role="gridcell"][data-col="title"]').nth(2).click({ button: "right" });
+  await page.getByRole("menu", { name: "Track" }).getByRole("menuitem", { name: "Identify Tracks" }).click();
+  const panel = page.getByRole("dialog", { name: "Identify Tracks" });
+  await expect(panel.getByRole("status").first()).toHaveText("Identified 5 of 5", { timeout: 10_000 });
+
+  // A player holds every file open.
+  await page.evaluate(() => (window as unknown as { __identifyFileInUse: (inUse: boolean) => void }).__identifyFileInUse(true));
+  const list = panel.getByRole("listbox");
+  await list.getByRole("option").filter({ hasText: "81%" }).first().click();
+  const detail = panel.getByRole("region", { name: "Identification result" });
+  await detail.getByRole("button", { name: "Accept", exact: true }).click();
+  await expect(detail.getByRole("status")).toHaveText("1 waiting for files in use.");
+  await expect(detail.getByRole("alert")).toHaveCount(0);
+  const waiting = detail.getByRole("region", { name: "Waiting for file" });
+  await expect(waiting).toContainText("the next time rbxport starts or closes, or when you choose Retry now");
+  await expect(detail.getByRole("button", { name: "Accept", exact: true })).toBeDisabled();
+
+  await panel.getByRole("tab", { name: "Waiting for file" }).click();
+  await expect(list.getByRole("option")).toHaveCount(1);
+  await expect(list.getByRole("option").first()).toContainText("Waiting — file in use");
+  await list.getByRole("option").first().click();
+
+  await page.evaluate(() => (window as unknown as { __identifyFileInUse: (inUse: boolean) => void }).__identifyFileInUse(false));
+  await waiting.getByRole("button", { name: "Retry now" }).click();
+  await expect(detail.locator("header")).toContainText("Applied");
+  await expect(waiting).toHaveCount(0);
+  await expect(list.getByRole("option")).toHaveCount(0);
+  await panel.getByRole("tab", { name: "Applied (undoable)" }).click();
+  await expect(list.getByRole("option")).toHaveCount(1);
+  await expect(list.getByRole("option").first()).toContainText("Applied");
+});
+
 test("bulk accept above a threshold, then fill only empty fields after confirming", async ({ page }) => {
   await page.goto("/?writable=1");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");

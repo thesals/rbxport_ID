@@ -6,7 +6,7 @@
  * At the top, the background job — how far it is, the track it is on, how
  * the finished ones came out, and Cancel. The job belongs to the backend, so
  * closing this panel leaves it running and reopening it picks it up. Below,
- * the queue under one of four filters, a window of rows at a time, and the
+ * the queue under one of five filters, a window of rows at a time, and the
  * chosen result in full beside it. Bulk accept marks every pending result at
  * or above a threshold accepted; Apply accepted then fills the empty fields
  * of those results, after saying what it will do (see `bulkPlan`).
@@ -27,7 +27,7 @@ import { useElementSize } from "@/store/useElementSize";
 import { IdentifyDetailPane } from "./IdentifyDetailPane";
 import {
   FILTERS, bulkPlan, decisionLabel, filterLabel, formatScore, reloadHint, sourceLabel, sourceShort, stateLabel, trackName,
-  type BulkPlan, type Translate,
+  waitingLabel, waitingNotice, type BulkPlan, type Translate,
 } from "./identifyText";
 import { useIdentifyQueue } from "./useIdentifyQueue";
 import styles from "./IdentifyPanel.module.css";
@@ -156,7 +156,8 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
       const accepted: IdentifyQueueItem[] = [];
       for (let offset = 0; ; offset += MAX_ROWS) {
         const page = await backend.identify.queue("all", offset, MAX_ROWS);
-        accepted.push(...page.items.filter((item) => item.state === "accepted"));
+        // A write already waiting for its file is not planned again.
+        accepted.push(...page.items.filter((item) => item.state === "accepted" && item.waiting === null));
         if (page.items.length === 0 || offset + page.items.length >= page.total) break;
       }
       // Artwork fills only a file without any, which only the detail says.
@@ -184,22 +185,26 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
       const items: IdentifyApplyItem[] = confirmed.items;
       let written = 0;
       let failed = 0;
+      // A file in use defers its write: a notice, not a failure.
+      let deferred = 0;
       let firstError: string | null = null;
       for (let at = 0; at < items.length; at += APPLY_BATCH) {
         for (const outcome of await backend.identify.apply(items.slice(at, at + APPLY_BATCH))) {
           if (outcome.ok) written += 1;
+          else if (outcome.deferred) deferred += 1;
           else {
             failed += 1;
             firstError ??= outcome.error;
           }
         }
       }
-      const outcome = items.length === 0
-        ? t("Nothing was written.")
-        : failed === 0
-          ? t("{count} applied.", { count: written })
-          : t("{count} applied, {failed} failed: {reason}", { count: written, failed, reason: firstError ?? "" });
-      const text = written > 0 ? `${outcome} ${reloadHint(t)}` : outcome;
+      const parts: string[] = [];
+      if (items.length === 0) parts.push(t("Nothing was written."));
+      else if (failed > 0) parts.push(t("{count} applied, {failed} failed: {reason}", { count: written, failed, reason: firstError ?? "" }));
+      else if (written > 0 || deferred === 0) parts.push(t("{count} applied.", { count: written }));
+      if (deferred > 0) parts.push(waitingNotice(deferred, t));
+      if (written > 0) parts.push(reloadHint(t));
+      const text = parts.join(" ");
       setBulkNote({ text, failed: failed > 0 });
     } catch (e) {
       setBulkNote({ text: errorMessage(e), failed: true });
@@ -230,7 +235,11 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
             <span className={styles.rowName}>{trackName(row)}</span>
             <span className={styles.rowMeta}>
               <span className={styles.rowScore}>{formatScore(row.score)}</span>
-              <span className={styles.badge} data-state={row.state}>{stateLabel(row.state, t)}</span>
+              {row.waiting !== null ? (
+                <span className={styles.badge} data-state="waiting">{waitingLabel(t)}</span>
+              ) : (
+                <span className={styles.badge} data-state={row.state}>{stateLabel(row.state, t)}</span>
+              )}
               <span>{decisionLabel(row.decision, t)}</span>
               {row.source !== null ? (
                 <span className={styles.rowSource} title={sourceLabel(row.source, t)}>{sourceShort(row.source, t)}</span>

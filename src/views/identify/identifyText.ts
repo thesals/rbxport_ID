@@ -97,7 +97,7 @@ export function reloadHint(t: Translate): string {
   return t("To see the changes in rekordbox, select the tracks there and choose {reloadTag}.", { reloadTag: t("Reload Tag") });
 }
 
-export const FILTERS: readonly IdentifyFilter[] = ["needsReview", "unidentified", "applied", "all"];
+export const FILTERS: readonly IdentifyFilter[] = ["needsReview", "unidentified", "waiting", "applied", "all"];
 
 export function filterLabel(filter: IdentifyFilter, t: Translate): string {
   switch (filter) {
@@ -107,6 +107,19 @@ export function filterLabel(filter: IdentifyFilter, t: Translate): string {
     case "applied": return t("Applied (undoable)");
     case "all": return t("All");
   }
+}
+
+/** What a row shows for a result whose write waits for its file. */
+export function waitingLabel(t: Translate): string {
+  return t("Waiting — file in use");
+}
+
+/**
+ * The neutral notice for writes deferred because their files were in use:
+ * not a failure, they are written once the files are free.
+ */
+export function waitingNotice(count: number, t: Translate): string {
+  return t("{count} waiting for files in use.", { count });
 }
 
 /** A score as the list shows it: a whole percentage, or a dash for none. */

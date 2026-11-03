@@ -4,15 +4,16 @@
  * The review queue against the mock identify store: the job's progress and
  * Cancel, the filters, a result's per-field diff with its ticks, Accept
  * writing only the ticked fields, Undo, Edit, and bulk accept above a
- * threshold followed by Apply accepted.
+ * threshold followed by Apply accepted, and writes deferred while a file is
+ * in use: waiting, retried and cancelled.
  */
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __setBackend } from "@/ipc/client";
-import { createMockIdentify } from "@/ipc/mock-identify";
-import type { Backend, IdentifyBackend } from "@/ipc/types";
+import { createMockIdentify, type MockIdentifyBackend } from "@/ipc/mock-identify";
+import type { Backend } from "@/ipc/types";
 import { useIdentifyJob } from "@/store/useIdentifyJob";
 import { IdentifyPanel } from "./IdentifyPanel";
 
@@ -23,7 +24,7 @@ declare global {
 const TICK = 10;
 let host: HTMLDivElement;
 let root: Root;
-let identify: IdentifyBackend;
+let identify: MockIdentifyBackend;
 const onClose = vi.fn();
 
 function Harness() {
@@ -212,6 +213,83 @@ describe("IdentifyPanel", () => {
     expect(options()).toHaveLength(1);
     await click(byText("[role=tab]", "All"));
     expect(options().filter((row) => row.textContent?.includes("Accepted"))).toHaveLength(2);
+  });
+
+  it("defers Accept on a file in use, explains it, and writes it on Retry now once the file is free", async () => {
+    await identifyFive();
+    await render();
+    const row = options()[0]!;
+    const name = row.querySelector("span")?.textContent ?? "";
+    await click(row);
+    const path = host.querySelector("[role=dialog] section header p")?.textContent ?? "";
+    identify.setFileInUse(true, path);
+    await click(button("Accept"));
+    // A notice, not an error.
+    expect(host.querySelector("[aria-label='Identification result'] [role=alert]")).toBeNull();
+    expect(byText("[aria-label='Identification result'] [role=status]", "1 waiting for files in use.")).toBeDefined();
+    const waiting = host.querySelector<HTMLElement>("section[aria-label='Waiting for file']");
+    expect(waiting?.textContent).toContain("open in another program, such as a player");
+    expect(waiting?.textContent).toContain("the next time rbxport starts or closes, or when you choose Retry now");
+    expect(waiting?.textContent).toContain("Nothing is written if the file changes in the meantime.");
+    expect(button("Accept")?.disabled).toBe(true);
+    expect(button("Reject")?.disabled).toBe(true);
+    expect(checkbox("Track Title")?.checked).toBe(true);
+    expect(checkbox("Track Title")?.disabled).toBe(true);
+
+    await click(byText("[role=tab]", "Waiting for file"));
+    expect(options()).toHaveLength(1);
+    expect(options()[0]?.textContent).toContain("Waiting — file in use");
+    await click(options()[0]);
+
+    // Still in use: it keeps waiting.
+    await click(button("Retry now"));
+    expect(byText("[aria-label='Identification result'] [role=status]", "1 waiting for files in use.")).toBeDefined();
+    expect(options()).toHaveLength(1);
+
+    identify.setFileInUse(false, path);
+    await click(button("Retry now"));
+    expect(host.querySelector("section[aria-label='Waiting for file']")).toBeNull();
+    expect(byText("[role=dialog] section span", "Applied")).toBeDefined();
+    expect(host.querySelector("[role=note]")?.textContent).toContain("choose Reload Tag");
+    expect(options()).toHaveLength(0);
+    await click(byText("[role=tab]", "Applied (undoable)"));
+    expect(name).not.toBe("");
+    expect(options().some((option) => option.querySelector("span")?.textContent === name)).toBe(true);
+  });
+
+  it("cancels a waiting write without writing it", async () => {
+    await identifyFive();
+    const cancel = vi.spyOn(identify, "cancelWaiting");
+    await render();
+    identify.setFileInUse(true);
+    await click(options()[0]);
+    await click(button("Accept"));
+    await click(button("Cancel write"));
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(host.querySelector("section[aria-label='Waiting for file']")).toBeNull();
+    expect(byText("[role=dialog] section span", "Accepted")).toBeDefined();
+    identify.setFileInUse(false);
+    await click(byText("[role=tab]", "Waiting for file"));
+    expect(options()).toHaveLength(0);
+    await click(byText("[role=tab]", "Applied (undoable)"));
+    expect(options().filter((row) => row.textContent?.includes("Applied"))).toHaveLength(1);
+  });
+
+  it("reports a bulk write to files in use as waiting, not failed", async () => {
+    useMock(false);
+    await identifyFive();
+    await act(async () => { await identify.acceptAbove(0.92); });
+    identify.setFileInUse(true);
+    await render();
+    await click(button("Apply accepted"));
+    await click(button("Apply"));
+    expect(byText("[role=status]", "1 waiting for files in use.")).toBeDefined();
+    expect(host.querySelector("[role=alert]")).toBeNull();
+    await click(byText("[role=tab]", "Waiting for file"));
+    expect(options()).toHaveLength(1);
+    // Already waiting: a second Apply accepted does not plan it again.
+    await click(button("Apply accepted"));
+    expect(host.textContent).toContain("No accepted results to apply.");
   });
 
   it("drops a bulk write the user does not confirm", async () => {

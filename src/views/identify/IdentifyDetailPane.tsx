@@ -5,6 +5,10 @@
  * Undo. Nothing is written until Accept: the spec's "never silently
  * overwrite" rule.
  *
+ * A file another program holds open defers the write: the result then waits
+ * with its ticked fields, says why, and offers Retry now and Cancel write. A
+ * deferred write is a notice, not an error.
+ *
  * One way: Accept and Undo write the audio file's tags and nothing else.
  * The rekordbox record imported when the track was identified is shown
  * under a field it disagrees with, for reference; it is never written.
@@ -17,7 +21,7 @@ import { useTranslation } from "@/i18n";
 import { errorMessage } from "@/lib/errorMessage";
 import {
   canApply, changes, decisionLabel, defaultFields, fieldLabel, formatScore, rekordboxValue, reloadHint, sourceLabel,
-  stateLabel, trackName,
+  stateLabel, trackName, waitingLabel, waitingNotice,
 } from "./identifyText";
 import styles from "./IdentifyPanel.module.css";
 
@@ -29,8 +33,14 @@ function imageSize(bytes: number): string {
 /** Fields whose proposal can be typed over. Artwork is a picture; the comment is only ever appended to. */
 const EDITABLE = (field: IdentifyField) => field !== "artwork" && field !== "subGenre";
 
+/** An answer whose write was deferred until its file is free: not a failure. */
+function deferred(outcome: unknown): boolean {
+  return !!outcome && typeof outcome === "object" && "deferred" in outcome && outcome.deferred === true;
+}
+
 /** An answer that says it failed, from a call that resolves rather than throws. */
 function refused(outcome: unknown): string | null {
+  if (deferred(outcome)) return null;
   if (outcome && typeof outcome === "object" && "ok" in outcome && outcome.ok === false) {
     return "error" in outcome && typeof outcome.error === "string" ? outcome.error : "";
   }
@@ -51,6 +61,7 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
   const [editing, setEditing] = useState<{ field: IdentifyField; value: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
 
   const load = useCallback(async (keepTicks: boolean) => {
     try {
@@ -59,6 +70,8 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
       setLoadError(null);
       setTicked((current) => {
         const fields = new Set(next.item.changes.map((c) => c.field));
+        // A waiting write shows the fields it will write.
+        if (next.item.waiting) return new Set(next.item.waiting.fields.filter((field) => fields.has(field)));
         return keepTicks
           ? new Set([...current].filter((field) => fields.has(field)))
           : new Set(defaultFields(next.item));
@@ -73,6 +86,7 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
     setDetail(null);
     setEditing(null);
     setError(null);
+    setNote(null);
     void load(false);
   }, [load]);
 
@@ -95,10 +109,14 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
   const run = useCallback(async (call: () => Promise<unknown>) => {
     setBusy(true);
     setError(null);
+    setNote(null);
     try {
       const outcome = await call();
-      const why = refused(Array.isArray(outcome) ? outcome.find((o) => refused(o) !== null) : outcome);
+      const outcomes: unknown[] = Array.isArray(outcome) ? outcome : [outcome];
+      const why = refused(outcomes.find((o) => refused(o) !== null));
       if (why !== null) setError(why || t("The change could not be made."));
+      const waiting = outcomes.filter(deferred).length;
+      if (waiting > 0) setNote(waitingNotice(waiting, t));
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -115,13 +133,19 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
 
   const { item, rekordbox } = detail;
   const written = item.state === "applied" || item.state === "autoApplied" || item.state === "undone";
-  const writable = canApply(item.state) && !detail.writeInProgress;
-  const reviewable = (item.state === "pending" || item.state === "accepted") && !detail.writeInProgress;
+  // A waiting write is settled by Retry now or Cancel write first.
+  const waiting = item.waiting !== null;
+  const writable = canApply(item.state) && !detail.writeInProgress && !waiting;
+  const reviewable = (item.state === "pending" || item.state === "accepted") && !detail.writeInProgress && !waiting;
   const setState = (action: IdentifyReviewAction) =>
     void run(async () => (await getBackend()).identify.setState(item.resultId, action));
   const accept = () => void run(async () =>
     (await getBackend()).identify.apply([{ resultId: item.resultId, fields: [...ticked] }]));
   const undo = () => void run(async () => (await getBackend()).identify.undo(item.resultId));
+  // Retrying tries every waiting write; this pane answers for its own.
+  const retry = () => void run(async () =>
+    (await (await getBackend()).identify.retryWaiting()).filter((outcome) => outcome.resultId === item.resultId));
+  const cancelWaiting = () => void run(async () => (await getBackend()).identify.cancelWaiting(item.resultId));
   const saveEdit = () => {
     if (!editing) return;
     const edit = editing;
@@ -142,6 +166,7 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
         <p className={styles.detailPath} title={item.path}>{item.path}</p>
         <p className={styles.detailMeta}>
           <span className={styles.badge} data-state={item.state}>{stateLabel(item.state, t)}</span>
+          {waiting ? <span className={styles.badge} data-state="waiting">{waitingLabel(t)}</span> : null}
           <span>{decisionLabel(item.decision, t)}</span>
           <span>{t("Score {score}", { score: formatScore(item.score) })}</span>
         </p>
@@ -149,6 +174,20 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
 
       {detail.writeInProgress ? (
         <p className={styles.notice} role="status">{t("Tags are being written to this file. Its review cannot change until the write is finished.")}</p>
+      ) : null}
+
+      {item.waiting !== null ? (
+        <section className={styles.waiting} aria-label={t("Waiting for file")}>
+          <p className={styles.notice}>
+            {t("The file was open in another program, such as a player, so its tags were not written.")}
+            {" "}{t("The ticked fields will be written automatically the next time rbxport starts or closes, or when you choose {retry}. Nothing is written if the file changes in the meantime.", { retry: t("Retry now") })}
+          </p>
+          {item.waiting.reason ? <p className={styles.hint}>{item.waiting.reason}</p> : null}
+          <div className={styles.actions}>
+            <button type="button" className={styles.button} disabled={busy} onClick={retry}>{t("Retry now")}</button>
+            <button type="button" className={styles.button} disabled={busy} onClick={cancelWaiting}>{t("Cancel write")}</button>
+          </div>
+        </section>
       ) : null}
 
       {item.changes.length > 0 ? (
@@ -277,6 +316,7 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
           </button>
         ) : null}
       </div>
+      {note !== null ? <p className={styles.note} role="status">{note}</p> : null}
       {error !== null ? <p className={styles.error} role="alert">{error}</p> : null}
 
       {detail.warnings.length > 0 ? (
