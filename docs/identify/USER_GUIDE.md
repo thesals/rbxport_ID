@@ -54,7 +54,7 @@ Auto-apply is off by default. When it's on, a result is written to the file duri
 - the score is at least the threshold you set, between 0.90 (the default) and 1.00;
 - every change fills an **empty** field.
 
-Comment (sub-genre) changes and anything that would overwrite a value are never auto-applied. An auto-applied result appears under **Applied** and can be undone like any other. If its write fails, for example because the file is open in a player, it stays under **Needs review** with the reason as a warning. If the write was interrupted partway, the result waits until the next start, which settles it (see [Safety](#safety)).
+Comment (sub-genre) changes and anything that would overwrite a value are never auto-applied. An auto-applied result appears under **Applied** and can be undone like any other. If the file is open in a player, the write waits until the file is free (see [Files in use](#files-in-use)); it isn't counted as identified until it's written. If its write fails for another reason, for example because the file is read-only, it stays under **Needs review** with the reason as a warning. If the write was interrupted partway, the result waits until the next start, which settles it (see [Safety](#safety)).
 
 A run keeps the settings it started with. If you turn auto-apply off during a run, the change takes effect from the next run.
 
@@ -81,7 +81,7 @@ A track with no candidate scoring at least 0.5 is marked **Unidentified**, not g
 
 ## Reviewing
 
-Open the review queue with **Review Identified Tracks**. Filter it by **Needs review**, **Unidentified**, **Applied** (results you can still undo) or **All**. Each row shows the score and where the match came from: **Fingerprint**, **Text search** or **Discogs**.
+Open the review queue with **Review Identified Tracks**. Filter it by **Needs review**, **Unidentified**, **Applied** (results you can still undo), **Waiting** (writes waiting for a file to be closed, newest first) or **All**. Each row shows the score and where the match came from: **Fingerprint**, **Text search** or **Discogs**.
 
 Choose a row to see:
 
@@ -113,7 +113,8 @@ Before any write:
 
 - The file's original tags are saved in the identify database.
 - The file must still hold the tags you reviewed. If it has changed since, the write is refused; identify the track again.
-- Read-only files, and files another program has open (in practice, a track loaded or playing in a player), are refused with a message saying which. Close or unload the file and try again.
+- Read-only files, and files you don't have permission to change, are refused with a message saying which.
+- A file another program has open (in practice, a track loaded or playing in a player) isn't written yet: the write waits until the file is free. See [Files in use](#files-in-use).
 
 The new tags are written to a temporary copy in the same folder, which then replaces the original. For MP3, AIFF and WAV, only the changed tag frames are rewritten, and the audio and all other frames are kept byte for byte. For FLAC, MP4/M4A and OGG, the audio is kept and the tag block is rewritten with every field it could read.
 
@@ -122,7 +123,17 @@ If rbxport or the computer stops in the middle of a write, the next start checks
 - **The file still holds its old tags:** the write is marked as not done.
 - **The file holds the new tags:** the write is marked as done.
 - **The file holds something else:** the write is closed as unknown and the result goes back to **Needs review**. Its original tags are kept.
-- **The file can't be found or read:** for example, it's on a drive that isn't connected, or a player has it open. The write stays open, and the track can't be reviewed or written, until a later start finds the file again.
+- **The file's tags can't be read at all:** the write is closed as unknown and the result goes back to **Needs review** with a warning. Its original tags are kept.
+- **A player has the file open:** the write stays open and is checked again when rbxport closes and at the next start.
+- **The file can't be found:** for example, it's on a drive that isn't connected. The write stays open, and the track can't be reviewed or written, until a later start finds the file again.
+
+### Files in use
+
+When you apply a result, or auto-apply writes one, while another program has the file open, nothing is written and nothing fails. The result stays accepted and shows under **Waiting** with the fields to write. rbxport tries it again when it starts, when it closes (for up to about 10 seconds; anything left waits for the next start), before every identification run and every apply, and when you choose **Retry**.
+
+Each try goes through the same checks as a normal apply. If the file still holds the tags you reviewed, the write is made and can be undone. If the file has changed meanwhile, the write is dropped and the result goes back to **Needs review** with a warning saying why. While a write waits you can't accept, reject or edit the result; cancel the waiting write to put it back under **Needs review**.
+
+Undo is never deferred: undoing a file that's open in another program fails with a message, and you can try again once it's closed.
 
 Any leftover temporary file is removed. The audio file itself is never rewritten during this check.
 
