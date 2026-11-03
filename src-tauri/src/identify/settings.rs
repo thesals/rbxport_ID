@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rbl_identify::config::{file_value, Config};
-use rbl_identify::decide::AUTO_APPLY_THRESHOLD;
+use rbl_identify::decide::{AUTO_APPLY_FLOOR, DEFAULT_AUTO_APPLY_THRESHOLD};
 use rbl_identify::pipeline::{self, GenrePolicy};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -151,7 +151,7 @@ pub(crate) struct Stored {
 
 impl Default for Stored {
     fn default() -> Self {
-        Self { genre_policy: GenrePolicyDto::FillEmpty, auto_apply: false, auto_apply_threshold: AUTO_APPLY_THRESHOLD }
+        Self { genre_policy: GenrePolicyDto::FillEmpty, auto_apply: false, auto_apply_threshold: DEFAULT_AUTO_APPLY_THRESHOLD }
     }
 }
 
@@ -167,7 +167,7 @@ impl Stored {
 }
 
 fn valid_threshold(t: f64) -> bool {
-    (AUTO_APPLY_THRESHOLD..=1.0).contains(&t)
+    (AUTO_APPLY_FLOOR..=1.0).contains(&t)
 }
 
 /// Where the keys are looked for.
@@ -239,9 +239,9 @@ impl Sources {
             Err(e) => return Err(e.to_string()),
         };
         if !stored.auto_apply_threshold.is_finite() {
-            stored.auto_apply_threshold = AUTO_APPLY_THRESHOLD;
+            stored.auto_apply_threshold = DEFAULT_AUTO_APPLY_THRESHOLD;
         }
-        stored.auto_apply_threshold = stored.auto_apply_threshold.clamp(AUTO_APPLY_THRESHOLD, 1.0);
+        stored.auto_apply_threshold = stored.auto_apply_threshold.clamp(AUTO_APPLY_FLOOR, 1.0);
         Ok(stored)
     }
 
@@ -273,7 +273,7 @@ impl Sources {
             if !valid_threshold(t) {
                 return Err(AppError::new(
                     ErrorKind::Malformed,
-                    "The auto-apply threshold must be between 0.92 and 1.",
+                    "The auto-apply threshold must be between 0.90 and 1.",
                 ));
             }
         }
@@ -576,8 +576,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = sources(dir.path(), &[], Vec::new());
         let dto = s.dto();
-        assert_eq!((dto.genre_policy, dto.auto_apply, dto.auto_apply_threshold), (GenrePolicyDto::FillEmpty, false, 0.92));
-        for bad in [0.91, 1.01, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!((dto.genre_policy, dto.auto_apply, dto.auto_apply_threshold), (GenrePolicyDto::FillEmpty, false, 0.90));
+        for bad in [0.8999, 1.01, -1.0, f64::NAN, f64::INFINITY] {
             let error = s
                 .save(
                     &IdentifySettingsUpdateDto { auto_apply_threshold: Some(bad), auto_apply: Some(true), ..Default::default() },
@@ -590,11 +590,13 @@ mod tests {
         s.save(&update(r#"{"autoApplyThreshold":0.97,"genrePolicy":"never"}"#), || {}).unwrap();
         let dto = s.dto();
         assert_eq!((dto.auto_apply_threshold, dto.genre_policy), (0.97, GenrePolicyDto::Never));
+        s.save(&update(r#"{"autoApplyThreshold":0.9}"#), || {}).unwrap();
+        assert_eq!(s.dto().auto_apply_threshold, 0.90, "the floor itself is allowed");
         s.save(&update(r#"{"autoApplyThreshold":1}"#), || {}).unwrap();
         assert_eq!(s.dto().auto_apply_threshold, 1.0);
         // A hand-edited file out of range is brought back into it.
         std::fs::write(dir.path().join(SETTINGS_FILE), r#"{"autoApplyThreshold":0.1}"#).unwrap();
-        assert_eq!(s.dto().auto_apply_threshold, 0.92);
+        assert_eq!(s.dto().auto_apply_threshold, 0.90);
         std::fs::write(dir.path().join(SETTINGS_FILE), "not json").unwrap();
         assert_eq!(s.stored(), Stored::default());
     }

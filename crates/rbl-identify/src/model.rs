@@ -338,7 +338,8 @@ pub struct Scored {
 /// What may happen to a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Decision {
-    /// Score ≥ 0.92, only empty fields would change, and the user enabled
+    /// A fingerprint match scoring at least the auto-apply threshold (never
+    /// below 0.90), only empty fields would change, and the user enabled
     /// auto-apply (off by default).
     AutoApply,
     /// A candidate worth showing; the user decides.

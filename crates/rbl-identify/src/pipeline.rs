@@ -50,13 +50,13 @@ pub struct Settings {
     pub auto_apply: bool,
     pub genre: GenrePolicy,
     /// The score auto-apply needs; never below
-    /// [`decide::AUTO_APPLY_THRESHOLD`] ([`decide::decide`] raises it).
+    /// [`decide::AUTO_APPLY_FLOOR`] ([`decide::decide`] raises it).
     pub auto_apply_threshold: f64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { auto_apply: false, genre: GenrePolicy::default(), auto_apply_threshold: decide::AUTO_APPLY_THRESHOLD }
+        Self { auto_apply: false, genre: GenrePolicy::default(), auto_apply_threshold: decide::DEFAULT_AUTO_APPLY_THRESHOLD }
     }
 }
 

@@ -209,7 +209,7 @@ impl Summary {
             Verdict::Wrong => self.wrong += 1,
             Verdict::Unidentified | Verdict::NoGroundTruth => {}
         }
-        if result.best().is_some_and(|b| b.score >= decide::AUTO_APPLY_THRESHOLD) {
+        if result.best().is_some_and(|b| b.score >= decide::AUTO_APPLY_FLOOR) {
             self.strong += 1;
             if verdict == Verdict::Wrong {
                 self.strong_wrong += 1;
@@ -257,7 +257,7 @@ impl Summary {
             pct(self.correct, identified),
             pct(self.correct, self.tracks)
         );
-        let _ = writeln!(out, "score >= {}: {} candidates, {} wrong (must be 0)", decide::AUTO_APPLY_THRESHOLD, self.strong, self.strong_wrong);
+        let _ = writeln!(out, "score >= {}: {} candidates, {} wrong (must be 0)", decide::AUTO_APPLY_FLOOR, self.strong, self.strong_wrong);
         if self.mainstream == 0 {
             let _ = writeln!(out, "mainstream correct: n/a (column not filled)");
         } else {

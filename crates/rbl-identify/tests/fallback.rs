@@ -11,7 +11,7 @@ use common::FakeTransport;
 use rbl_identify::IdentifyError;
 use rbl_identify::clock::ManualClock;
 use rbl_identify::config::Secret;
-use rbl_identify::decide::{AUTO_APPLY_THRESHOLD, REVIEW_THRESHOLD};
+use rbl_identify::decide::{AUTO_APPLY_FLOOR, REVIEW_THRESHOLD};
 use rbl_identify::discogs::DiscogsClient;
 use rbl_identify::fallback::{self, FallbackMatch, DISCOGS_CAP, LABEL_DIFFERS_CAP, NO_DURATION_CAP};
 use rbl_identify::model::{CandidateSource, ExistingTags};
@@ -71,7 +71,7 @@ fn the_release_on_the_files_label_is_opened_first_and_matched() {
     assert_eq!(found.scored.candidate.artist_credit, "Example Artist");
     assert!(found.scored.candidate.recording_mbid.is_empty(), "no MusicBrainz recording");
     assert!((found.scored.score - DISCOGS_CAP).abs() < f64::EPSILON, "{:?}", found.scored);
-    assert!(found.scored.score < AUTO_APPLY_THRESHOLD);
+    assert!(found.scored.score < AUTO_APPLY_FLOOR);
     assert_eq!(found.enrichment.discogs_release_id, Some(9_000_102));
     assert_eq!((found.enrichment.label.as_str(), found.enrichment.catalog_number.as_str()), ("Fallback Records", "FB 001"));
     assert_eq!(found.enrichment.styles, ["Tech House", "Minimal"]);

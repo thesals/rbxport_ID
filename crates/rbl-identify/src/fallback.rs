@@ -34,8 +34,8 @@ pub const MAX_RELEASES: usize = 2;
 pub const MAX_SEARCHES: usize = 3;
 /// How far a duration Discogs lists may be from the file's.
 pub const MAX_DURATION_DELTA_SECS: f64 = 3.0;
-/// The ceiling of a fallback candidate: reviewable, never near the 0.92
-/// auto-apply threshold.
+/// The ceiling of a fallback candidate: reviewable, never near the 0.90
+/// auto-apply floor.
 pub const DISCOGS_CAP: f64 = 0.85;
 /// The ceiling when Discogs lists no duration for the track, so only the
 /// text vouches for it.
@@ -319,7 +319,7 @@ mod tests {
         let file = tags("Example Artist", "Fallback Track (Extended Mix)", "");
         let s = score_match(&file, 390.0, cand("Example Artist", "Fallback Track (Extended Mix)", Some(390_000)), true, None);
         assert!((s.score - DISCOGS_CAP).abs() < f64::EPSILON, "{s:?}");
-        assert!(s.score < crate::decide::AUTO_APPLY_THRESHOLD);
+        assert!(s.score < crate::decide::AUTO_APPLY_FLOOR);
         assert_eq!(s.breakdown.rejected.as_deref(), Some("Discogs fallback: capped at 0.85"));
     }
 

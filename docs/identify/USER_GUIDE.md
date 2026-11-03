@@ -51,7 +51,7 @@ Whichever you choose, the styles are also offered for the comment, for review.
 Auto-apply is off by default. When it's on, a result is written to the file during the run, without review, only if all of these are true:
 
 - the match came from the audio fingerprint, not a text search or Discogs;
-- the score is at least the threshold you set, between 0.92 and 1.00;
+- the score is at least the threshold you set, between 0.90 (the default) and 1.00;
 - every change fills an **empty** field.
 
 Comment (sub-genre) changes and anything that would overwrite a value are never auto-applied. An auto-applied result appears under **Applied** and can be undone like any other. If its write fails, for example because the file is open in a player, it stays under **Needs review** with the reason as a warning. If the write was interrupted partway, the result waits until the next start, which settles it (see [Safety](#safety)).

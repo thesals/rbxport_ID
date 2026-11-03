@@ -36,7 +36,7 @@ This fork of rbxport adds track identification and tag correction. Upstream deli
 4. **Enrich.** Run a Discogs search by artist + title (+ label/catno when known) to fill label, catalog number, year and **styles**, which give sub-genre granularity such as Tech House or Progressive House. Pull artwork from Cover Art Archive or Discogs only if the track has none.
 5. **Score** each candidate from 0 to 1, combining: AcoustID score, duration delta (≤ 2 s strong, > 10 s reject), string similarity to existing tags (normalized; ignore case, "feat." variants and punctuation), and mix-name agreement ("Extended Mix" vs "Radio Edit" vs a remix must match). Never treat a remix and the original as the same track.
 6. **Decide.**
-   - **Auto-apply** only if score ≥ 0.92, the change fills *empty* fields only, and the user has enabled auto-apply. The default is off.
+   - **Auto-apply** only if score ≥ 0.92 (this fork: ≥ 0.90, the user's decision; the threshold setting defaults to 0.90 and can only raise it), the change fills *empty* fields only, and the user has enabled auto-apply. The default is off.
    - **Review** for everything else with a candidate.
    - **Unidentified** when no candidate scores ≥ 0.5. Don't guess.
 7. **Write.** On accept: snapshot the originals, write the tags with `lofty`, update the library record, and record an undo entry.
