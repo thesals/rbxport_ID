@@ -592,17 +592,53 @@ fn identify_and_save(
     let path = PathBuf::from(&path_text);
     let mut result = identifier.identify(&path).map_err(|e| e.to_string())?;
     let score = result.best().map(|b| b.score);
-    let decision = result.decision;
+    let mut decision = result.decision;
     // A refusal (a track whose result was applied, or has a write open) is
     // this track's failure, not an internal error to report.
     let result_id = state
         .with_store(|store| {
             let library = LibraryTrack { track_id: track.track_id.clone(), path: raw.to_owned() };
-            save(store, &key, &mut result, &library, track.rekordbox.as_ref())
-                .map_err(|e| AppError::new(ErrorKind::Malformed, e.to_string()))
+            let id = save(store, &key, &mut result, &library, track.rekordbox.as_ref())
+                .map_err(|e| AppError::new(ErrorKind::Malformed, e.to_string()))?;
+            // Auto-apply (opted in, and decided only for a fingerprint match
+            // at or above the threshold that fills empty fields): written now,
+            // or left for review with the reason.
+            if decision == Decision::AutoApply {
+                if let Err(reason) = auto_apply(store, id) {
+                    tracing::warn!(result = id, "identify: an auto-apply was not written; left for review");
+                    tracing::debug!(%reason, "identify: auto-apply refused");
+                    decision = Decision::Review;
+                }
+            }
+            Ok(id)
         })
         .map_err(|e| e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message)))?;
     Ok((path_text, result_id, decision, score))
+}
+
+/// Writes an auto-apply result to its file, every field of its proposal,
+/// through the same recorded path as a user's apply
+/// ([`rbl_identify::write::apply_result`]), so it ends `AutoApplied` and can
+/// be undone. The proposal must still only fill empty fields (never a
+/// sub-genre, never an overwrite; artwork only for a file without any).
+/// When it is not written the result becomes a pending review carrying the
+/// reason; the error is that reason.
+fn auto_apply(store: &Store, result: ResultId) -> Result<(), String> {
+    let written = (|| {
+        let (item, ..) = store.result(result).map_err(|e| e.to_string())?.ok_or("the result is not in the store")?;
+        let proposal = item.proposal.as_ref().filter(|p| p.fills_only_empty()).ok_or("the proposal does not only fill empty fields")?;
+        let fields: Vec<Field> = proposal.changes.iter().map(|c| c.field).collect();
+        rbl_identify::write::apply_result(store, result, &fields).map(|_| ()).map_err(|e| e.to_string())
+    })();
+    written.map_err(|e| {
+        let reason = format!("Auto-apply did not write this file: {e}");
+        // A write left open (it may have half landed) keeps the result
+        // accepted until startup reconciles it.
+        if let Err(e) = store.demote_auto_apply(result, &reason) {
+            tracing::warn!(error = %e, "identify: an unwritten auto-apply could not be returned to review");
+        }
+        reason
+    })
 }
 
 /// Saves a finished track (its cover, row, result and the imported library
@@ -1489,6 +1525,23 @@ mod tests {
         }
     }
 
+    /// A fingerprint match that only fills the file's empty title and
+    /// catalog number, decided `decision`.
+    fn fill_result(path: &Path, decision: Decision) -> TrackResult {
+        let mut r = result(path, Decision::Review);
+        r.decision = decision;
+        r.artwork = None;
+        r.proposal = Some(Proposal::new(
+            vec![
+                FieldChange { field: Field::Title, current: String::new(), proposed: "The Music (Extended Mix)".into() },
+                FieldChange { field: Field::CatalogNumber, current: String::new(), proposed: "ABC001".into() },
+            ],
+            None,
+            true,
+        ));
+        r
+    }
+
     impl Identifier for Fake {
         fn identify(&self, path: &Path) -> rbl_identify::Result<TrackResult> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1500,6 +1553,9 @@ mod tests {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if name.starts_with("broken") {
                 return Err(rbl_identify::IdentifyError::Fingerprint("not audio".into()));
+            }
+            if name.starts_with("auto") || name.starts_with("fill") {
+                return Ok(fill_result(path, if name.starts_with("auto") { Decision::AutoApply } else { Decision::Review }));
             }
             Ok(result(path, if name.starts_with("review") { Decision::Review } else { Decision::Unidentified }))
         }
@@ -1583,6 +1639,82 @@ mod tests {
         let hash = Store::open_in_memory().unwrap().put_artwork(JPEG, "image/jpeg").unwrap();
         let stored = state.with_store(|s| s.artwork(&hash).map_err(store_error)).unwrap();
         assert_eq!(stored.map(|(bytes, _)| bytes), Some(JPEG.to_vec()));
+    }
+
+    #[test]
+    fn an_auto_apply_result_is_written_by_the_job_and_can_be_undone() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = IdentifyState::with_root(root.path());
+        let audio = files.path().join("auto.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let job = JobTrack {
+            track_id: "1".into(),
+            title: "auto".into(),
+            path: Some(audio.to_string_lossy().into_owned()),
+            rekordbox: None,
+        };
+        let events = run(&state, &[job], &Fake::new(), &AtomicBool::new(false));
+        let JobEvent::Result(done) = &events[1] else { panic!("expected a result") };
+        assert_eq!((done.decision, done.error.as_deref()), (ResultDecision::AutoApply, None));
+        let Some(JobEvent::Progress(last)) = events.last() else { panic!("no final progress") };
+        assert_eq!((last.identified, last.review), (1, 0));
+        let written = tags::read(&audio).unwrap().snapshot;
+        assert_eq!(rbl_identify::pipeline::current(&written, Field::Title), "The Music (Extended Mix)");
+        assert_eq!(rbl_identify::pipeline::current(&written, Field::CatalogNumber), "ABC001");
+        let applied = state.queue(QueueFilter::Applied, 0, 10).unwrap().items.remove(0);
+        assert_eq!((applied.state.as_str(), applied.undoable), ("autoApplied", true));
+        assert!(state.undo_item(applied.result_id).ok);
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+    }
+
+    #[test]
+    fn an_auto_apply_that_cannot_be_written_is_left_for_review_and_the_job_goes_on() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = IdentifyState::with_root(root.path());
+        let audio = files.path().join("auto.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let mut permissions = std::fs::metadata(&audio).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&audio, permissions.clone()).unwrap();
+        let tracks = [
+            JobTrack { track_id: "1".into(), title: "auto".into(), path: Some(audio.to_string_lossy().into_owned()), rekordbox: None },
+            track(files.path(), "unknown.mp3", true),
+        ];
+        let events = run(&state, &tracks, &Fake::new(), &AtomicBool::new(false));
+        let JobEvent::Result(first) = &events[1] else { panic!("expected a result") };
+        assert_eq!(first.decision, ResultDecision::Review, "reported as what happened");
+        let Some(JobEvent::Progress(last)) = events.last() else { panic!("no final progress") };
+        assert_eq!((last.done, last.identified, last.review, last.unidentified), (2, 0, 1, 1));
+        #[allow(clippy::permissions_set_readonly_false, reason = "the test file must be deletable again")]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&audio, permissions).unwrap();
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "nothing written");
+        let item = state.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items.remove(0);
+        assert_eq!((item.state.as_str(), item.decision.as_str()), ("pending", "review"));
+        let detail = state.detail(item.result_id).unwrap();
+        assert!(detail.warnings.iter().any(|w| w.contains("read-only")), "{:?}", detail.warnings);
+        assert_eq!(state.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
+        // Applied by the user later, it is the user's write.
+        assert!(state.apply_items(&ticked(item.result_id, &["title"]))[0].ok);
+        assert_eq!(state.detail(item.result_id).unwrap().item.state, "applied");
+    }
+
+    #[test]
+    fn a_fill_only_result_not_decided_for_auto_apply_is_never_written() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = IdentifyState::with_root(root.path());
+        let audio = files.path().join("fill.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let job = JobTrack { track_id: "1".into(), title: "fill".into(), path: Some(audio.to_string_lossy().into_owned()), rekordbox: None };
+        run(&state, &[job], &Fake::new(), &AtomicBool::new(false));
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        assert_eq!(state.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items[0].state, "pending");
     }
 
     #[test]

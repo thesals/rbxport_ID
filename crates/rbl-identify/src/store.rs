@@ -1405,6 +1405,38 @@ impl Store {
         Ok(proposal)
     }
 
+    /// An auto-apply that could not be written becomes a review: its
+    /// decision `Review` (so a later write is recorded as `Applied`, by the
+    /// user), its state `Pending` (it shows under Needs review), and `reason`
+    /// appended to its warnings. Refused unless the result is current,
+    /// decided `AutoApply` and `Accepted`, and while its track has a write
+    /// open (that one must be reconciled first).
+    pub fn demote_auto_apply(&self, result: ResultId, reason: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let from = current_state(&tx, result)?;
+        let (track, decision, warnings): (TrackId, String, String) = tx
+            .query_row("SELECT track_id, decision, warnings_json FROM results WHERE id = ?1", [result], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(|e| sql("read the result", &e))?;
+        if from != ReviewState::Accepted || parse_decision(&decision)? != Decision::AutoApply {
+            return Err(IdentifyError::Store(format!("result {result} is not an unwritten auto-apply")));
+        }
+        if has_open_application(&tx, track)? {
+            return Err(IdentifyError::Store(format!(
+                "result {result}: a write is in progress; it must be completed or abandoned first"
+            )));
+        }
+        let mut warnings: Vec<String> = from_json(&warnings, "warnings")?;
+        warnings.push(reason.to_owned());
+        tx.execute(
+            "UPDATE results SET decision = 'Review', state = 'Pending', warnings_json = ?2, updated_unix = ?3 WHERE id = ?1",
+            params![result, to_json(&warnings, "warnings")?, now_unix()],
+        )
+        .map_err(|e| sql("demote the auto-apply", &e))?;
+        tx.commit().map_err(|e| sql("commit the demotion", &e))
+    }
+
     /// Bulk accept: every current `Pending` result scoring at least
     /// `threshold` becomes `Accepted`. Returns them, best first.
     pub fn accept_at_or_above(&self, threshold: f64) -> Result<Vec<ResultId>> {
@@ -1885,6 +1917,21 @@ mod tests {
         let path = store.result(result).unwrap().unwrap().0.path;
         let after = TrackKey { path, file_size: 2_000, modified_unix: 1_800_000_000 };
         record_applied(store, result, &proposal().changes, None, &snapshot("T"), &after, None).unwrap();
+    }
+
+    #[test]
+    fn an_unwritten_auto_apply_becomes_a_pending_review_with_its_reason() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        let auto = store.save_result(track, Decision::AutoApply, &[], Some(&proposal()), None, &[], false).unwrap();
+        store.demote_auto_apply(auto, "the file is read-only").unwrap();
+        let (item, _, _, warnings) = store.result(auto).unwrap().unwrap();
+        assert_eq!((item.state, item.decision), (ReviewState::Pending, Decision::Review));
+        assert_eq!(warnings, ["the file is read-only"]);
+        assert!(store.demote_auto_apply(auto, "again").is_err(), "only an unwritten auto-apply");
+        let review = store.save_result(track, Decision::Review, &[], Some(&proposal()), None, &[], false).unwrap();
+        store.set_state(review, ReviewState::Accepted).unwrap();
+        assert!(store.demote_auto_apply(review, "x").is_err(), "a user's accept is left alone");
     }
 
     #[test]
