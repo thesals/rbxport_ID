@@ -254,8 +254,10 @@ impl Sources {
     }
 
     /// Validates the whole update, then writes what it changes. Nothing is
-    /// written when any part is refused.
-    pub(crate) fn save(&self, update: &IdentifySettingsUpdateDto) -> AppResult<()> {
+    /// written when any part is refused. `before_write` runs once, just
+    /// before the first file is written, so a caller holding state built
+    /// from the old settings can drop it even if a later write fails.
+    pub(crate) fn save(&self, update: &IdentifySettingsUpdateDto, before_write: impl FnOnce()) -> AppResult<()> {
         if let Some(t) = update.auto_apply_threshold {
             if !valid_threshold(t) {
                 return Err(AppError::new(
@@ -281,6 +283,7 @@ impl Sources {
         if let Some(t) = update.auto_apply_threshold {
             stored.auto_apply_threshold = t;
         }
+        let json = Some(serde_json::to_vec_pretty(&stored).map_err(|e| AppError::internal(format!("identify settings: {e}")))?);
 
         // Everything is checked (and the new file built) before anything is
         // written.
@@ -299,13 +302,18 @@ impl Sources {
             let borrowed: Vec<(&str, Option<&str>)> = changes.iter().map(|(k, v)| (*k, v.as_deref())).collect();
             Some(rewrite_env(&text, &borrowed)?)
         };
-        let json = serde_json::to_vec_pretty(&stored).map_err(|e| AppError::internal(format!("identify settings: {e}")))?;
-
+        if json.is_none() && env_text.is_none() {
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.root).map_err(|e| write_failed(&self.root, &e))?;
+        before_write();
+        if let Some(json) = json {
+            write_atomic(&self.settings_json(), &json)?;
+        }
         if let Some(text) = env_text {
             write_atomic(&self.env_file(), text.as_bytes())?;
         }
-        write_atomic(&self.settings_json(), &json)
+        Ok(())
     }
 }
 
@@ -427,15 +435,15 @@ mod tests {
     fn absent_null_and_string_mean_keep_clear_and_replace() {
         let dir = tempfile::tempdir().unwrap();
         let s = sources(dir.path(), &[], Vec::new());
-        s.save(&update(&format!(r#"{{"acoustidKey":"  {SECRET}  ","discogsToken":"tok","mbUserAgent":"ua/1 ( a@b.c )"}}"#)))
+        s.save(&update(&format!(r#"{{"acoustidKey":"  {SECRET}  ","discogsToken":"tok","mbUserAgent":"ua/1 ( a@b.c )"}}"#)), || {})
             .unwrap();
         assert_eq!(s.resolve(ACOUSTID_KEY), Some((SECRET.to_owned(), KeySource::Settings)), "trimmed");
         // Absent: kept.
-        s.save(&update(r#"{"autoApply":true}"#)).unwrap();
+        s.save(&update(r#"{"autoApply":true}"#), || {}).unwrap();
         assert_eq!(s.resolve(ACOUSTID_KEY).map(|r| r.1), Some(KeySource::Settings));
         assert_eq!(s.resolve(DISCOGS_TOKEN).map(|r| r.1), Some(KeySource::Settings));
         // Null and the empty string: cleared.
-        s.save(&update(r#"{"acoustidKey":null,"discogsToken":"   "}"#)).unwrap();
+        s.save(&update(r#"{"acoustidKey":null,"discogsToken":"   "}"#), || {}).unwrap();
         assert_eq!(s.resolve(ACOUSTID_KEY), None);
         assert_eq!(s.resolve(DISCOGS_TOKEN), None);
         let dto = s.dto();
@@ -454,13 +462,13 @@ mod tests {
         let s = sources(dir.path(), &[], Vec::new());
         let set = update(&format!(r#"{{"acoustidKey":"{SECRET}","discogsToken":"{SECRET}"}}"#));
         assert!(!format!("{set:?}").contains(SECRET));
-        s.save(&set).unwrap();
+        s.save(&set, || {}).unwrap();
         let dto = s.dto();
         assert!(!serde_json::to_string(&dto).unwrap().contains(SECRET));
         assert!(!format!("{dto:?}").contains(SECRET));
         // An error about a key names the key, not the value.
         let bad = format!("{SECRET}\nINJECTED=1");
-        let error = s.save(&IdentifySettingsUpdateDto { acoustid_key: SecretUpdate::Set(bad), ..Default::default() }).unwrap_err();
+        let error = s.save(&IdentifySettingsUpdateDto { acoustid_key: SecretUpdate::Set(bad), ..Default::default() }, || {}).unwrap_err();
         let shown = format!("{error:?} {}", serde_json::to_string(&error).unwrap());
         assert!(shown.contains(ACOUSTID_KEY) && !shown.contains(SECRET), "{shown}");
         // And the refused update wrote nothing.
@@ -468,7 +476,7 @@ mod tests {
         assert!(!std::fs::read_to_string(s.env_file()).unwrap().contains("INJECTED"));
         // The missing-key error never shows a value either.
         let partial = sources(dir.path(), &[], Vec::new());
-        partial.save(&update(r#"{"mbUserAgent":""}"#)).unwrap();
+        partial.save(&update(r#"{"mbUserAgent":""}"#), || {}).unwrap();
         let error = format!("{:?}", partial.config().unwrap_err());
         assert!(error.contains(MB_USER_AGENT) && !error.contains(SECRET), "{error}");
     }
@@ -479,14 +487,14 @@ mod tests {
         let s = sources(dir.path(), &[], Vec::new());
         let original = "\u{feff}# my keys\r\nOTHER=keep me # really\r\n\r\nACOUSTID_API_KEY=old\r\n# trailing comment\r\nACOUSTID_API_KEY=dupe\r\n";
         std::fs::write(s.env_file(), original).unwrap();
-        s.save(&update(r#"{"acoustidKey":"new value # with hash","mbUserAgent":"ua"}"#)).unwrap();
+        s.save(&update(r#"{"acoustidKey":"new value # with hash","mbUserAgent":"ua"}"#), || {}).unwrap();
         let text = std::fs::read_to_string(s.env_file()).unwrap();
         assert_eq!(
             text,
             "\u{feff}# my keys\r\nOTHER=keep me # really\r\n\r\nACOUSTID_API_KEY=\"new value # with hash\"\r\n# trailing comment\r\nMB_USER_AGENT=ua\r\n"
         );
         assert_eq!(s.resolve(ACOUSTID_KEY).map(|r| r.0).as_deref(), Some("new value # with hash"));
-        s.save(&update(r#"{"acoustidKey":null}"#)).unwrap();
+        s.save(&update(r#"{"acoustidKey":null}"#), || {}).unwrap();
         let text = std::fs::read_to_string(s.env_file()).unwrap();
         assert!(!text.contains(ACOUSTID_KEY) && text.contains("OTHER=keep me # really"), "{text}");
         // Staged files never outlive the save.
@@ -533,21 +541,39 @@ mod tests {
         assert_eq!((dto.genre_policy, dto.auto_apply, dto.auto_apply_threshold), (GenrePolicyDto::FillEmpty, false, 0.92));
         for bad in [0.91, 1.01, -1.0, f64::NAN, f64::INFINITY] {
             let error = s
-                .save(&IdentifySettingsUpdateDto { auto_apply_threshold: Some(bad), auto_apply: Some(true), ..Default::default() })
+                .save(
+                    &IdentifySettingsUpdateDto { auto_apply_threshold: Some(bad), auto_apply: Some(true), ..Default::default() },
+                    || {},
+                )
                 .unwrap_err();
             assert_eq!(error.kind, ErrorKind::Malformed, "{bad}");
         }
         assert!(!s.dto().auto_apply, "a refused update changes nothing");
-        s.save(&update(r#"{"autoApplyThreshold":0.97,"genrePolicy":"never"}"#)).unwrap();
+        s.save(&update(r#"{"autoApplyThreshold":0.97,"genrePolicy":"never"}"#), || {}).unwrap();
         let dto = s.dto();
         assert_eq!((dto.auto_apply_threshold, dto.genre_policy), (0.97, GenrePolicyDto::Never));
-        s.save(&update(r#"{"autoApplyThreshold":1}"#)).unwrap();
+        s.save(&update(r#"{"autoApplyThreshold":1}"#), || {}).unwrap();
         assert_eq!(s.dto().auto_apply_threshold, 1.0);
         // A hand-edited file out of range is brought back into it.
         std::fs::write(dir.path().join(SETTINGS_FILE), r#"{"autoApplyThreshold":0.1}"#).unwrap();
         assert_eq!(s.dto().auto_apply_threshold, 0.92);
         std::fs::write(dir.path().join(SETTINGS_FILE), "not json").unwrap();
         assert_eq!(s.stored(), Stored::default());
+    }
+
+    #[test]
+    fn before_write_runs_once_before_any_write_and_not_for_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sources(dir.path(), &[], Vec::new());
+        let calls = std::cell::Cell::new(0);
+        s.save(&update(r#"{"autoApplyThreshold":0.1}"#), || calls.set(calls.get() + 1)).unwrap_err();
+        assert_eq!(calls.get(), 0);
+        s.save(&update(r#"{"autoApply":true,"acoustidKey":"k"}"#), || {
+            assert!(!dir.path().join(SETTINGS_FILE).exists() && !s.env_file().exists(), "before anything is written");
+            calls.set(calls.get() + 1);
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

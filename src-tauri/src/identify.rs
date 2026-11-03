@@ -301,13 +301,17 @@ impl IdentifyState {
     /// with. Blocking: call from a worker thread.
     pub(crate) fn save_settings(&self, update: &IdentifySettingsUpdateDto) -> AppResult<IdentifySettingsDto> {
         let _saving = self.settings_lock.lock();
-        self.sources.save(update)?;
-        let old = self.engine.lock().take();
+        // Dropped from the cache before the first file is written, so even
+        // a save that fails halfway leaves no engine built from the old
+        // settings.
+        let mut old = None;
+        let saved = self.sources.save(update, || old = self.engine.lock().take());
         // reqwest's blocking client must not be dropped on the async
         // runtime; a running job's own Arc keeps it alive meanwhile.
         if let Some(old) = old {
             off_runtime(move || drop(old))?;
         }
+        saved?;
         Ok(self.sources.dto())
     }
 
@@ -1902,6 +1906,31 @@ mod tests {
         let bad: IdentifySettingsUpdateDto = serde_json::from_str(r#"{"autoApplyThreshold":0.5}"#).unwrap();
         assert_eq!(state.save_settings(&bad).unwrap_err().kind, ErrorKind::Malformed);
         assert!(Arc::ptr_eq(&next, &state.engine().unwrap()));
+    }
+
+    /// A save whose second write fails (here `.env.identify` is read-only,
+    /// which refuses the rename over it on Windows) still drops the cached
+    /// services: the first write already changed the settings.
+    #[cfg(windows)]
+    #[test]
+    fn a_save_that_fails_halfway_still_drops_the_cached_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = isolated(dir.path());
+        let env_file = dir.path().join(ENV_FILE);
+        std::fs::write(&env_file, "ACOUSTID_API_KEY=sekrit-key\nMB_USER_AGENT=rbxport-test/1 ( a@b.c )\n").unwrap();
+        let first = state.engine().unwrap();
+        let mut permissions = std::fs::metadata(&env_file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&env_file, permissions.clone()).unwrap();
+        let change: IdentifySettingsUpdateDto = serde_json::from_str(r#"{"autoApply":true,"discogsToken":"tok"}"#).unwrap();
+        let error = state.save_settings(&change);
+        #[allow(clippy::permissions_set_readonly_false, reason = "the test file must be deletable again")]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&env_file, permissions).unwrap();
+        assert!(error.is_err(), "the key could not be written");
+        let next = state.engine().unwrap();
+        assert!(!Arc::ptr_eq(&first, &next), "not the services built from the old settings");
+        assert!(next.settings.auto_apply, "the settings that were written are used");
     }
 
     /// One second of silent 16-bit mono WAV.
