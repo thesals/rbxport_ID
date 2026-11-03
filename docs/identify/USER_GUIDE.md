@@ -51,7 +51,7 @@ Whichever you choose, the styles are also offered for the comment, for review.
 Auto-apply is off by default. When it's on, a result is written to the file during the run, without review, only if all of these are true:
 
 - the match came from the audio fingerprint, not a text search or Discogs;
-- the score is at least the threshold you set, between 0.90 (the default) and 1.00;
+- the confidence score is at least the level you set, from 90% (the default) to 100%;
 - every change fills an **empty** field.
 
 Comment (sub-genre) changes and anything that would overwrite a value are never auto-applied. An auto-applied result appears under **Applied** and can be undone like any other. If the file is open in a player, the write waits until the file is free (see [Files in use](#files-in-use)); it isn't counted as identified until it's written. If its write fails for another reason, for example because the file is read-only, it stays under **Needs review** with the reason as a warning. If the write was interrupted partway, the result waits until the next start, which settles it (see [Safety](#safety)).
@@ -123,15 +123,15 @@ If rbxport or the computer stops in the middle of a write, the next start checks
 - **The file still holds its old tags:** the write is marked as not done.
 - **The file holds the new tags:** the write is marked as done.
 - **The file holds something else:** the write is closed as unknown and the result goes back to **Needs review**. Its original tags are kept.
-- **The file's tags can't be read at all:** the write is closed as unknown and the result goes back to **Needs review** with a warning. Its original tags are kept.
-- **A player has the file open:** the write stays open and is checked again when rbxport closes and at the next start.
+- **The file opens, but its tags can't be understood:** the write is closed as unknown and the result goes back to **Needs review** with a warning. Its original tags are kept.
+- **A player has the file open, or it can't be read right now:** the write stays open and is checked again when rbxport closes and at the next start.
 - **The file can't be found:** for example, it's on a drive that isn't connected. The write stays open, and the track can't be reviewed or written, until a later start finds the file again.
 
 ### Files in use
 
-When you apply a result, or auto-apply writes one, while another program has the file open, nothing is written and nothing fails. The result stays accepted and shows under **Waiting for file** with the fields to write. rbxport tries it again when it starts, when it closes (for up to about 10 seconds; anything left waits for the next start), before every identification run and every apply, and when you choose **Retry now**. **Cancel write** drops it and puts the result back under **Needs review**.
+When you apply a result, or auto-apply writes one, while another program has the file open, nothing is written and nothing fails. The result stays accepted and shows under **Waiting for file** with the fields to write. rbxport tries it again when it starts, when it closes (for up to about 10 seconds; a write that can't finish in time is stopped cleanly and waits for the next start), before every identification run and every apply, and when you choose **Retry now**. **Cancel write** drops it and puts the result back under **Needs review**.
 
-Each try goes through the same checks as a normal apply. If the file still holds the tags you reviewed, the write is made and can be undone. If the file has changed meanwhile, the write is dropped and the result goes back to **Needs review** with a warning saying why. While a write waits you can't accept, reject or edit the result; choose **Cancel write** first.
+Each try goes through the same checks as a normal apply. If the file still holds the tags you reviewed, the write is made and can be undone. If the file has changed meanwhile, the write is dropped and the result goes back to **Needs review** with a warning saying why. While a write waits you can't accept, reject or edit the result, or identify the track again; choose **Cancel write** first.
 
 Undo is never deferred: undoing a file that's open in another program fails with a message, and you can try again once it's closed.
 
