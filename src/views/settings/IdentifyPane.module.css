@@ -30,3 +30,5 @@
 .switch { display: flex; align-items: center; justify-content: space-between; gap: 16px; cursor: pointer; }
 .error { margin: 8px 0 0; color: var(--c-error); font-size: var(--f-size-sm); }
 .path { margin: 6px 0 0; font-size: var(--f-size-sm); overflow-wrap: anywhere; user-select: text; }
+.confirm { margin-top: 10px; padding: 10px; border: 1px solid var(--c-outline); border-radius: 4px; }
+.warning { margin: 0; color: var(--c-text); font-size: var(--f-size-sm); line-height: 1.5; }

@@ -1,7 +1,12 @@
 /**
  * Track identification's settings (fork-only; `docs/identify/IDENTIFY_SPEC.md`):
- * the AcoustID key, the Discogs token and the MusicBrainz user agent the
- * services need, how Discogs styles are proposed for Genre, and auto-apply.
+ * the lock on writing tags to audio files, the AcoustID key, the Discogs
+ * token and the MusicBrainz user agent the services need, how Discogs
+ * styles are proposed for Genre, and auto-apply.
+ *
+ * "Write tags to audio files" is off by default, and the backend refuses
+ * every audio-file write while it is. Turning it on takes a second,
+ * explicit step here; turning it off is immediate.
  *
  * Keys are secrets. The backend reports only where each comes from, never
  * its value; a new one is typed into an empty password box and sent once,
@@ -39,7 +44,7 @@ export const THRESHOLD_MAX = 1;
 const percent = (value: number) => String(Math.round(value * 100));
 
 /** Which part of the pane a save came from, so its error shows beside it. */
-type Area = "acoustidKey" | "discogsToken" | "mbUserAgent" | "genrePolicy" | "autoApply";
+type Area = "fileWrites" | "acoustidKey" | "discogsToken" | "mbUserAgent" | "genrePolicy" | "autoApply";
 
 function sourceText(source: IdentifyKeySource, t: Translate): string {
   switch (source) {
@@ -164,6 +169,8 @@ export function IdentifyPane() {
   const [busy, setBusy] = useState(false);
   const [agent, setAgent] = useState("");
   const [threshold, setThreshold] = useState("");
+  // Asked to turn file writes on, waiting for the confirmation.
+  const [confirmingWrites, setConfirmingWrites] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -230,6 +237,19 @@ export function IdentifyPane() {
   ];
 
   const agentFromEnvironment = settings.mbUserAgentSource === "environment";
+  const writesOff = !settings.fileWrites;
+  const onWritesToggle = (on: boolean) => {
+    if (on) {
+      setError("fileWrites", null);
+      setConfirmingWrites(true);
+      return;
+    }
+    setConfirmingWrites(false);
+    void save("fileWrites", { fileWrites: false });
+  };
+  const confirmWrites = async () => {
+    if (await save("fileWrites", { fileWrites: true })) setConfirmingWrites(false);
+  };
   const agentLocked = lockedReason(settings.mbUserAgentSource, "MB_USER_AGENT", t);
 
   return (
@@ -237,6 +257,40 @@ export function IdentifyPane() {
       <p className={`${layout.help} ${styles.intro}`}>
         {t("Identify tracks with AcoustID, MusicBrainz and Discogs. Only the tags in the audio files are written; the rekordbox library is not changed.")}
       </p>
+
+      <section className={`${layout.card} ${styles.card}`} aria-label={t("Write tags to audio files")}>
+        <label className={styles.switch}>
+          <strong id={`${id}-writes`}>{t("Write tags to audio files")}</strong>
+          <input
+            type="checkbox"
+            role="switch"
+            className={controls.toggle}
+            aria-labelledby={`${id}-writes`}
+            aria-describedby={`${id}-writes-help`}
+            // Shown on only once it is saved on, not while the confirmation is asked for.
+            checked={settings.fileWrites}
+            disabled={busy || confirmingWrites}
+            onChange={(event) => onWritesToggle(event.target.checked)}
+          />
+        </label>
+        <p id={`${id}-writes-help`} className={layout.help}>
+          {t("While this is off, identification only reads the audio files and saves proposals for review. Nothing is written to them, not by Accept, Undo or auto-apply. Off by default.")}
+        </p>
+        {confirmingWrites ? (
+          <div className={styles.confirm} role="group" aria-label={t("Confirm writing tags to audio files")}>
+            <p className={styles.warning}>
+              {t("Accept, Undo, Apply accepted and auto-apply will change the tags in your audio files, including files in your rekordbox library. The rekordbox library itself is not changed.")}
+            </p>
+            <div className={styles.actions}>
+              <button type="button" className={controls.button} disabled={busy} onClick={() => void confirmWrites()}>
+                {t("Turn on writing")}
+              </button>
+              <Button onClick={() => setConfirmingWrites(false)}>{t("Cancel")}</Button>
+            </div>
+          </div>
+        ) : null}
+        {errors.fileWrites !== undefined ? <p className={styles.error} role="alert">{errors.fileWrites}</p> : null}
+      </section>
 
       <KeyCard
         name={t("AcoustID API key")}
@@ -325,7 +379,7 @@ export function IdentifyPane() {
             aria-labelledby={`${id}-auto`}
             aria-describedby={`${id}-auto-help`}
             checked={settings.autoApply}
-            disabled={busy}
+            disabled={busy || writesOff}
             onChange={(event) => void save("autoApply", { autoApply: event.target.checked })}
           />
         </label>
@@ -346,7 +400,7 @@ export function IdentifyPane() {
             step={1}
             value={threshold}
             aria-describedby={`${id}-threshold-help`}
-            disabled={busy || !settings.autoApply}
+            disabled={busy || writesOff || !settings.autoApply}
             onChange={(event) => setThreshold(event.target.value)}
             onBlur={commitThreshold}
             onKeyDown={(event) => { if (event.key === "Enter") commitThreshold(); }}
@@ -357,6 +411,11 @@ export function IdentifyPane() {
           {t("Write automatically at {percent}% confidence or higher.", { percent: percent(settings.autoApplyThreshold) })}
           {" "}{t("From {min}% to {max}%.", { min: percent(THRESHOLD_MIN), max: percent(THRESHOLD_MAX) })}
         </p>
+        {writesOff ? (
+          <p className={layout.help} role="note">
+            {t("Auto-apply needs {setting} turned on. Until then, every match waits for review.", { setting: t("Write tags to audio files") })}
+          </p>
+        ) : null}
         {errors.autoApply !== undefined ? <p className={styles.error} role="alert">{errors.autoApply}</p> : null}
       </section>
 

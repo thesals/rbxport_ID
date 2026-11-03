@@ -113,6 +113,15 @@ const inFilter = (filter: IdentifyFilter, { state, waiting }: IdentifyQueueItem)
 /** The store's refusal of a review change while a write waits for its file. */
 export const WAITING_READ_ONLY = "This result is waiting to be written once the file is closed in the other program. Cancel the waiting write to change its review.";
 
+/**
+ * What every audio-file write answers while "Write tags to audio files" is
+ * off, in the backend's words.
+ */
+export const FILE_WRITES_OFF = "Writing to audio files is turned off. Turn on \"Write tags to audio files\" in Preferences → Identify to write.";
+
+/** The warning a job leaves on a match it would have applied but for the lock. */
+export const AUTO_APPLY_LOCKED = "Not applied automatically: writing to audio files is turned off. It waits for review.";
+
 /** What a write to a file in use answers: not a failure, a write for later. */
 export const DEFERRED_MESSAGE = "The file is open in another program. It will be written when the file is free.";
 
@@ -162,6 +171,8 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
   // Settings: a key is only ever known by where it came from, so its layers
   // hold `true` for "a key is here".
   let settings: IdentifySettings = {
+    // Off until the user turns it on: nothing is written to an audio file.
+    fileWrites: false,
     acoustidKey: "settings", discogsToken: "environment",
     mbUserAgent: "rbxport/1.2.0 ( dj@example.com )", mbUserAgentSource: "settings",
     genrePolicy: "fillEmpty", autoApply: false, autoApplyThreshold: 0.9,
@@ -272,7 +283,10 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
         const slot = OUTCOMES[index % OUTCOMES.length] ?? "failed";
         const fills = slot === "autoApply";
         // The decision as `decide` makes it: auto-apply only when switched on.
-        const outcome: Outcome = fills && !(settings.autoApply && 0.97 >= settings.autoApplyThreshold) ? "review" : slot;
+        const qualifies = fills && settings.autoApply && 0.97 >= settings.autoApplyThreshold;
+        // A match that qualifies is still only reviewed while file writes are off.
+        const locked = qualifies && !settings.fileWrites;
+        const outcome: Outcome = fills && (!qualifies || locked) ? "review" : slot;
         let counted: "identified" | "review" | "unidentified" | "failed" =
           outcome === "autoApply" ? "identified" : outcome === "failed" ? "failed" : outcome;
         const result: IdentifyResultEvent = {
@@ -293,6 +307,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
           result.error = "identify store: this track has a write waiting for the file to be closed; cancel it before identifying again";
         } else {
           const id = save(trackId, path, artist, title, outcome, fills);
+          if (locked) results.get(id)?.warnings.push(AUTO_APPLY_LOCKED);
           result.resultId = id;
           result.score = results.get(id)?.item.score ?? null;
           if (outcome === "autoApply") {
@@ -330,6 +345,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
   function write(resultId: number, fields: readonly IdentifyField[], auto: boolean): IdentifyWriteOutcome {
     const detail = changeable(resultId);
     const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error, deferred: false });
+    if (!settings.fileWrites) return refuse(FILE_WRITES_OFF);
     if (!detail) return refuse("That identification result is no longer in the store.");
     if (detail.item.state !== "pending" && detail.item.state !== "accepted") {
       return refuse(`A ${detail.item.state} result cannot be applied.`);
@@ -374,6 +390,15 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
    */
   const retryAll = (skip: ReadonlySet<number> = new Set()): IdentifyWriteOutcome[] => {
     const outcomes: IdentifyWriteOutcome[] = [];
+    // Locked: every waiting write is refused and keeps waiting, for when writes are turned on.
+    if (!settings.fileWrites) {
+      for (const id of current.values()) {
+        if (!skip.has(id) && results.get(id)?.item.waiting) {
+          outcomes.push({ resultId: id, ok: false, error: FILE_WRITES_OFF, deferred: false });
+        }
+      }
+      return outcomes;
+    }
     const changed: number[] = [];
     for (const id of current.values()) {
       if (skip.has(id)) continue;
@@ -501,6 +526,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       return Promise.resolve(outcomes);
     },
     undo: (resultId) => {
+      if (!settings.fileWrites) return Promise.resolve({ resultId, ok: false, error: FILE_WRITES_OFF, deferred: false });
       const detail = changeable(resultId);
       const snapshot = snapshots.get(resultId);
       if (!detail || !detail.item.undoable || !snapshot) {
@@ -578,6 +604,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
         next.mbUserAgent = value ?? "";
         next.mbUserAgentSource = source;
       }
+      if (update.fileWrites !== undefined) next.fileWrites = update.fileWrites;
       if (update.genrePolicy !== undefined) next.genrePolicy = update.genrePolicy;
       if (update.autoApply !== undefined) next.autoApply = update.autoApply;
       if (threshold !== undefined) next.autoApplyThreshold = threshold;

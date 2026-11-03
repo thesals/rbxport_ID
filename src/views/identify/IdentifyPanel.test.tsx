@@ -72,9 +72,9 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-/** A fresh mock store with auto-apply on or off. */
-function useMock(autoApply: boolean) {
-  identify = createMockIdentify({ tickMs: TICK, settings: { autoApply } });
+/** A fresh mock store with auto-apply on or off, and file writes on unless asked otherwise. */
+function useMock(autoApply: boolean, fileWrites = true) {
+  identify = createMockIdentify({ tickMs: TICK, settings: { autoApply, fileWrites } });
   __setBackend({ identify } as unknown as Backend);
 }
 

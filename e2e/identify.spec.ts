@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
 /**
  * Track identification (fork-only) against the mock backend: Identify
@@ -7,11 +7,31 @@ import { expect, test } from "@playwright/test";
  * comes out review, unidentified, a fill-only fingerprint match, review,
  * failed, one track every 400 ms. Auto-apply is off by default, so the
  * fill-only match waits for review; turned on, the job writes it.
+ *
+ * "Write tags to audio files" is off by default and nothing writes while it
+ * is, so every flow that writes turns it on first, through its confirmation.
  */
+
+/** Turns "Write tags to audio files" on in Preferences → Identify, confirming it, and closes the Preferences. */
+async function turnOnFileWrites(page: Page) {
+  await page.getByRole("banner").getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Preferences" });
+  await dialog.getByRole("tab", { name: "Identify", exact: true }).click();
+  const writes = dialog.getByRole("region", { name: "Write tags to audio files" });
+  // The switch only asks: it stays off until the confirmation.
+  await writes.getByRole("switch").click();
+  await expect(writes.getByRole("switch")).not.toBeChecked();
+  await writes.getByRole("group", { name: "Confirm writing tags to audio files" })
+    .getByRole("button", { name: "Turn on writing" }).click();
+  await expect(writes.getByRole("switch")).toBeChecked();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+}
 
 test("identify a selection, review a result, apply ticked fields and undo", async ({ page }) => {
   await page.goto("/?writable=1");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await turnOnFileWrites(page);
   const rows = page.getByRole("row").filter({ has: page.getByRole("gridcell") });
   await rows.nth(0).click();
   await rows.nth(4).click({ modifiers: ["Shift"] });
@@ -66,6 +86,7 @@ test("identify a selection, review a result, apply ticked fields and undo", asyn
 test("a write to a file in use waits under Waiting for file, then Retry now writes it", async ({ page }) => {
   await page.goto("/?writable=1");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await turnOnFileWrites(page);
   const rows = page.getByRole("row").filter({ has: page.getByRole("gridcell") });
   await rows.nth(0).click();
   await rows.nth(4).click({ modifiers: ["Shift"] });
@@ -104,6 +125,7 @@ test("a write to a file in use waits under Waiting for file, then Retry now writ
 test("bulk accept above a threshold, then fill only empty fields after confirming", async ({ page }) => {
   await page.goto("/?writable=1");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await turnOnFileWrites(page);
   const rows = page.getByRole("row").filter({ has: page.getByRole("gridcell") });
   await rows.nth(0).click();
   await rows.nth(4).click({ modifiers: ["Shift"] });
@@ -163,8 +185,15 @@ test("the Identify settings pane reports keys by source and saves a change", asy
   await expect(key).toHaveCount(0);
   await expect(dialog).not.toContainText("not-a-real-key");
 
+  // Auto-apply is locked until writing to audio files is turned on.
   const auto = dialog.getByRole("region", { name: "Auto-apply" });
   await expect(auto.getByRole("switch")).not.toBeChecked();
+  await expect(auto.getByRole("switch")).toBeDisabled();
+  const writes = dialog.getByRole("region", { name: "Write tags to audio files" });
+  await writes.getByRole("switch").click();
+  await writes.getByRole("button", { name: "Turn on writing" }).click();
+  await expect(writes.getByRole("switch")).toBeChecked();
+  await expect(auto.getByRole("switch")).toBeEnabled();
   await auto.getByRole("switch").check();
   await expect(auto).toContainText("Write automatically at 90% confidence or higher.");
   const threshold = auto.getByRole("spinbutton", { name: "Minimum confidence" });
@@ -182,6 +211,7 @@ test("the Identify settings pane reports keys by source and saves a change", asy
 test("with auto-apply on, the job writes a qualifying match and files it under Applied, undoably", async ({ page }) => {
   await page.goto("/?writable=1");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await turnOnFileWrites(page);
   await page.getByRole("banner").getByRole("button", { name: "Settings" }).click();
   const dialog = page.getByRole("dialog", { name: "Preferences" });
   await dialog.getByRole("tab", { name: "Identify", exact: true }).click();

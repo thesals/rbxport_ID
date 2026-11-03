@@ -3,7 +3,8 @@
  * The Identify settings pane against the mock identify store: keys are never
  * shown or kept, each save sends only what changed (absent keeps, null
  * clears), the auto-apply threshold stays within 90–100%, and a key from the
- * environment cannot be cleared here.
+ * environment cannot be cleared here. Writing to audio files is off by
+ * default, takes a confirmation to turn on, and locks auto-apply while off.
  */
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -103,7 +104,7 @@ describe("IdentifyPane", () => {
   });
 
   it("keeps the auto-apply threshold between 90% and 100%, shown as a percentage", async () => {
-    await render();
+    await render({ settings: { fileWrites: true } });
     const auto = card("Auto-apply");
     const threshold = auto.querySelector<HTMLInputElement>('input[type="number"]')!;
     const toggle = auto.querySelector<HTMLInputElement>('input[role="switch"]')!;
@@ -163,5 +164,44 @@ describe("IdentifyPane", () => {
     await click([...genre.querySelectorAll<HTMLInputElement>('input[type="radio"]')].find((r) => r.value === "never"));
     expect(genre.querySelector('[role="alert"]')?.textContent).toBe("The settings file could not be written.");
     expect(genre.querySelector<HTMLInputElement>('input[value="fillEmpty"]')?.checked).toBe(true);
+  });
+
+  it("starts with writing to audio files off, and turns it on only after a confirmation", async () => {
+    await render();
+    const writes = card("Write tags to audio files");
+    // At the top of the pane, before the keys.
+    expect(host.querySelector("section section")).toBe(writes);
+    const toggle = writes.querySelector<HTMLInputElement>('input[role="switch"]')!;
+    expect(toggle.checked).toBe(false);
+    expect(writes.textContent).toContain("identification only reads the audio files and saves proposals for review");
+    expect(writes.textContent).toContain("not by Accept, Undo or auto-apply");
+    // Auto-apply is locked while it is off.
+    const auto = card("Auto-apply");
+    expect(auto.querySelector<HTMLInputElement>('input[role="switch"]')?.disabled).toBe(true);
+    expect(auto.querySelector('[role="note"]')?.textContent).toContain("Auto-apply needs Write tags to audio files turned on.");
+
+    // The switch asks first; nothing is saved yet.
+    await click(toggle);
+    expect(save).not.toHaveBeenCalled();
+    expect(toggle.checked).toBe(false);
+    const group = writes.querySelector<HTMLElement>('[role="group"][aria-label="Confirm writing tags to audio files"]')!;
+    expect(group.textContent).toContain("including files in your rekordbox library");
+    await click(buttonIn(group, "Cancel"));
+    expect(writes.querySelector('[role="group"]')).toBeNull();
+    expect(save).not.toHaveBeenCalled();
+
+    await click(toggle);
+    await click(buttonIn(writes.querySelector<HTMLElement>('[role="group"]')!, "Turn on writing"));
+    expect(save).toHaveBeenCalledWith({ fileWrites: true });
+    expect(toggle.checked).toBe(true);
+    expect(writes.querySelector('[role="group"]')).toBeNull();
+    expect(auto.querySelector<HTMLInputElement>('input[role="switch"]')?.disabled).toBe(false);
+    expect(auto.querySelector('[role="note"]')).toBeNull();
+    expect((await identify.settings()).fileWrites).toBe(true);
+
+    // Turning it off needs no confirmation.
+    await click(toggle);
+    expect(save).toHaveBeenLastCalledWith({ fileWrites: false });
+    expect(toggle.checked).toBe(false);
   });
 });

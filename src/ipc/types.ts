@@ -1999,6 +1999,13 @@ export type IdentifyKeySource = "settings" | "devFile" | "environment" | null;
 export type IdentifyGenrePolicy = "fillEmpty" | "replace" | "never";
 
 export interface IdentifySettings {
+  /**
+   * The lock on writing tags to audio files; off by default. While it is
+   * off, every audio-file write is refused (apply, undo, auto-apply and
+   * waiting-write retries) and identification only reads files and keeps
+   * proposals for review.
+   */
+  fileWrites: boolean;
   /** Where the AcoustID key comes from; never the key itself. */
   acoustidKey: IdentifyKeySource;
   discogsToken: IdentifyKeySource;
@@ -2019,6 +2026,7 @@ export interface IdentifySettings {
  * the stored value and a string replaces it.
  */
 export interface IdentifySettingsUpdate {
+  fileWrites?: boolean;
   acoustidKey?: string | null;
   discogsToken?: string | null;
   mbUserAgent?: string;

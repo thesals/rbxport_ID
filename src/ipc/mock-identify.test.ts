@@ -7,12 +7,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createMockBackend } from "./backend-mock";
-import { IDENTIFY_MAX_ROWS, WAITING_READ_ONLY, createMockIdentify } from "./mock-identify";
+import {
+  AUTO_APPLY_LOCKED, FILE_WRITES_OFF, IDENTIFY_MAX_ROWS, WAITING_READ_ONLY, createMockIdentify,
+} from "./mock-identify";
 import type { IdentifyBackend, IdentifyProgress, IdentifyResultEvent } from "./types";
 
 const TICK = 10;
 /** With auto-apply on, the third track of five is written by the job itself. */
-const AUTO = { tickMs: TICK, settings: { autoApply: true } } as const;
+const AUTO = { tickMs: TICK, settings: { autoApply: true, fileWrites: true } } as const;
+/** Auto-apply off, with writing to audio files on. */
+const WRITES = { tickMs: TICK, settings: { fileWrites: true } } as const;
 
 function record(identify: IdentifyBackend) {
   const events: (["progress", IdentifyProgress] | ["result", IdentifyResultEvent])[] = [];
@@ -66,7 +70,7 @@ describe("mock identify", () => {
     expect((await on.result(written!.resultId)).item.state).toBe("undone");
 
     // Off (the default): the same match is a review, nothing is written.
-    const off = createMockIdentify({ tickMs: TICK });
+    const off = createMockIdentify(WRITES);
     const { events } = record(off);
     await off.start(["1", "2", "3"]);
     await finish(3);
@@ -100,7 +104,7 @@ describe("mock identify", () => {
   });
 
   it("refuses a second job while one runs and stops between tracks on cancel", async () => {
-    const identify = createMockIdentify({ tickMs: TICK });
+    const identify = createMockIdentify(WRITES);
     const { events } = record(identify);
     const jobId = await identify.start(["1", "2", "3"]);
     await expect(identify.start(["4"])).rejects.toMatchObject({ kind: "readOnly" });
@@ -120,7 +124,7 @@ describe("mock identify", () => {
   });
 
   it("windows the queue and caps a page", async () => {
-    const identify = createMockIdentify({ tickMs: TICK });
+    const identify = createMockIdentify(WRITES);
     // Four of every five are stored; the fifth fails.
     const ids = Array.from({ length: 200 }, (_, i) => String(1000 + i));
     await identify.start(ids);
@@ -133,7 +137,7 @@ describe("mock identify", () => {
   });
 
   it("changes review state and proposals by the store's rules", async () => {
-    const identify = createMockIdentify({ tickMs: TICK });
+    const identify = createMockIdentify(WRITES);
     await identify.start(["1", "2"]);
     await finish(2);
     const review = (await identify.queue("needsReview", 0, 10)).items[0]!;
@@ -332,5 +336,38 @@ describe("mock identify", () => {
     await expect(identify.saveSettings({ autoApplyThreshold: 0.89 })).rejects.toMatchObject({ kind: "malformed" });
     await expect(identify.saveSettings({ autoApplyThreshold: 1.01 })).rejects.toMatchObject({ kind: "malformed" });
     expect(await identify.saveSettings({ autoApply: true, autoApplyThreshold: 0.95 })).toMatchObject({ autoApply: true, autoApplyThreshold: 0.95 });
+  });
+
+  it("writes nothing to an audio file while file writes are off, as by default", async () => {
+    const identify = createMockIdentify({ tickMs: TICK, settings: { autoApply: true } });
+    expect((await identify.settings()).fileWrites).toBe(false);
+    const { events } = record(identify);
+    await identify.start(["1", "2", "3", "4", "5"]);
+    await finish(5);
+    // The match auto-apply would write stays for review, with a warning.
+    const final = events.at(-1)?.[1] as IdentifyProgress;
+    expect(final).toMatchObject({ identified: 0, review: 3 });
+    const third = (await identify.queue("all", 0, 10)).items.find((item) => item.trackId === "3");
+    expect(third).toMatchObject({ state: "pending", decision: "review", undoable: false });
+    expect((await identify.result(third!.resultId)).warnings).toContain(AUTO_APPLY_LOCKED);
+
+    const refusal = { resultId: third!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF };
+    expect(await identify.apply([{ resultId: third!.resultId, fields: ["label"] }])).toEqual([refusal]);
+    expect(await identify.undo(third!.resultId)).toEqual(refusal);
+    expect((await identify.result(third!.resultId)).item.state).toBe("pending");
+    // Review changes write only the store, so they still work.
+    expect((await identify.setState(third!.resultId, "accept")).state).toBe("accepted");
+
+    // A write left waiting is refused on retry, and keeps waiting for writes to be turned on.
+    await identify.saveSettings({ fileWrites: true });
+    identify.setFileInUse(true);
+    expect((await identify.apply([{ resultId: third!.resultId, fields: ["label"] }]))[0]?.deferred).toBe(true);
+    identify.setFileInUse(false);
+    expect(await identify.saveSettings({ fileWrites: false })).toMatchObject({ fileWrites: false });
+    expect(await identify.retryWaiting()).toEqual([refusal]);
+    expect((await identify.queue("waiting", 0, 10)).total).toBe(1);
+    await identify.saveSettings({ fileWrites: true });
+    expect(await identify.retryWaiting()).toEqual([{ resultId: third!.resultId, ok: true, error: null, deferred: false }]);
+    expect((await identify.result(third!.resultId)).item.state).toBe("applied");
   });
 });
