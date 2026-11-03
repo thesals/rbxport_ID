@@ -26,14 +26,14 @@ let root: Root;
 let identify: IdentifyBackend;
 const onClose = vi.fn();
 
-function Harness({ readOnly = false }: { readOnly?: boolean }) {
+function Harness() {
   const job = useIdentifyJob();
-  return <IdentifyPanel job={job} readOnly={readOnly} readOnlyReason="Locked" onClose={onClose} />;
+  return <IdentifyPanel job={job} onClose={onClose} />;
 }
 
 const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
-const render = async (readOnly = false, settle = 200) => {
-  act(() => { root.render(<Harness readOnly={readOnly} />); });
+const render = async (settle = 200) => {
+  act(() => { root.render(<Harness />); });
   await flush(settle);
 };
 const byText = (selector: string, text: string | RegExp) =>
@@ -80,7 +80,7 @@ describe("IdentifyPanel", () => {
   it("shows a running job with its counts and cancels it", async () => {
     await identify.start(["1", "2", "3", "4", "5", "6"]);
     await vi.advanceTimersByTimeAsync(TICK * 2 + 1);
-    await render(false, 0);
+    await render(0);
     expect(host.textContent).toMatch(/Identifying \d of 6/);
     expect(host.textContent).toMatch(/auto-apply · \d+ to review/);
     expect(host.querySelector("progress")).not.toBeNull();
@@ -117,9 +117,12 @@ describe("IdentifyPanel", () => {
     await click(checkbox("Label") ?? undefined);
     expect(checkbox("Label")?.checked).toBe(false);
 
+    expect(host.textContent).not.toContain("Reload Tag");
     await click(button("Accept"));
     expect(apply).toHaveBeenCalledWith([{ resultId: expect.any(Number) as number, fields: ["title", "subGenre", "artwork"] }]);
     expect(byText("[role=dialog] section span", "Applied")).toBeDefined();
+    expect(host.querySelector("[role=note]")?.textContent).toBe(
+      "To see the changes in rekordbox, select the tracks there and choose Reload Tag.");
     expect(button("Accept")?.disabled).toBe(true);
     expect(options()).toHaveLength(1);
 
@@ -144,13 +147,20 @@ describe("IdentifyPanel", () => {
     expect(byText("section span", "Rejected")).toBeDefined();
   });
 
-  it("refuses writes while the library is read-only", async () => {
+  it("shows each result's source, and rekordbox's record where it differs from the file", async () => {
     await identifyFive();
-    await render(true);
-    await click(options()[0]);
-    expect(button("Accept")?.disabled).toBe(true);
-    expect(button("Accept")?.title).toBe("Locked");
-    expect(button("Apply accepted")?.disabled).toBe(true);
+    await render();
+    const row = options()[0]!;
+    const source = row.querySelector<HTMLElement>("[title=Fingerprint]");
+    expect(source?.textContent).toBe("Fingerprint");
+    await click(row);
+    // The mock's rekordbox record has an older label and no comment; its
+    // title matches the file, so that row says nothing about rekordbox.
+    const rowOf = (label: string) => [...host.querySelectorAll("tr")].find((tr) => tr.querySelector("th")?.textContent === label);
+    expect(rowOf("Label")?.textContent).toContain("rekordbox: Older Label");
+    expect(rowOf("Sub-genre (added to Comment)")?.textContent).toContain("rekordbox: (empty)");
+    expect(rowOf("Track Title")?.textContent).not.toContain("rekordbox:");
+    expect(host.textContent).toContain("the rekordbox library is not changed");
   });
 
   it("accepts above the threshold, then applies what was accepted", async () => {
@@ -174,7 +184,7 @@ describe("IdentifyPanel", () => {
     await click(button("Apply"));
     expect(apply).toHaveBeenCalledTimes(1);
     expect(apply.mock.calls[0]?.[0]).toEqual([{ resultId: expect.any(Number) as number, fields: ["label", "catalogNumber"] }]);
-    expect(host.textContent).toContain("1 applied.");
+    expect(host.textContent).toContain("1 applied. To see the changes in rekordbox");
     await click(byText("[role=tab]", "Applied (undoable)"));
     expect(options()).toHaveLength(1);
     await click(byText("[role=tab]", "All"));

@@ -5,7 +5,7 @@
  */
 import type {
   IdentifyCandidate, IdentifyDecision, IdentifyField, IdentifyFieldChange, IdentifyFilter, IdentifyQueueItem,
-  IdentifyReviewState,
+  IdentifyRekordboxRecord, IdentifyReviewState,
 } from "@/ipc/types";
 import type { useTranslation } from "@/i18n";
 
@@ -59,6 +59,42 @@ export function sourceLabel(source: IdentifyCandidate["source"], t: Translate): 
     case "textSearch": return t("Text search");
     case "discogsText": return t("Discogs text search");
   }
+}
+
+/** The source as a queue row shows it: a word, with `sourceLabel` as its title. */
+export function sourceShort(source: IdentifyCandidate["source"], t: Translate): string {
+  switch (source) {
+    case "fingerprint": return t("Fingerprint");
+    case "textSearch": return t("Text search");
+    case "discogsText": return t("Discogs");
+  }
+}
+
+/**
+ * What rekordbox's imported record holds for a field the diff shows, or
+ * null for a field rekordbox does not keep. The sub-genre is appended to the
+ * comment, so its rekordbox value is the comment.
+ */
+export function rekordboxValue(field: IdentifyField, record: IdentifyRekordboxRecord): string | null {
+  switch (field) {
+    case "title": return record.title;
+    case "artist": return record.artist;
+    case "album": return record.album;
+    case "label": return record.label;
+    case "genre": return record.genre;
+    case "year": return record.year;
+    case "isrc": return record.isrc;
+    case "subGenre": return record.comment;
+    default: return null;
+  }
+}
+
+/**
+ * How to see a written change in rekordbox, which reads a file's tags again
+ * only when asked: its own Reload Tag, in the words its menu uses.
+ */
+export function reloadHint(t: Translate): string {
+  return t("To see the changes in rekordbox, select the tracks there and choose {reloadTag}.", { reloadTag: t("Reload Tag") });
 }
 
 export const FILTERS: readonly IdentifyFilter[] = ["needsReview", "unidentified", "applied", "all"];

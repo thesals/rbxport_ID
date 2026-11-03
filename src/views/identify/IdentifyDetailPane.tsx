@@ -4,6 +4,10 @@
  * weighed and why; and Accept (write the ticked fields), Reject, Edit and
  * Undo. Nothing is written until Accept: the spec's "never silently
  * overwrite" rule.
+ *
+ * One way: Accept and Undo write the audio file's tags and nothing else.
+ * The rekordbox record imported when the track was identified is shown
+ * under a field it disagrees with, for reference; it is never written.
  */
 import { useCallback, useEffect, useState } from "react";
 
@@ -12,7 +16,8 @@ import type { IdentifyDetail, IdentifyField, IdentifyReviewAction } from "@/ipc/
 import { useTranslation } from "@/i18n";
 import { errorMessage } from "@/lib/errorMessage";
 import {
-  canApply, changes, decisionLabel, defaultFields, fieldLabel, formatScore, sourceLabel, stateLabel, trackName,
+  canApply, changes, decisionLabel, defaultFields, fieldLabel, formatScore, rekordboxValue, reloadHint, sourceLabel,
+  stateLabel, trackName,
 } from "./identifyText";
 import styles from "./IdentifyPanel.module.css";
 
@@ -34,15 +39,11 @@ function refused(outcome: unknown): string | null {
 
 export interface IdentifyDetailPaneProps {
   resultId: number;
-  /** The library cannot be written: Accept and Undo are refused. */
-  readOnly: boolean;
-  /** Why, in the words the status bar uses. */
-  readOnlyReason: string;
   /** After a call of this pane's own changed the result. */
   onChanged: () => void;
 }
 
-export function IdentifyDetailPane({ resultId, readOnly, readOnlyReason, onChanged }: IdentifyDetailPaneProps) {
+export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPaneProps) {
   const t = useTranslation();
   const [detail, setDetail] = useState<IdentifyDetail | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -112,7 +113,8 @@ export function IdentifyDetailPane({ resultId, readOnly, readOnlyReason, onChang
   }
   if (detail === null) return <div className={styles.detailEmpty}>{t("Loading…")}</div>;
 
-  const { item } = detail;
+  const { item, rekordbox } = detail;
+  const written = item.state === "applied" || item.state === "autoApplied" || item.state === "undone";
   const writable = canApply(item.state) && !detail.writeInProgress;
   const reviewable = (item.state === "pending" || item.state === "accepted") && !detail.writeInProgress;
   const setState = (action: IdentifyReviewAction) =>
@@ -165,6 +167,7 @@ export function IdentifyDetailPane({ resultId, readOnly, readOnlyReason, onChang
               {item.changes.map((change) => {
                 const label = fieldLabel(change.field, t);
                 const same = !changes(change);
+                const inRekordbox = rekordbox ? rekordboxValue(change.field, rekordbox) : null;
                 return (
                   <tr key={change.field} data-same={same || undefined}>
                     <td>
@@ -177,7 +180,14 @@ export function IdentifyDetailPane({ resultId, readOnly, readOnlyReason, onChang
                       />
                     </td>
                     <th scope="row" className={styles.fieldName}>{label}</th>
-                    <td className={styles.current}>{change.current || <span className={styles.none}>{t("(empty)")}</span>}</td>
+                    <td className={styles.current}>
+                      {change.current || <span className={styles.none}>{t("(empty)")}</span>}
+                      {inRekordbox !== null && inRekordbox !== change.current ? (
+                        <span className={styles.rekordbox}>
+                          {t("rekordbox: {value}", { value: inRekordbox || t("(empty)") })}
+                        </span>
+                      ) : null}
+                    </td>
                     <td className={styles.proposed}>
                       {editing?.field === change.field ? (
                         <form className={styles.editForm} onSubmit={(event) => { event.preventDefault(); saveEdit(); }}>
@@ -239,12 +249,16 @@ export function IdentifyDetailPane({ resultId, readOnly, readOnlyReason, onChang
         </p>
       ) : null}
 
+      {writable && item.changes.length > 0 ? (
+        <p className={styles.hint}>{t("Only the tags in the audio files are written; the rekordbox library is not changed.")}</p>
+      ) : null}
+      {written ? <p className={styles.hint} role="note">{reloadHint(t)}</p> : null}
+
       <div className={styles.actions}>
         <button
           type="button"
           className={styles.button}
-          disabled={!writable || busy || ticked.size === 0 || readOnly}
-          title={readOnly ? readOnlyReason : undefined}
+          disabled={!writable || busy || ticked.size === 0}
           onClick={accept}
         >
           {t("Accept")}
@@ -258,13 +272,7 @@ export function IdentifyDetailPane({ resultId, readOnly, readOnlyReason, onChang
           </button>
         ) : null}
         {item.undoable ? (
-          <button
-            type="button"
-            className={styles.button}
-            disabled={busy || readOnly}
-            title={readOnly ? readOnlyReason : undefined}
-            onClick={undo}
-          >
+          <button type="button" className={styles.button} disabled={busy} onClick={undo}>
             {t("Undo")}
           </button>
         ) : null}

@@ -10,6 +10,10 @@
  * chosen result in full beside it. Bulk accept marks every pending result at
  * or above a threshold accepted; Apply accepted then fills the empty fields
  * of those results, after saying what it will do (see `bulkPlan`).
+ *
+ * One way: results are written to the audio files' tags only, never to the
+ * rekordbox library, so a read-only library does not stop them. rekordbox
+ * shows them after its own Reload Tag.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -22,7 +26,8 @@ import type { IdentifyJob } from "@/store/useIdentifyJob";
 import { useElementSize } from "@/store/useElementSize";
 import { IdentifyDetailPane } from "./IdentifyDetailPane";
 import {
-  FILTERS, bulkPlan, decisionLabel, filterLabel, formatScore, stateLabel, trackName, type BulkPlan, type Translate,
+  FILTERS, bulkPlan, decisionLabel, filterLabel, formatScore, reloadHint, sourceLabel, sourceShort, stateLabel, trackName,
+  type BulkPlan, type Translate,
 } from "./identifyText";
 import { useIdentifyQueue } from "./useIdentifyQueue";
 import styles from "./IdentifyPanel.module.css";
@@ -36,8 +41,6 @@ const APPLY_BATCH = 32;
 
 export interface IdentifyPanelProps {
   job: IdentifyJob;
-  readOnly: boolean;
-  readOnlyReason: string;
   onClose: () => void;
 }
 
@@ -52,7 +55,7 @@ function jobSummary(job: IdentifyJob, t: Translate): string {
   }
 }
 
-export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: IdentifyPanelProps) {
+export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
   const t = useTranslation();
   const [filter, setFilter] = useState<IdentifyFilter>("needsReview");
   const queue = useIdentifyQueue(filter);
@@ -191,11 +194,12 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
           }
         }
       }
-      const text = items.length === 0
+      const outcome = items.length === 0
         ? t("Nothing was written.")
         : failed === 0
           ? t("{count} applied.", { count: written })
           : t("{count} applied, {failed} failed: {reason}", { count: written, failed, reason: firstError ?? "" });
+      const text = written > 0 ? `${outcome} ${reloadHint(t)}` : outcome;
       setBulkNote({ text, failed: failed > 0 });
     } catch (e) {
       setBulkNote({ text: errorMessage(e), failed: true });
@@ -228,6 +232,9 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
               <span className={styles.rowScore}>{formatScore(row.score)}</span>
               <span className={styles.badge} data-state={row.state}>{stateLabel(row.state, t)}</span>
               <span>{decisionLabel(row.decision, t)}</span>
+              {row.source !== null ? (
+                <span className={styles.rowSource} title={sourceLabel(row.source, t)}>{sourceShort(row.source, t)}</span>
+              ) : null}
             </span>
           </>
         ) : <span className={styles.none}>{t("Loading…")}</span>}
@@ -314,13 +321,7 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
           <button type="button" className={styles.small} disabled={bulkBusy} onClick={() => void acceptAbove()}>
             {t("Accept above")}
           </button>
-          <button
-            type="button"
-            className={styles.small}
-            disabled={bulkBusy || readOnly}
-            title={readOnly ? readOnlyReason : undefined}
-            onClick={() => void planAccepted()}
-          >
+          <button type="button" className={styles.small} disabled={bulkBusy} onClick={() => void planAccepted()}>
             {t("Apply accepted")}
           </button>
         </div>
@@ -330,8 +331,9 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
               {t("Fill {fields} empty fields in {results} results. {left} results with overwrites or a sub-genre are left for individual review.", {
                 fields: plan.fields, results: plan.items.length, left: plan.leftForReview,
               })}
+              {" "}{t("Only the tags in the audio files are written; the rekordbox library is not changed.")}
             </p>
-            <button type="button" className={styles.small} disabled={bulkBusy || readOnly || plan.items.length === 0}
+            <button type="button" className={styles.small} disabled={bulkBusy || plan.items.length === 0}
               onClick={() => void applyPlan(plan)}>
               {t("Apply")}
             </button>
@@ -359,12 +361,7 @@ export function IdentifyPanel({ job, readOnly, readOnlyReason, onClose }: Identi
           </div>
           <div className={styles.detailColumn}>
             {selected ? (
-              <IdentifyDetailPane
-                resultId={selected.id}
-                readOnly={readOnly}
-                readOnlyReason={readOnlyReason}
-                onChanged={queue.refresh}
-              />
+              <IdentifyDetailPane resultId={selected.id} onChanged={queue.refresh} />
             ) : (
               <p className={styles.detailEmpty}>{t("Choose a result to review it.")}</p>
             )}

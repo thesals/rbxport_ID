@@ -223,9 +223,9 @@ export function treeMenu(
  * The fork's track identification, which rekordbox does not have
  * (`docs/identify/IDENTIFY_SPEC.md`). It is kept out of the transcribed
  * menus above and appended after them, behind a separator, so those stay
- * rekordbox's own. Starting a job writes nothing to the library — only
- * applying a reviewed result does — so it is live while the library is
- * read-only.
+ * rekordbox's own. Identification never writes the library — applying a
+ * reviewed result writes only the file's tags — so it is live while the
+ * library is read-only.
  */
 const IDENTIFY_NODE_ROWS: readonly MenuRow<TreeAction>[] = [
   { label: "Identify Tracks", action: "identify" },

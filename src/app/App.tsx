@@ -1624,9 +1624,9 @@ function AppBody() {
 
   // Track identification (fork-only; docs/identify/IDENTIFY_SPEC.md). The
   // job runs in the backend; the review queue is drawn over the window and
-  // loaded the first time it opens. Identifying writes nothing to the
-  // library, so it is offered while the library is read-only; applying a
-  // result is a write, refused there as any other is.
+  // loaded the first time it opens. It is one way: it reads the rekordbox
+  // library into its own store and writes only the audio files' tags, never
+  // the library, so all of it is offered while the library is read-only.
   const identifyJob = useIdentifyJob();
   const [identifyOpen, setIdentifyOpen] = useState(false);
   const openIdentify = useCallback(() => setIdentifyOpen(true), []);
@@ -2606,8 +2606,7 @@ function AppBody() {
       ) : null}
       {reportOpen ? <ReportBug onClose={() => setReportOpen(false)} /> : null}
       {identifyOpen ? (
-        <IdentifyPanel job={identifyJob} readOnly={readOnly} readOnlyReason={refusal(advancedPrefs.protectLibrary)}
-          onClose={() => setIdentifyOpen(false)} />
+        <IdentifyPanel job={identifyJob} onClose={() => setIdentifyOpen(false)} />
       ) : null}
       {smartEditor ? (
         <SmartPlaylistEditor
