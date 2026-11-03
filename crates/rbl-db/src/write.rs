@@ -156,56 +156,7 @@ const WRITABLE_COLUMNS: &[&str] = &[
     // The information panel's Info tab.
     "Title", "Lyricist", "ReleaseYear", "TrackNo", "DiscNo", "DJPlayCount", "KeyID", "BPM", "ImagePath",
     "ArtistID", "OrgArtistID", "ComposerID", "RemixerID", "AlbumID", "GenreID", "LabelID",
-    // Written by track identification (fork-only).
-    "ISRC",
 ];
-
-/// A writable column's name as the static the writer interpolates.
-fn writable_column(column: &str) -> Result<&'static str> {
-    WRITABLE_COLUMNS
-        .iter()
-        .copied()
-        .find(|c| *c == column)
-        .ok_or_else(|| DbError::WriteRefused(format!("{column} is not a writable column")))
-}
-
-/// One `djmdContent` column's exact value, kept outside the library so it
-/// can be put back ([`Writer::track_values`], [`Writer::restore_track_values`]).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ColumnValue {
-    pub column: String,
-    pub value: StoredValue,
-}
-
-/// A stored value, as SQLite types it. Track columns hold no blobs.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum StoredValue {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(String),
-}
-
-impl StoredValue {
-    fn from_value(value: Value) -> Result<Self> {
-        Ok(match value {
-            Value::Null => Self::Null,
-            Value::Integer(n) => Self::Integer(n),
-            Value::Real(x) => Self::Real(x),
-            Value::Text(t) => Self::Text(t),
-            Value::Blob(_) => return Err(DbError::WriteRefused("a track column holds a blob".to_owned())),
-        })
-    }
-
-    fn to_value(&self) -> Value {
-        match self {
-            Self::Null => Value::Null,
-            Self::Integer(n) => Value::Integer(*n),
-            Self::Real(x) => Value::Real(*x),
-            Self::Text(t) => Value::Text(t.clone()),
-        }
-    }
-}
 
 /// Lookup tables [`intern`] may add a row to. Same reason as above.
 const LOOKUP_TABLES: &[&str] = &["djmdArtist", "djmdAlbum", "djmdGenre", "djmdLabel"];
@@ -242,29 +193,6 @@ pub enum TrackField {
 }
 
 impl TrackField {
-    /// The `djmdContent` column the field is stored in; `None` for BPM,
-    /// which also lives in the analysis grid.
-    #[must_use]
-    pub fn column(self) -> Option<&'static str> {
-        Some(match self {
-            Self::Title => "Title",
-            Self::Artist => "ArtistID",
-            Self::Album => "AlbumID",
-            Self::Year => "ReleaseYear",
-            Self::TrackNumber => "TrackNo",
-            Self::DiscNumber => "DiscNo",
-            Self::OriginalArtist => "OrgArtistID",
-            Self::Composer => "ComposerID",
-            Self::Remixer => "RemixerID",
-            Self::Lyricist => "Lyricist",
-            Self::PlayCount => "DJPlayCount",
-            Self::Genre => "GenreID",
-            Self::Label => "LabelID",
-            Self::Key => "KeyID",
-            Self::Bpm => return None,
-        })
-    }
-
     /// The wire name, as the frontend spells it.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
@@ -1727,46 +1655,26 @@ impl Writer {
         field: TrackField,
         value: &str,
     ) -> Result<(Changed, TrackEdit)> {
-        let Some(column) = field.column() else {
-            return Err(DbError::WriteRefused("BPM history belongs to the beat grid editor".to_owned()));
+        let column = match field {
+            TrackField::Title => "Title",
+            TrackField::Artist => "ArtistID",
+            TrackField::Album => "AlbumID",
+            TrackField::Year => "ReleaseYear",
+            TrackField::TrackNumber => "TrackNo",
+            TrackField::DiscNumber => "DiscNo",
+            TrackField::OriginalArtist => "OrgArtistID",
+            TrackField::Composer => "ComposerID",
+            TrackField::Remixer => "RemixerID",
+            TrackField::Lyricist => "Lyricist",
+            TrackField::PlayCount => "DJPlayCount",
+            TrackField::Genre => "GenreID",
+            TrackField::Label => "LabelID",
+            TrackField::Key => "KeyID",
+            TrackField::Bpm => return Err(DbError::WriteRefused(
+                "BPM history belongs to the beat grid editor".to_owned(),
+            )),
         };
         self.track_edit(content, column, |writer| writer.set_field(content, field, value))
-    }
-
-    /// Sets a track's ISRC (`djmdContent.ISRC`, plain text as the import
-    /// stores it [ASSUME: rekordbox's own import of `TSRC` not captured]).
-    pub fn set_isrc(&mut self, content: &str, isrc: &str) -> Result<Changed> {
-        self.touch_content(content, "ISRC", &Value::Text(isrc.to_owned()))
-    }
-
-    /// The exact stored values of these `djmdContent` columns, for a caller
-    /// that must put them back later, after a restart included (track
-    /// identification's undo). Only writable columns can be read this way.
-    pub fn track_values(&self, content: &str, columns: &[&str]) -> Result<Vec<ColumnValue>> {
-        columns
-            .iter()
-            .map(|column| {
-                let column = writable_column(column)?;
-                let value = self.track_value(content, column)?;
-                Ok(ColumnValue { column: column.to_owned(), value: StoredValue::from_value(value)? })
-            })
-            .collect()
-    }
-
-    /// Puts columns back to values from [`Self::track_values`], each as an
-    /// ordinary edit (USN and `updated_at` move on). Refused for a column
-    /// that is not writable or a track that is not live.
-    pub fn restore_track_values(&mut self, content: &str, values: &[ColumnValue]) -> Result<Changed> {
-        let mut total = Changed::default();
-        for value in values {
-            let column = writable_column(&value.column)?;
-            let changed = self.touch_content(content, column, &value.value.to_value())?;
-            if changed.rows == 0 {
-                return Err(DbError::WriteRefused(format!("no live track {content}")));
-            }
-            total = Changed { rows: total.rows + changed.rows, usn: changed.usn };
-        }
-        Ok(total)
     }
 
     pub fn undo_track_edit(&mut self, edit: &TrackEdit) -> Result<Changed> {
