@@ -13,7 +13,7 @@ import type { VuDisplay } from "@/lib/vuMeter";
  * metronome, a streaming service — is left out rather than drawn dead: a
  * switch that changes nothing is worse than no switch.
  */
-import { useEffect, useLayoutEffect, useRef, useState, type ComponentType, type SVGProps } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type ComponentType, type SVGProps } from "react";
 
 import {
   PrefAboutIcon, PrefAdvancedIcon, PrefAnalysisIcon, PrefAudioIcon, PrefDjSystemIcon,
@@ -34,18 +34,21 @@ import { DjSystemPane, DJ_SYSTEM_TABS, type DjSystemTab } from "./DjSystemPane";
 import { KeyboardPane } from "./KeyboardPane";
 import { UsbExportPane } from "./UsbExportPane";
 import { BackupsPane } from "./BackupsPane";
-import { ArchiveRestore, RefreshCw } from "lucide-react";
+import { ArchiveRestore, Fingerprint, RefreshCw } from "lucide-react";
 import { LinkPane } from "./LinkPane";
 import { RekordboxPane } from "./RekordboxPane";
 import styles from "./Preferences.module.css";
 import { Button } from "./controls";
 import { ViewPane, VIEW_TABS, type ViewTab } from "./ViewPane";
 
+/** Fork-only (`docs/identify/IDENTIFY_SPEC.md`), loaded the first time it is opened. */
+const IdentifyPane = lazy(() => import("./IdentifyPane").then((m) => ({ default: m.IdentifyPane })));
+
 /**
  * The sidebar, in the capture's order and wording, less PLAN and CLOUD, and
  * with About at the end — ours, for the version and the update check.
  */
-export type Pane = "view" | "audio" | "analysis" | "djSystem" | "link" | "keyboard" | "advanced" | "backups" | "usbExport" | "rekordbox" | "about";
+export type Pane = "view" | "audio" | "analysis" | "djSystem" | "link" | "keyboard" | "advanced" | "backups" | "usbExport" | "rekordbox" | "identify" | "about";
 
 export type PreferencesTarget = Pane | "libraryProtection";
 
@@ -68,6 +71,7 @@ const PANES: readonly { id: Pane; label: string; Icon: ComponentType<SVGProps<SV
   { id: "link", label: "PRO DJ LINK", Icon: LinkIcon },
   { id: "usbExport", label: "USB Export", Icon: UsbStickIcon },
   { id: "backups", label: "Backups", Icon: ArchiveRestore },
+  { id: "identify", label: "Identify", Icon: Fingerprint },
   { id: "about", label: "About", Icon: PrefAboutIcon },
 ];
 
@@ -301,6 +305,10 @@ export function Preferences({
                   <BackupsPane />
                 ) : pane === "rekordbox" ? (
                   <RekordboxPane />
+                ) : pane === "identify" ? (
+                  <Suspense fallback={null}>
+                    <IdentifyPane />
+                  </Suspense>
                 ) : pane === "about" ? (
                   <AboutPane />
                 ) : (

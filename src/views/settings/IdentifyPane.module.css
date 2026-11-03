@@ -1,0 +1,32 @@
+/* The Identify pane (fork-only): cards on the PaneLayout pattern. */
+.intro { margin: 0 0 20px; }
+.card { margin-bottom: 16px; }
+.card strong { display: block; font-weight: 600; }
+.status { margin: 6px 0 0; font-size: var(--f-size-sm); }
+.status[data-set] { color: var(--c-text); }
+.status:not([data-set]) { color: var(--c-text-dim); }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.input {
+  flex: 1;
+  min-width: 180px;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--c-outline);
+  border-radius: 4px;
+  background: var(--c-field);
+  color: var(--c-icon-on);
+  color-scheme: dark;
+  font: inherit;
+  font-size: var(--f-size-sm);
+}
+.input:focus-visible { outline: 2px solid var(--c-accent); outline-offset: 1px; }
+.number { flex: 0 0 auto; min-width: 0; width: 6em; }
+.link { padding: 0; border: 0; background: none; color: var(--c-accent); font: inherit; text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; cursor: pointer; }
+.link:hover { color: var(--c-label-aqua); }
+.choice { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; cursor: pointer; }
+.choice input { margin-top: 2px; }
+.choice span { display: block; }
+.choice small { display: block; margin-top: 2px; color: var(--c-text-dim); font-size: var(--f-size-sm); line-height: 1.5; }
+.switch { display: flex; align-items: center; justify-content: space-between; gap: 16px; cursor: pointer; }
+.error { margin: 8px 0 0; color: var(--c-error); font-size: var(--f-size-sm); }
+.path { margin: 6px 0 0; font-size: var(--f-size-sm); overflow-wrap: anywhere; user-select: text; }
