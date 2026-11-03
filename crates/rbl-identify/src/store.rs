@@ -1091,6 +1091,20 @@ impl Store {
         tx.commit().map_err(|e| sql("commit the undo", &e))
     }
 
+    /// Whether the store holds a current result for exactly this file as
+    /// `key` sees it now: the same path, size and modification time. What a
+    /// resumed import skips.
+    pub fn has_current_result(&self, key: &TrackKey) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM tracks t JOIN results r ON r.track_id = t.id AND r.is_current = 1
+                                WHERE t.path = ?1 AND t.file_size = ?2 AND t.modified_unix = ?3)",
+                params![key.path, file_size(key.file_size)?, key.modified_unix],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql("look for the file's result", &e))
+    }
+
     /// The track with this path, if the store knows it.
     pub fn track_id(&self, path: &str) -> Result<Option<TrackId>> {
         self.conn
@@ -2402,6 +2416,25 @@ mod tests {
     }
 
     /// A track with a review result scoring `score`.
+    #[test]
+    fn a_current_result_is_found_only_for_the_same_file_as_it_is_now() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(!store.has_current_result(&key("a.mp3")).unwrap());
+        // A track read but not identified has no result.
+        store.upsert_track(&key("b.mp3"), 360.0, None, &tags("T")).unwrap();
+        assert!(!store.has_current_result(&key("b.mp3")).unwrap());
+        reviewed(&store, "a.mp3", 0.6);
+        assert!(store.has_current_result(&key("a.mp3")).unwrap());
+        let changed = |f: fn(&mut TrackKey)| {
+            let mut k = key("a.mp3");
+            f(&mut k);
+            store.has_current_result(&k).unwrap()
+        };
+        assert!(!changed(|k| k.file_size += 1), "another size");
+        assert!(!changed(|k| k.modified_unix += 1), "another time");
+        assert!(!changed(|k| k.path = "A.mp3".into()), "another spelling is another file");
+    }
+
     fn reviewed(store: &Store, path: &str, top: f64) -> (TrackId, ResultId) {
         let track = store.upsert_track(&key(path), 360.0, Some("AQAB"), &tags("T")).unwrap();
         let result = store

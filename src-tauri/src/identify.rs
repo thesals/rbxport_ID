@@ -35,6 +35,7 @@
 //! the environment) and are never logged or returned; the settings commands
 //! ([`settings`]) say only where each comes from.
 
+pub mod import;
 mod settings;
 
 pub use settings::{GenrePolicyDto, IdentifySettingsDto, IdentifySettingsUpdateDto, KeySource, SecretUpdate};
