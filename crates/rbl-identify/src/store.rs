@@ -530,14 +530,16 @@ pub enum Reconciliation {
     /// The file held exactly what the write planned: it landed before its
     /// outcome was recorded, and is now recorded as written (and undoable).
     Completed { application: ApplicationId },
-    /// The file held neither (part of the changes, or someone else's): it
-    /// cannot be told what happened, so the application is closed as
+    /// The file was read and held neither (part of the changes, or someone
+    /// else's): it cannot be told what happened, so the application is closed as
     /// unknown (abandoned with a [`RECONCILED_UNKNOWN`] reason) and its result
     /// returned to review, so the track is free again. The file is not
     /// touched; its before-snapshot stays in the store.
     Unknown { application: ApplicationId, reason: String },
     /// Left open, because it can be told later: the file is not there (a
-    /// volume that is not mounted), or no snapshot was recorded.
+    /// volume that is not mounted), it could not be read (held open by a
+    /// player, rekordbox or a virus scanner, or a passing I/O error), or no
+    /// snapshot was recorded.
     NeedsUser { application: Box<Application>, reason: String },
 }
 
@@ -1262,6 +1264,14 @@ impl Store {
                     });
                     continue;
                 }
+                // Not knowing is not "neither": a later start may read it.
+                FileNow::Unreadable(e) => {
+                    outcomes.push(Reconciliation::NeedsUser {
+                        application: Box::new(application),
+                        reason: format!("the file could not be read: {e}"),
+                    });
+                    continue;
+                }
                 FileNow::Read { tags, .. } if tags == before => {
                     self.abandon_application(id, RECONCILED_UNCHANGED)?;
                     outcomes.push(Reconciliation::Abandoned { application: id });
@@ -1274,7 +1284,6 @@ impl Store {
                     continue;
                 }
                 FileNow::Read { .. } => "the file's tags are neither the ones from before the write nor the written ones".to_owned(),
-                FileNow::Unreadable(e) => format!("the file could not be read: {e}"),
             };
             self.close_unknown(&application, &unknown)?;
             outcomes.push(Reconciliation::Unknown { application: id, reason: unknown });
@@ -2919,10 +2928,10 @@ mod tests {
 
         assert_eq!(outcomes[0], Reconciliation::Abandoned { application: untouched });
         assert_eq!(outcomes[1], Reconciliation::Completed { application: written });
-        for (outcome, id) in outcomes[2..4].iter().zip([partial, unreadable]) {
-            assert!(matches!(outcome, Reconciliation::Unknown { application, .. } if *application == id), "{outcome:?}");
+        assert!(matches!(outcomes[2], Reconciliation::Unknown { application, .. } if application == partial));
+        for (outcome, id) in outcomes[3..5].iter().zip([unreadable, missing]) {
+            assert!(matches!(outcome, Reconciliation::NeedsUser { application, .. } if application.id == id), "{outcome:?}");
         }
-        assert!(matches!(&outcomes[4], Reconciliation::NeedsUser { application, .. } if application.id == missing));
         assert!(matches!(outcomes[5], Reconciliation::Unknown { application, .. } if application == raw));
 
         // Unchanged: abandoned, the result free again.
@@ -2938,11 +2947,15 @@ mod tests {
         assert!(matches!(closed.outcome, Some(Outcome::Abandoned { ref reason, .. }) if reason.starts_with(RECONCILED_UNKNOWN)));
         assert_eq!(store.result(partial_result).unwrap().unwrap().0.state, ReviewState::Pending);
         assert_eq!(store.application_snapshot(partial).unwrap(), Some(snapshot("T")), "the before-tags are kept");
-        // Only the missing file stays open, for the next start.
+        // The unreadable and the missing file stay open, for the next start,
+        // which settles them once it can read them.
         let open: Vec<ApplicationId> = store.open_applications().unwrap().iter().map(|a| a.id).collect();
-        assert_eq!(open, [missing]);
+        assert_eq!(open, [unreadable, missing]);
         let again = store.reconcile_open_applications(|_| read(snapshot("T"))).unwrap();
-        assert_eq!(again, [Reconciliation::Abandoned { application: missing }]);
+        assert_eq!(
+            again,
+            [Reconciliation::Abandoned { application: unreadable }, Reconciliation::Abandoned { application: missing }]
+        );
         assert_eq!(store.open_applications().unwrap(), []);
     }
 

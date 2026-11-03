@@ -253,8 +253,9 @@ impl IdentifyState {
         // A write whose file still holds its before-snapshot never happened
         // and is abandoned; one whose file holds exactly the written tags is
         // recorded as written; one that cannot be told is closed as unknown
-        // and its result returned to review. Only a file that is not there
-        // stays open, for the next start. No file is written here.
+        // and its result returned to review. A file that is not there, or
+        // cannot be read now, stays open for the next start. No file is
+        // written here.
         match self.with_store(|store| store.reconcile_open_applications_from_files().map_err(store_error)) {
             Ok(outcomes) if outcomes.is_empty() => {}
             Ok(outcomes) => {
@@ -2203,6 +2204,41 @@ mod tests {
         let other_detail = identify.detail(other_result).unwrap();
         assert_eq!((other_detail.item.state.as_str(), other_detail.write_in_progress), ("pending", false));
         assert_eq!(std::fs::read(&other).unwrap(), other_bytes, "never rewritten by reconcile");
+    }
+
+    /// A file another program holds exclusively at startup cannot be read:
+    /// its write stays open (never closed as unknown) and the next start,
+    /// with the file free, records it as written.
+    #[cfg(windows)]
+    #[test]
+    fn startup_leaves_a_write_open_while_its_file_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let audio = dir.path().join("held.wav");
+        wav(&audio);
+        let result = identified(&identify, &audio, "1", title.clone());
+        identify
+            .with_store(|store| {
+                store.set_state(result, ReviewState::Accepted).map_err(store_error)?;
+                let before = tags::read(&audio).map_err(store_error)?.snapshot;
+                store.begin_application(result, &title, None, &before, None).map_err(store_error)
+            })
+            .unwrap();
+        // The write landed, then the crash.
+        let before = tags::read(&audio).unwrap().snapshot;
+        rbl_identify::write::write(&audio, &before, &rbl_identify::write::plan(&before, &title).unwrap(), None).unwrap();
+
+        let held = hold(&audio, 0);
+        identify.reconcile_on_startup();
+        assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap().len(), 1);
+        assert!(identify.detail(result).unwrap().write_in_progress);
+        drop(held);
+
+        identify.reconcile_on_startup();
+        assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
+        let item = identify.detail(result).unwrap().item;
+        assert_eq!((item.state.as_str(), item.undoable), ("applied", true));
     }
 
     /// Holds `path` open the way a player does, with `share` (`FILE_SHARE_*`).
