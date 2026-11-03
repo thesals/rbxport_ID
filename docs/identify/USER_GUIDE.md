@@ -81,7 +81,7 @@ A track with no candidate scoring at least 0.5 is marked **Unidentified**, not g
 
 ## Reviewing
 
-Open the review queue with **Review Identified Tracks**. Filter it by **Needs review**, **Unidentified**, **Applied** (results you can still undo), **Waiting** (writes waiting for a file to be closed, newest first) or **All**. Each row shows the score and where the match came from: **Fingerprint**, **Text search** or **Discogs**.
+Open the review queue with **Review Identified Tracks**. Filter it by **Needs review**, **Unidentified**, **Applied** (results you can still undo), **Waiting for file** (writes waiting for a file to be closed, newest first) or **All**. Each row shows the score and where the match came from: **Fingerprint**, **Text search** or **Discogs**.
 
 Choose a row to see:
 
@@ -129,9 +129,9 @@ If rbxport or the computer stops in the middle of a write, the next start checks
 
 ### Files in use
 
-When you apply a result, or auto-apply writes one, while another program has the file open, nothing is written and nothing fails. The result stays accepted and shows under **Waiting** with the fields to write. rbxport tries it again when it starts, when it closes (for up to about 10 seconds; anything left waits for the next start), before every identification run and every apply, and when you choose **Retry**.
+When you apply a result, or auto-apply writes one, while another program has the file open, nothing is written and nothing fails. The result stays accepted and shows under **Waiting for file** with the fields to write. rbxport tries it again when it starts, when it closes (for up to about 10 seconds; anything left waits for the next start), before every identification run and every apply, and when you choose **Retry now**. **Cancel write** drops it and puts the result back under **Needs review**.
 
-Each try goes through the same checks as a normal apply. If the file still holds the tags you reviewed, the write is made and can be undone. If the file has changed meanwhile, the write is dropped and the result goes back to **Needs review** with a warning saying why. While a write waits you can't accept, reject or edit the result; cancel the waiting write to put it back under **Needs review**.
+Each try goes through the same checks as a normal apply. If the file still holds the tags you reviewed, the write is made and can be undone. If the file has changed meanwhile, the write is dropped and the result goes back to **Needs review** with a warning saying why. While a write waits you can't accept, reject or edit the result; choose **Cancel write** first.
 
 Undo is never deferred: undoing a file that's open in another program fails with a message, and you can try again once it's closed.
 
