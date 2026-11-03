@@ -5,6 +5,7 @@ target/
 .DS_Store
 *.log
 .env.sentry
+.env.identify
 
 # Tauri
 src-tauri/gen/
