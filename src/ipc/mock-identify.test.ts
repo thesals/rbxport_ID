@@ -11,6 +11,8 @@ import { IDENTIFY_MAX_ROWS, createMockIdentify } from "./mock-identify";
 import type { IdentifyBackend, IdentifyProgress, IdentifyResultEvent } from "./types";
 
 const TICK = 10;
+/** With auto-apply on, the third track of five is written by the job itself. */
+const AUTO = { tickMs: TICK, settings: { autoApply: true } } as const;
 
 function record(identify: IdentifyBackend) {
   const events: (["progress", IdentifyProgress] | ["result", IdentifyResultEvent])[] = [];
@@ -29,7 +31,7 @@ describe("mock identify", () => {
   afterEach(() => { vi.useRealTimers(); });
 
   it("reports each track as it starts and ends, then a final progress", async () => {
-    const identify = createMockIdentify({ tickMs: TICK });
+    const identify = createMockIdentify(AUTO);
     const { events } = record(identify);
     const ids = ["1", "2", "3", "4", "5"];
     const jobId = await identify.start(ids);
@@ -53,14 +55,45 @@ describe("mock identify", () => {
     expect(await identify.progress()).toEqual(final);
   });
 
+  it("writes an auto-apply match at once when auto-apply is on, and leaves it for review otherwise", async () => {
+    const on = createMockIdentify(AUTO);
+    await on.start(["1", "2", "3"]);
+    await finish(3);
+    const [written] = (await on.queue("applied", 0, 10)).items;
+    expect(written).toMatchObject({ trackId: "3", decision: "autoApply", state: "autoApplied", undoable: true });
+    expect((await on.result(written!.resultId)).existing.label).toBe("Mock Records");
+    expect((await on.undo(written!.resultId)).ok).toBe(true);
+    expect((await on.result(written!.resultId)).item.state).toBe("undone");
+
+    // Off (the default): the same match is a review, nothing is written.
+    const off = createMockIdentify({ tickMs: TICK });
+    const { events } = record(off);
+    await off.start(["1", "2", "3"]);
+    await finish(3);
+    expect(events.filter(([kind]) => kind === "result").map(([, r]) => (r as IdentifyResultEvent).decision))
+      .toEqual(["review", "unidentified", "review"]);
+    expect((await off.queue("applied", 0, 10)).total).toBe(0);
+    expect((await off.queue("needsReview", 0, 10)).items.map((i) => i.trackId)).toEqual(["3", "1"]);
+    expect(events.at(-1)?.[1]).toMatchObject({ identified: 0, review: 2 });
+
+    // A refused write stays under Needs review and is counted there.
+    const locked = createMockIdentify({ ...AUTO, refuseAutoWrite: true });
+    const lockedEvents = record(locked).events;
+    await locked.start(["1", "2", "3"]);
+    await finish(3);
+    expect((await locked.queue("applied", 0, 10)).total).toBe(0);
+    expect((await locked.queue("needsReview", 0, 10)).items[0]).toMatchObject({ trackId: "3", state: "pending", undoable: false });
+    expect(lockedEvents.at(-1)?.[1]).toMatchObject({ identified: 0, review: 2 });
+  });
+
   it("files every finished track under its filter", async () => {
-    const identify = createMockIdentify({ tickMs: TICK });
+    const identify = createMockIdentify(AUTO);
     await identify.start(["1", "2", "3", "4", "5"]);
     await finish(5);
     expect((await identify.queue("all", 0, 50)).total).toBe(4);
     expect((await identify.queue("needsReview", 0, 50)).total).toBe(2);
     expect((await identify.queue("unidentified", 0, 50)).total).toBe(1);
-    expect((await identify.queue("applied", 0, 50)).total).toBe(0);
+    expect((await identify.queue("applied", 0, 50)).total).toBe(1);
     const all = await identify.queue("all", 0, 50);
     expect(all.items.at(-1)?.score, "no score sorts last").toBeNull();
     expect(all.items[0]?.score).toBeGreaterThan(all.items[1]?.score ?? 1);
@@ -126,7 +159,7 @@ describe("mock identify", () => {
   });
 
   it("applies ticked fields, undoes them, and accepts above a threshold", async () => {
-    const identify = createMockIdentify({ tickMs: TICK });
+    const identify = createMockIdentify(AUTO);
     const changed: number[][] = [];
     identify.onChanged((event) => changed.push(event.resultIds));
     await identify.start(["1", "2", "3", "4"]);
@@ -159,7 +192,7 @@ describe("mock identify", () => {
   });
 
   it("appends the sub-genre to the comment and refuses what the store refuses", async () => {
-    const identify = createMockIdentify({ tickMs: TICK });
+    const identify = createMockIdentify(AUTO);
     await identify.start(["1", "2", "3"]);
     await finish(3);
     const review = (await identify.queue("needsReview", 0, 10)).items[0]!;
@@ -178,9 +211,10 @@ describe("mock identify", () => {
     await identify.setState(review.resultId, "reject");
     expect((await identify.apply([{ resultId: review.resultId, fields: ["title"] }]))[0]).toMatchObject({ ok: false });
 
+    // The job wrote the auto-apply match itself; it is not written again.
     const auto = (await identify.queue("all", 0, 10)).items.find((i) => i.decision === "autoApply")!;
-    expect((await identify.apply([{ resultId: auto.resultId, fields: ["label"] }]))[0]?.ok).toBe(true);
-    expect((await identify.result(auto.resultId)).item.state).toBe("autoApplied");
+    expect(auto).toMatchObject({ state: "autoApplied", undoable: true });
+    expect((await identify.apply([{ resultId: auto.resultId, fields: ["label"] }]))[0]?.ok).toBe(false);
     await expect(identify.acceptAbove(Number.NaN)).rejects.toMatchObject({ kind: "malformed" });
   });
 

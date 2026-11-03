@@ -275,7 +275,7 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
                 <div className={styles.jobCurrent} title={progress.currentPath}>{progress.currentTitle}</div>
               ) : null}
               <div className={styles.jobCounts}>
-                {t("{identified} auto-apply · {review} to review · {unidentified} unidentified · {failed} failed", {
+                {t("{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed", {
                   identified: progress.identified, review: progress.review,
                   unidentified: progress.unidentified, failed: progress.failed,
                 })}

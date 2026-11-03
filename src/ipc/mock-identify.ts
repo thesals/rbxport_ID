@@ -13,7 +13,7 @@
  * few hundred lines.
  */
 import type {
-  AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyChangedEvent, IdentifyDecision, IdentifyDetail, IdentifyFieldChange,
+  AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyChangedEvent, IdentifyDecision, IdentifyDetail, IdentifyField, IdentifyFieldChange,
   IdentifyFilter, IdentifyProgress, IdentifyQueueItem, IdentifyResultEvent, IdentifyReviewAction, IdentifyReviewState,
   IdentifyKeySource, IdentifySettings, IdentifyWriteOutcome,
 } from "./types";
@@ -28,6 +28,8 @@ export interface MockIdentifyOptions {
   describe?: (trackId: string) => { title: string; artist: string } | undefined;
   /** Where each key comes from at first; the settings file holds the rest. */
   settings?: Partial<IdentifySettings>;
+  /** Make the job's automatic writes fail, as a locked file would. */
+  refuseAutoWrite?: boolean;
 }
 
 /**
@@ -58,7 +60,12 @@ function layersAt<T>(source: IdentifyKeySource, value: T): Layers<T> {
 }
 
 type Outcome = IdentifyDecision | "failed";
-/** What the tracks of a job come out as, in turn. */
+/**
+ * What the tracks of a job come out as, in turn. `autoApply` is a
+ * fingerprint match that only fills empty fields: an auto-apply decision,
+ * written at once, when auto-apply is on and its score reaches the
+ * threshold, and a review otherwise (`decide` in Rust).
+ */
 const OUTCOMES: readonly Outcome[] = ["review", "unidentified", "autoApply", "review", "failed"];
 
 /** The comment a Beatport download carries, which `subGenre` appends to. */
@@ -122,8 +129,6 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   const changedListeners = new Set<(event: IdentifyChangedEvent) => void>();
   /** The values an apply replaced, by result, for its undo. */
   const snapshots = new Map<number, IdentifyFieldChange[]>();
-  /** Results written at least once: only an auto-apply's first write is autoApplied. */
-  const written = new Set<number>();
   /** Every result, current or replaced, by id. */
   const results = new Map<number, IdentifyDetail>();
   /** Each file's current result. */
@@ -163,13 +168,18 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   };
 
   /** Stores one finished track as the store would, and returns its id. */
-  const save = (trackId: string, path: string, artist: string, title: string, decision: IdentifyDecision): number => {
+  const save = (
+    trackId: string, path: string, artist: string, title: string, decision: IdentifyDecision,
+    /** A match that only fills empty fields. */
+    fills: boolean,
+  ): number => {
     const id = nextResult++;
-    const score = decision === "unidentified" ? 0.31 : decision === "autoApply" ? 0.97 : 0.81;
+    const score = decision === "unidentified" ? 0.31 : fills ? 0.97 : 0.81;
+    const overwrites = decision !== "unidentified" && !fills;
     const changes: IdentifyFieldChange[] =
       decision === "unidentified"
         ? []
-        : decision === "autoApply"
+        : fills
           ? [
               { field: "label", current: "", proposed: "Mock Records" },
               { field: "catalogNumber", current: "", proposed: "MOCK001" },
@@ -181,6 +191,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
               { field: "artwork", current: "none", proposed: "JPEG from Cover Art Archive" },
             ];
     const candidates = decision === "unidentified" ? [] : [candidate(artist, `${title} (Extended Mix)`, score)];
+    // An auto-apply decision is accepted until the job writes it.
     const state: IdentifyReviewState =
       decision === "unidentified" ? "unidentified" : decision === "autoApply" ? "accepted" : "pending";
     results.set(id, {
@@ -190,12 +201,12 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
         source: candidates[0]?.source ?? null,
       },
       existing: {
-        artist, title, album: "", label: decision === "review" ? "Old Label" : "", year: null, isrc: "", genre: "",
-        catalogNumber: "", comment: decision === "review" ? COMMENT : "", hasArtwork: decision !== "review",
+        artist, title, album: "", label: overwrites ? "Old Label" : "", year: null, isrc: "", genre: "",
+        catalogNumber: "", comment: overwrites ? COMMENT : "", hasArtwork: !overwrites,
       },
       candidates,
       enrichment: null,
-      artwork: decision === "review"
+      artwork: overwrites
         ? { source: "coverArtArchive", url: "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500", sha256: "0".repeat(64), mime: "image/jpeg", bytes: 48_213 }
         : null,
       warnings: decision === "unidentified" ? ["AcoustID: no match"] : [],
@@ -204,7 +215,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       // file, with an older label and no comment.
       rekordbox: {
         trackId, importedAt: new Date().toISOString(), title, artist, album: "",
-        label: decision === "review" ? "Older Label" : "", genre: "", year: "", comment: "", isrc: "",
+        label: overwrites ? "Older Label" : "", genre: "", year: "", comment: "", isrc: "",
       },
     });
     current.set(path, id);
@@ -236,7 +247,12 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       progress.currentPath = path;
       tellProgress(progress);
       setTimeout(() => {
-        const outcome = OUTCOMES[index % OUTCOMES.length] ?? "failed";
+        const slot = OUTCOMES[index % OUTCOMES.length] ?? "failed";
+        const fills = slot === "autoApply";
+        // The decision as `decide` makes it: auto-apply only when switched on.
+        const outcome: Outcome = fills && !(settings.autoApply && 0.97 >= settings.autoApplyThreshold) ? "review" : slot;
+        let counted: "identified" | "review" | "unidentified" | "failed" =
+          outcome === "autoApply" ? "identified" : outcome === "failed" ? "failed" : outcome;
         const result: IdentifyResultEvent = {
           jobId, trackId, resultId: null, path, decision: outcome, score: null, error: null,
         };
@@ -246,15 +262,27 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
           result.error = "The file could not be found.";
         } else if (heldState === "applied" || heldState === "autoApplied") {
           result.decision = "failed";
+          counted = "failed";
           result.error = "identify store: this track has an applied result; undo it before identifying again";
         } else {
-          result.resultId = save(trackId, path, artist, title, outcome);
-          result.score = results.get(result.resultId)?.item.score ?? null;
+          const id = save(trackId, path, artist, title, outcome, fills);
+          result.resultId = id;
+          result.score = results.get(id)?.item.score ?? null;
+          if (outcome === "autoApply") {
+            // Written straight away; a refused write leaves it for review.
+            const detail = results.get(id);
+            const fields = detail ? detail.item.changes.map((c) => c.field) : [];
+            const written = options.refuseAutoWrite
+              ? { resultId: id, ok: false, error: "The file is open in another program." }
+              : write(id, fields, true);
+            if (!written.ok && detail) {
+              detail.item.state = "pending";
+              counted = "review";
+            }
+            tellChanged([id]);
+          }
         }
-        if (result.decision === "autoApply") progress.identified += 1;
-        else if (result.decision === "review") progress.review += 1;
-        else if (result.decision === "unidentified") progress.unidentified += 1;
-        else progress.failed += 1;
+        progress[counted] += 1;
         progress.done += 1;
         tellResult(result);
         step(index + 1);
@@ -262,6 +290,37 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
     };
     step(0);
   };
+
+  /**
+   * Writes a result's fields as the store does, snapshotting what they
+   * replace. `auto` is the job's own write of an auto-apply decision, which
+   * the store records as autoApplied; a person's is applied.
+   */
+  function write(resultId: number, fields: readonly IdentifyField[], auto: boolean): IdentifyWriteOutcome {
+    const detail = changeable(resultId);
+    const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error });
+    if (!detail) return refuse("That identification result is no longer in the store.");
+    if (detail.item.state !== "pending" && detail.item.state !== "accepted") {
+      return refuse(`A ${detail.item.state} result cannot be applied.`);
+    }
+    if (fields.length === 0) return refuse("Choose at least one field to write.");
+    const picked = detail.item.changes.filter((c) => fields.includes(c.field));
+    if (picked.length !== new Set(fields).size) return refuse("That change could not be made to this result.");
+    snapshots.set(resultId, detail.item.changes.map((c) => ({ ...c })));
+    detail.item.changes = detail.item.changes.map((c) => fields.includes(c.field) ? { ...c, current: c.proposed } : c);
+    for (const change of picked) {
+      if (change.field === "artwork") detail.existing.hasArtwork = true;
+      else if (change.field === "subGenre") detail.existing.comment = change.proposed;
+      else if (change.field === "year") detail.existing.year = Number(change.proposed) || null;
+      else if (change.field in detail.existing) {
+        (detail.existing as unknown as Record<string, string>)[change.field] = change.proposed;
+      }
+    }
+    detail.item.state = auto ? "autoApplied" : "applied";
+    detail.item.undoable = true;
+    touch(detail);
+    return { resultId, ok: true, error: null };
+  }
 
   /** A current result with no write open, or the store's refusal. */
   const changeable = (resultId: number): IdentifyDetail | null => {
@@ -357,33 +416,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       return Promise.resolve(item);
     },
     apply: (items) => {
-      const outcomes = items.map(({ resultId, fields }): IdentifyWriteOutcome => {
-        const detail = changeable(resultId);
-        const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error });
-        if (!detail) return refuse("That identification result is no longer in the store.");
-        if (detail.item.state !== "pending" && detail.item.state !== "accepted") {
-          return refuse(`A ${detail.item.state} result cannot be applied.`);
-        }
-        if (fields.length === 0) return refuse("Choose at least one field to write.");
-        const picked = detail.item.changes.filter((c) => fields.includes(c.field));
-        if (picked.length !== new Set(fields).size) return refuse("That change could not be made to this result.");
-        snapshots.set(resultId, detail.item.changes.map((c) => ({ ...c })));
-        detail.item.changes = detail.item.changes.map((c) => fields.includes(c.field) ? { ...c, current: c.proposed } : c);
-        for (const change of picked) {
-          if (change.field === "artwork") detail.existing.hasArtwork = true;
-          else if (change.field === "subGenre") detail.existing.comment = change.proposed;
-          else if (change.field === "year") detail.existing.year = Number(change.proposed) || null;
-          else if (change.field in detail.existing) {
-            (detail.existing as unknown as Record<string, string>)[change.field] = change.proposed;
-          }
-        }
-        // As the store: an auto-apply result's first write is autoApplied.
-        detail.item.state = detail.item.decision === "autoApply" && !written.has(resultId) ? "autoApplied" : "applied";
-        written.add(resultId);
-        detail.item.undoable = true;
-        touch(detail);
-        return { resultId, ok: true, error: null };
-      });
+      const outcomes = items.map(({ resultId, fields }) => write(resultId, fields, false));
       tellChanged(outcomes.filter((o) => o.ok).map((o) => o.resultId));
       return Promise.resolve(outcomes);
     },

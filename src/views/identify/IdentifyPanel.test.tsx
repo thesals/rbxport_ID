@@ -57,8 +57,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   globalThis.ResizeObserver ??= class { observe() {} disconnect() {} unobserve() {} } as unknown as typeof ResizeObserver;
-  identify = createMockIdentify({ tickMs: TICK });
-  __setBackend({ identify } as unknown as Backend);
+  // Auto-apply on: the job writes the third track of five itself.
+  useMock(true);
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
@@ -71,6 +71,12 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+/** A fresh mock store with auto-apply on or off. */
+function useMock(autoApply: boolean) {
+  identify = createMockIdentify({ tickMs: TICK, settings: { autoApply } });
+  __setBackend({ identify } as unknown as Backend);
+}
+
 async function identifyFive() {
   await identify.start(["1", "2", "3", "4", "5"]);
   await flush(TICK * 8);
@@ -82,7 +88,7 @@ describe("IdentifyPanel", () => {
     await vi.advanceTimersByTimeAsync(TICK * 2 + 1);
     await render(0);
     expect(host.textContent).toMatch(/Identifying \d of 6/);
-    expect(host.textContent).toMatch(/auto-apply · \d+ to review/);
+    expect(host.textContent).toMatch(/applied automatically · \d+ to review/);
     expect(host.querySelector("progress")).not.toBeNull();
     await click(button("Cancel"));
     await flush(TICK * 10);
@@ -134,6 +140,21 @@ describe("IdentifyPanel", () => {
     expect(byText("section span", "Needs review")).toBeDefined();
   });
 
+  it("files a result the job wrote under Applied, where it can be undone like any other", async () => {
+    await identifyFive();
+    await render();
+    expect(host.textContent).toContain("1 applied automatically · 2 to review");
+    await click(byText("[role=tab]", "Applied (undoable)"));
+    expect(options()).toHaveLength(1);
+    expect(options()[0]?.textContent).toContain("Applied automatically");
+    await click(options()[0]);
+    expect(button("Accept")?.disabled).toBe(true);
+    expect(host.querySelector("[role=note]")?.textContent).toContain("choose Reload Tag");
+    await click(button("Undo"));
+    expect(byText("section span", "Undone")).toBeDefined();
+    expect(options()).toHaveLength(0);
+  });
+
   it("edits a proposed value and rejects", async () => {
     await identifyFive();
     await render();
@@ -164,20 +185,22 @@ describe("IdentifyPanel", () => {
   });
 
   it("accepts above the threshold, then applies what was accepted", async () => {
+    // Off, so the fill-only match waits for review with the others.
+    useMock(false);
     await identifyFive();
     const apply = vi.spyOn(identify, "apply");
     await render();
     await click(button("Accept above"));
-    expect(host.textContent).toContain("0 results accepted.");
+    expect(host.textContent).toContain("1 result accepted.");
     const number = host.querySelector<HTMLInputElement>('input[aria-label="Accept threshold value"]')!;
     type(number, "0.8");
     await click(button("Accept above"));
     expect(host.textContent).toContain("2 results accepted.");
     await click(button("Apply accepted"));
     // Nothing is written before the counts are confirmed. Of the three
-    // accepted (the two above plus the auto-apply match the mock leaves
-    // accepted), only the auto-apply match just fills empty fields; the two
-    // reviews overwrite a title and add a sub-genre, so they wait.
+    // accepted (the fill-only match at 0.92, then the two reviews at 0.8),
+    // only the fill-only match just fills empty fields; the two reviews
+    // overwrite a title and add a sub-genre, so they wait.
     expect(apply).not.toHaveBeenCalled();
     expect(host.textContent).toContain(
       "Fill 2 empty fields in 1 results. 2 results with overwrites or a sub-genre are left for individual review.");
@@ -192,7 +215,9 @@ describe("IdentifyPanel", () => {
   });
 
   it("drops a bulk write the user does not confirm", async () => {
+    useMock(false);
     await identifyFive();
+    await act(async () => { await identify.acceptAbove(0.92); });
     const apply = vi.spyOn(identify, "apply");
     await render();
     await click(button("Apply accepted"));

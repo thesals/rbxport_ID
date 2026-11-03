@@ -326,7 +326,7 @@ export function IdentifyPane() {
           />
         </label>
         <p id={`${id}-auto-help`} className={layout.help}>
-          {t("Only fingerprint matches that fill empty fields only are applied automatically; everything else waits for review. Off by default.")}
+          {t("When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under Applied (undoable); if the write fails, it stays under Needs review. Everything else waits for review. Off by default.")}
         </p>
         <div className={styles.actions}>
           <label htmlFor={`${id}-threshold`}>{t("Minimum score")}</label>

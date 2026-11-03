@@ -54,7 +54,8 @@ it("starts a job and follows its progress to the end", async () => {
 
   await act(async () => { await vi.advanceTimersByTimeAsync(TICK * 4); });
   expect(job?.running).toBe(false);
-  expect(job?.progress).toMatchObject({ state: "done", done: 3, review: 1, unidentified: 1, identified: 1 });
+  // Auto-apply is off by default, so the auto-apply match is a review.
+  expect(job?.progress).toMatchObject({ state: "done", done: 3, review: 2, unidentified: 1, identified: 0 });
 });
 
 it("reads a job that was already running when it mounted, and cancels it", async () => {

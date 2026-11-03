@@ -1735,7 +1735,11 @@ export interface IdentifyProgress {
   /** The track being identified; empty once the job has ended. */
   currentTitle: string;
   currentPath: string;
-  /** Finished tracks by outcome; `identified` counts auto-apply decisions. */
+  /**
+   * Finished tracks by outcome. `identified` counts results the job wrote to
+   * the file itself (auto-apply on, now under Applied); one whose write
+   * failed stays under Needs review and is counted in `review`.
+   */
   identified: number;
   review: number;
   unidentified: number;
