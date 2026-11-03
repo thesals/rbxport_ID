@@ -83,6 +83,7 @@ use lofty::probe::Probe;
 use lofty::tag::Tag;
 
 use crate::error::{IdentifyError, Result};
+use crate::clock::Deadline;
 use crate::model::{ArtworkRef, Field, FieldChange, TagSnapshot};
 use crate::pipeline::current;
 use crate::store::{ApplicationId, ResultId, ReviewState, Store, TrackKey, WaitingWrite};
@@ -196,6 +197,21 @@ pub fn plan(now: &TagSnapshot, changes: &[FieldChange]) -> Result<Vec<Edit>> {
 /// The write is checked by reading the file back: if any edit did not land
 /// as planned, the original tags are put back and the write is refused.
 pub fn write(path: &Path, before: &TagSnapshot, edits: &[Edit], artwork: Option<Image<'_>>) -> Result<TagSnapshot> {
+    write_until(path, before, edits, artwork, Deadline::NONE)
+}
+
+/// [`write`], stopping with [`IdentifyError::OutOfTime`] once `deadline`
+/// passes while the file is read or the new one is staged. A stop always
+/// comes before the rename over the original: the file is never changed,
+/// and the staged copy is deleted. The rename itself, and putting the file
+/// back after a failed check, are never cut short.
+pub fn write_until(
+    path: &Path,
+    before: &TagSnapshot,
+    edits: &[Edit],
+    artwork: Option<Image<'_>>,
+    deadline: Deadline<'_>,
+) -> Result<TagSnapshot> {
     if edits.is_empty() {
         return Err(refuse("Nothing to write."));
     }
@@ -204,24 +220,24 @@ pub fn write(path: &Path, before: &TagSnapshot, edits: &[Edit], artwork: Option<
     }
     // A leftover from a crash during an earlier write beside this file.
     remove_stale_temps(path);
-    let original = std::fs::read(path).map_err(|e| io_error(path, &e))?;
+    let original = read_until(path, deadline)?;
     if tags::read(path)?.snapshot != *before {
         return Err(refuse("The file's tags changed while the write was being prepared. Try again."));
     }
     let raw = match id3_kind(path, &original)? {
         Id3Kind::Tagged | Id3Kind::Untagged => {
             let rewritten = id3::rewrite(&original, edits, artwork)?;
-            replace(path, &rewritten)?;
+            replace_until(path, &rewritten, deadline)?;
             true
         }
         Id3Kind::Chunk(container) => {
             let tag = chunk::payload(&original, container)?;
             let new_tag = id3::rewrite_tag(tag, edits, artwork)?;
-            replace(path, &chunk::splice(&original, container, Some(&new_tag))?)?;
+            replace_until(path, &chunk::splice(&original, container, Some(&new_tag))?, deadline)?;
             true
         }
         Id3Kind::Other => {
-            lofty_write(path, edits, artwork)?;
+            lofty_write(path, edits, artwork, deadline)?;
             false
         }
     };
@@ -422,6 +438,49 @@ fn io_error(path: &Path, e: &std::io::Error) -> IdentifyError {
 /// Replaces the file with `bytes`: staged beside it, flushed, renamed over
 /// it. Keeps the creation time on Windows.
 pub(crate) fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    replace_until(path, bytes, Deadline::NONE)
+}
+
+/// How much is read or staged between two looks at the deadline.
+const CHUNK: usize = 1 << 20;
+
+/// Why a write stopped for its deadline.
+fn out_of_time() -> IdentifyError {
+    IdentifyError::OutOfTime("There was no time left to write the file; nothing was changed.".to_owned())
+}
+
+/// The whole file, read in chunks, stopping once `deadline` passes.
+fn read_until(path: &Path, deadline: Deadline<'_>) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|e| io_error(path, &e))?;
+    let mut bytes = Vec::with_capacity(file.metadata().map_or(0, |m| usize::try_from(m.len()).unwrap_or(0)));
+    let mut chunk = vec![0_u8; CHUNK];
+    loop {
+        if deadline.passed() {
+            return Err(out_of_time());
+        }
+        let n = file.read(&mut chunk).map_err(|e| io_error(path, &e))?;
+        if n == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Writes `bytes` to a staged file in chunks, stopping once `deadline`
+/// passes (the staged file is then deleted by its owner).
+fn stage_until(staged: &mut std::fs::File, bytes: &[u8], deadline: Deadline<'_>) -> Result<()> {
+    for chunk in bytes.chunks(CHUNK) {
+        if deadline.passed() {
+            return Err(out_of_time());
+        }
+        staged.write_all(chunk).map_err(|e| refuse(format!("The new tags could not be staged: {e}")))?;
+    }
+    Ok(())
+}
+
+/// [`replace`], stopping before the rename once `deadline` passes.
+fn replace_until(path: &Path, bytes: &[u8], deadline: Deadline<'_>) -> Result<()> {
     let meta = std::fs::metadata(path).map_err(|e| io_error(path, &e))?;
     if meta.permissions().readonly() {
         return Err(refuse("The file is read-only. Clear its read-only attribute to write its tags."));
@@ -433,13 +492,17 @@ pub(crate) fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
         .suffix(".tmp")
         .tempfile_in(parent)
         .map_err(|e| refuse(format!("The file's folder cannot be written to: {e}")))?;
-    staged.write_all(bytes).map_err(|e| refuse(format!("The new tags could not be staged: {e}")))?;
+    stage_until(staged.as_file_mut(), bytes, deadline)?;
     staged.as_file().sync_all().map_err(|e| refuse(format!("The new tags could not be staged: {e}")))?;
     #[cfg(windows)]
     if let Ok(created) = meta.created() {
         use std::os::windows::fs::FileTimesExt as _;
         // Best effort: the tags are what matter.
         let _ = staged.as_file().set_times(std::fs::FileTimes::new().set_created(created));
+    }
+    // The last moment to stop: after this the file is replaced.
+    if deadline.passed() {
+        return Err(out_of_time());
     }
     staged.persist(path).map_err(|e| replace_error(&e.error, held_open(path)))?;
     #[cfg(unix)]
@@ -500,8 +563,8 @@ fn lofty_key(tag: &Tag, field: Field) -> Option<ItemKey> {
     keys.iter().find(|k| tag.get_string(k).is_some()).cloned().or_else(|| keys.into_iter().next())
 }
 
-fn lofty_write(path: &Path, edits: &[Edit], artwork: Option<Image<'_>>) -> Result<()> {
-    let staged = stage_copy(path)?;
+fn lofty_write(path: &Path, edits: &[Edit], artwork: Option<Image<'_>>, deadline: Deadline<'_>) -> Result<()> {
+    let staged = stage_copy(path, deadline)?;
     let mut tagged = Probe::open(staged.path())
         .and_then(Probe::read)
         .map_err(|e| refuse(format!("The file's tags could not be read for writing: {e}")))?;
@@ -538,12 +601,12 @@ fn lofty_write(path: &Path, edits: &[Edit], artwork: Option<Image<'_>>) -> Resul
     tagged
         .save_to_path(staged.path(), WriteOptions::default())
         .map_err(|e| refuse(format!("The tags could not be written: {e}")))?;
-    publish(path, staged)
+    publish(path, staged, deadline)
 }
 
 /// Puts the recorded values of `fields` back with lofty.
 fn lofty_restore(path: &Path, before: &TagSnapshot, fields: &[Field]) -> Result<()> {
-    let staged = stage_copy(path)?;
+    let staged = stage_copy(path, Deadline::NONE)?;
     let mut tagged = Probe::open(staged.path())
         .and_then(Probe::read)
         .map_err(|e| refuse(format!("The file's tags could not be read: {e}")))?;
@@ -575,12 +638,12 @@ fn lofty_restore(path: &Path, before: &TagSnapshot, fields: &[Field]) -> Result<
     tagged
         .save_to_path(staged.path(), WriteOptions::default())
         .map_err(|e| refuse(format!("The tags could not be written: {e}")))?;
-    publish(path, staged)
+    publish(path, staged, Deadline::NONE)
 }
 
 /// A copy of the file beside it, to write tags into before it replaces the
 /// original.
-fn stage_copy(path: &Path) -> Result<tempfile::NamedTempFile> {
+fn stage_copy(path: &Path, deadline: Deadline<'_>) -> Result<tempfile::NamedTempFile> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let mut staged = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
@@ -589,15 +652,24 @@ fn stage_copy(path: &Path) -> Result<tempfile::NamedTempFile> {
         .tempfile_in(parent)
         .map_err(|e| refuse(format!("The file's folder cannot be written to: {e}")))?;
     let mut source = std::fs::File::open(path).map_err(|e| io_error(path, &e))?;
-    std::io::copy(&mut source, staged.as_file_mut()).map_err(|e| refuse(format!("The file could not be staged: {e}")))?;
-    Ok(staged)
+    let mut chunk = vec![0_u8; CHUNK];
+    loop {
+        if deadline.passed() {
+            return Err(out_of_time());
+        }
+        let n = std::io::Read::read(&mut source, &mut chunk).map_err(|e| refuse(format!("The file could not be staged: {e}")))?;
+        if n == 0 {
+            return Ok(staged);
+        }
+        staged.as_file_mut().write_all(&chunk[..n]).map_err(|e| refuse(format!("The file could not be staged: {e}")))?;
+    }
 }
 
 /// Renames a staged copy over the original, as [`replace`] does.
-fn publish(path: &Path, staged: tempfile::NamedTempFile) -> Result<()> {
+fn publish(path: &Path, staged: tempfile::NamedTempFile, deadline: Deadline<'_>) -> Result<()> {
     let bytes = std::fs::read(staged.path()).map_err(|e| refuse(format!("The staged file could not be read: {e}")))?;
     drop(staged);
-    replace(path, &bytes)
+    replace_until(path, &bytes, deadline)
 }
 
 // ------------------------------------------------------------- AIFF / WAV
@@ -1072,6 +1144,13 @@ pub struct Applied {
 /// the file is free, through this same path and its checks. A write that
 /// lands ends the result's waiting write.
 pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result<Applied> {
+    apply(store, result, fields, false, Deadline::NONE)
+}
+
+/// [`apply_result`]'s path. `retrying`: the call is the retry of the
+/// result's own waiting write (checked by [`retry_waiting`]), which may
+/// stop for `deadline` and then keeps waiting.
+fn apply(store: &Store, result: ResultId, fields: &[Field], retrying: bool, deadline: Deadline<'_>) -> Result<Applied> {
     let (item, ..) = store.result(result)?.ok_or_else(|| refuse("That identification result is no longer in the store."))?;
     let accepted_here = match item.state {
         ReviewState::Accepted => false,
@@ -1146,7 +1225,7 @@ pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result
         }
     };
     let image = image.as_ref().map(|(bytes, mime)| Image { bytes, mime });
-    let after = match write(path, &info.snapshot, &edits, image) {
+    let after = match write_until(path, &info.snapshot, &edits, image, deadline) {
         Ok(after) => after,
         Err(e) => {
             let e = in_use_or(path, e);
@@ -1159,6 +1238,10 @@ pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result
                     // written once the file is free.
                     if matches!(e, IdentifyError::InUse(_)) {
                         return Err(defer(store));
+                    }
+                    // Out of time: nothing changed, and it keeps waiting.
+                    if retrying && matches!(e, IdentifyError::OutOfTime(_)) {
+                        return Err(e);
                     }
                     back_to_pending(store);
                 }
@@ -1193,9 +1276,13 @@ pub enum Retried {
 
 /// Tries a waiting write again, through exactly [`apply_result`]'s path and
 /// checks: the file must still hold, in every field to write, the value the
-/// review saw. A store failure is the only error; the waiting write is then
-/// kept.
-pub fn retry_waiting(store: &Store, waiting: &WaitingWrite) -> Result<Retried> {
+/// review saw. Stops, still waiting, once `deadline` passes, before the
+/// file is changed. A store failure is the only error; the waiting write is
+/// then kept.
+pub fn retry_waiting(store: &Store, waiting: &WaitingWrite, deadline: Deadline<'_>) -> Result<Retried> {
+    if deadline.passed() {
+        return Ok(Retried::StillWaiting(out_of_time().to_string()));
+    }
     let path = Path::new(&waiting.path);
     if !path.exists() {
         return Ok(Retried::StillWaiting("The file is not there now.".to_owned()));
@@ -1203,9 +1290,9 @@ pub fn retry_waiting(store: &Store, waiting: &WaitingWrite) -> Result<Retried> {
     if store.open_applications()?.iter().any(|a| a.path == waiting.path) {
         return Ok(Retried::StillWaiting("An earlier write to this file is still being settled.".to_owned()));
     }
-    match apply_result(store, waiting.result, &waiting.fields) {
+    match apply(store, waiting.result, &waiting.fields, true, deadline) {
         Ok(applied) => Ok(Retried::Written(applied)),
-        Err(IdentifyError::Deferred(message)) => Ok(Retried::StillWaiting(message)),
+        Err(IdentifyError::Deferred(message) | IdentifyError::OutOfTime(message)) => Ok(Retried::StillWaiting(message)),
         Err(e @ IdentifyError::Store(_)) => Err(e),
         Err(e) => {
             let warning = format!("A write that was waiting for this file to be closed was not made: {e}");
@@ -1326,5 +1413,109 @@ mod tests {
         // Nothing left to remove; a file in no folder is a no-op.
         assert_eq!(remove_stale_temps(&track), 0);
         assert_eq!(remove_stale_temps(Path::new("track.mp3")), 0);
+    }
+
+    // ------------------------------------------------- waiting writes
+
+    use crate::model::{Decision, ExistingTags, Proposal};
+    use crate::store::ResultId;
+    use std::time::Duration;
+
+    /// `secs` seconds of silent 16-bit mono WAV.
+    fn wav(path: &Path, secs: u32) {
+        let rate = 44_100_u32;
+        let data_len = rate * 2 * secs;
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16_u32.to_le_bytes());
+        out.extend_from_slice(&1_u16.to_le_bytes());
+        out.extend_from_slice(&1_u16.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes());
+        out.extend_from_slice(&2_u16.to_le_bytes());
+        out.extend_from_slice(&16_u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(out.len() + data_len as usize, 0);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// A pending result proposing a title and a catalog number for `audio`.
+    fn reviewed(store: &Store, audio: &Path) -> ResultId {
+        let key = TrackKey::for_file(audio).unwrap();
+        let track = store.upsert_track(&key, 1.0, None, &ExistingTags::default()).unwrap();
+        let changes = vec![
+            FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() },
+            FieldChange { field: Field::CatalogNumber, current: String::new(), proposed: "CAT001".into() },
+        ];
+        store.save_result(track, Decision::Review, &[], Some(&Proposal::new(changes, None, true)), None, &[], false).unwrap()
+    }
+
+    fn staged_beside(audio: &Path) -> Vec<String> {
+        std::fs::read_dir(audio.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(TEMP_PREFIX))
+            .collect()
+    }
+
+    /// A clock that moves one second each time it is read.
+    #[derive(Default)]
+    struct Ticking(std::sync::Mutex<Duration>);
+
+    impl crate::clock::Clock for Ticking {
+        fn now(&self) -> Duration {
+            let mut now = self.0.lock().unwrap();
+            *now += Duration::from_secs(1);
+            *now
+        }
+
+        fn sleep(&self, duration: Duration) {
+            *self.0.lock().unwrap() += duration;
+        }
+    }
+
+    /// However far into the read or the staged copy the deadline passes, the
+    /// write stops cleanly: the file is unchanged, no staged file is left,
+    /// no write is left open, and it keeps waiting. With time enough, it is
+    /// made.
+    #[test]
+    #[allow(clippy::panic)]
+    fn a_retry_out_of_time_stops_cleanly_at_any_point_and_keeps_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("big.wav");
+        // About 5 MiB: several chunks to read and to stage.
+        wav(&audio, 60);
+        let original = std::fs::read(&audio).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let result = reviewed(&store, &audio);
+        store.defer_write(result, &[Field::Title], OPEN_ELSEWHERE).unwrap();
+        let mut stopped = 0;
+        for budget in 0..200 {
+            let clock = Ticking::default();
+            let deadline = Deadline::new(&clock, Duration::from_secs(budget));
+            let waiting = store.waiting_write(result).unwrap().unwrap();
+            match retry_waiting(&store, &waiting, deadline).unwrap() {
+                Retried::StillWaiting(why) => {
+                    stopped += 1;
+                    assert!(why.contains("no time left"), "{why}");
+                    assert_eq!(std::fs::read(&audio).unwrap(), original, "budget {budget}");
+                    assert_eq!(staged_beside(&audio), Vec::<String>::new(), "budget {budget}");
+                    assert_eq!(store.open_applications().unwrap(), [], "budget {budget}");
+                    let (item, ..) = store.result(result).unwrap().unwrap();
+                    assert_eq!(item.state, ReviewState::Accepted, "budget {budget}");
+                    assert!(item.waiting.is_some(), "budget {budget}");
+                }
+                Retried::Written(_) => {
+                    assert!(stopped > 5, "it stopped part way several times first ({stopped})");
+                    assert_eq!(current(&tags::read(&audio).unwrap().snapshot, Field::Title), "Mine");
+                    assert_eq!(store.waiting_write(result).unwrap(), None);
+                    return;
+                }
+                other @ Retried::Dropped { .. } => panic!("budget {budget}: {other:?}"),
+            }
+        }
+        panic!("never written");
     }
 }

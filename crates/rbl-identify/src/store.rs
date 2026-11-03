@@ -56,6 +56,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::clock::Deadline;
 use crate::error::{IdentifyError, Result};
 use crate::model::{
     ArtworkRef, CandidateSource, Decision, Enrichment, ExistingTags, Field, FieldChange, FrameValues, Proposal, RawId3, Scored,
@@ -1403,12 +1404,25 @@ impl Store {
     ///   cannot be identified again or written.
     ///
     /// Only a store error stops the pass. Nothing here writes to a file.
-    pub fn reconcile_open_applications<F>(&self, mut read_current: F) -> Result<Vec<Reconciliation>>
+    pub fn reconcile_open_applications<F>(&self, read_current: F) -> Result<Vec<Reconciliation>>
+    where
+        F: FnMut(&Application) -> FileNow,
+    {
+        self.reconcile_open_applications_until(read_current, Deadline::NONE)
+    }
+
+    /// [`Store::reconcile_open_applications`], stopping once `deadline`
+    /// passes: the applications not looked at yet stay open, and are not in
+    /// the outcomes.
+    pub fn reconcile_open_applications_until<F>(&self, mut read_current: F, deadline: Deadline<'_>) -> Result<Vec<Reconciliation>>
     where
         F: FnMut(&Application) -> FileNow,
     {
         let mut outcomes = Vec::new();
         for application in self.open_applications()? {
+            if deadline.passed() {
+                break;
+            }
             let Some(before) = self.application_snapshot(application.id)? else {
                 outcomes.push(Reconciliation::NeedsUser {
                     application: Box::new(application),
@@ -1507,7 +1521,13 @@ impl Store {
     /// disk at its stored path, after deleting any staged file the
     /// interrupted write left beside it ([`crate::write::remove_stale_temps`]).
     pub fn reconcile_open_applications_from_files(&self) -> Result<Vec<Reconciliation>> {
-        self.reconcile_open_applications(|application| {
+        self.reconcile_open_applications_from_files_until(Deadline::NONE)
+    }
+
+    /// [`Store::reconcile_open_applications_from_files`], stopping once
+    /// `deadline` passes (between files: one file's read is not cut short).
+    pub fn reconcile_open_applications_from_files_until(&self, deadline: Deadline<'_>) -> Result<Vec<Reconciliation>> {
+        self.reconcile_open_applications_until(|application| {
             let path = Path::new(&application.path);
             if !path.exists() {
                 return FileNow::Missing;
@@ -1526,7 +1546,7 @@ impl Store {
                 Ok(key) => FileNow::Read { tags, key },
                 Err(e) => FileNow::Unreadable(e.to_string()),
             }
-        })
+        }, deadline)
     }
 
     /// What the last written application of a result wrote; empty when
@@ -3427,6 +3447,28 @@ mod tests {
         let (item, ..) = store.result(result).unwrap().unwrap();
         assert_eq!(item.state, ReviewState::Accepted, "still waiting to be written");
         assert!(item.waiting.is_some());
+    }
+
+    #[test]
+    fn reconciling_stops_at_its_deadline_and_leaves_the_rest_open() {
+        let store = Store::open_in_memory().unwrap();
+        let clock = crate::clock::ManualClock::new();
+        interrupted(&store, "a.mp3", &snapshot("T"));
+        interrupted(&store, "b.mp3", &snapshot("T"));
+        // The first file takes the whole budget.
+        let outcomes = store
+            .reconcile_open_applications_until(
+                |_| {
+                    crate::clock::Clock::sleep(&clock, std::time::Duration::from_secs(5));
+                    read(snapshot("T"))
+                },
+                Deadline::new(&clock, std::time::Duration::from_secs(3)),
+            )
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(store.open_applications().unwrap().len(), 1, "the second is left for later");
+        let none = store.reconcile_open_applications_until(|_| read(snapshot("T")), Deadline::new(&clock, std::time::Duration::ZERO)).unwrap();
+        assert_eq!(none, [], "no time at all: nothing looked at");
     }
 
     #[test]

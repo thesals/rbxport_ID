@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rbl_identify::acoustid::AcoustIdClient;
-use rbl_identify::clock::{Clock, SystemClock};
+use rbl_identify::clock::{Clock, Deadline, SystemClock};
 use rbl_identify::coverart::CoverArtClient;
 use rbl_identify::discogs::DiscogsClient;
 use rbl_identify::model::{Decision, Field, FieldChange, Proposal, Scored};
@@ -326,7 +326,8 @@ impl IdentifyState {
         // cannot be read now, stays open for the next start. No file is
         // written here.
         let reconciled = self.with_store_until(deadline, true, |store| {
-            let outcomes = store.reconcile_open_applications_from_files().map_err(store_error)?;
+            let outcomes =
+                store.reconcile_open_applications_from_files_until(self.deadline(deadline)).map_err(store_error)?;
             let mut changed = Vec::new();
             for outcome in &outcomes {
                 if let Reconciliation::Completed { application }
@@ -361,6 +362,14 @@ impl IdentifyState {
         }
     }
 
+    /// `deadline` on the identify clock, for the write path to check as it
+    /// goes.
+    fn deadline(&self, deadline: Option<Instant>) -> Deadline<'_> {
+        deadline.map_or(Deadline::NONE, |d| {
+            Deadline::after(self.clock.as_ref(), d.saturating_duration_since(Instant::now()))
+        })
+    }
+
     /// Tries every waiting write except those of `skip`, oldest first,
     /// through the same path and checks as an apply, stopping at `deadline`
     /// (what is left keeps waiting). Returns one outcome per write tried,
@@ -385,7 +394,7 @@ impl IdentifyState {
                 break;
             }
             let tried = self.with_store_until(deadline, true, |store| {
-                Ok(rbl_identify::write::retry_waiting(store, waiting).map_err(store_error))
+                Ok(rbl_identify::write::retry_waiting(store, waiting, self.deadline(deadline)).map_err(store_error))
             });
             let outcome = match tried {
                 None => break,

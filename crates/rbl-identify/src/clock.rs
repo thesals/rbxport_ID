@@ -11,6 +11,44 @@ pub trait Clock: Send + Sync {
     fn sleep(&self, duration: Duration);
 }
 
+/// A point in time a piece of work must not run past, on a [`Clock`]: the
+/// app's exit pass checks it between chunks of a write, so it can stop
+/// before touching the file. [`Deadline::NONE`] never passes.
+#[derive(Clone, Copy)]
+pub struct Deadline<'a> {
+    at: Option<(&'a dyn Clock, Duration)>,
+}
+
+impl std::fmt::Debug for Deadline<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deadline").field("at", &self.at.map(|(_, at)| at)).finish()
+    }
+}
+
+impl Deadline<'static> {
+    /// No deadline.
+    pub const NONE: Self = Self { at: None };
+}
+
+impl<'a> Deadline<'a> {
+    /// Passes once `clock` reads `at` or later.
+    #[must_use]
+    pub fn new(clock: &'a dyn Clock, at: Duration) -> Self {
+        Self { at: Some((clock, at)) }
+    }
+
+    /// `budget` from now on `clock`.
+    #[must_use]
+    pub fn after(clock: &'a dyn Clock, budget: Duration) -> Self {
+        Self::new(clock, clock.now().saturating_add(budget))
+    }
+
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.at.is_some_and(|(clock, at)| clock.now() >= at)
+    }
+}
+
 /// The real clock.
 #[derive(Debug)]
 pub struct SystemClock {
