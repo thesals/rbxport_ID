@@ -220,10 +220,11 @@ describe("mock identify", () => {
     expect(written.existing.label).toBe("Mock Records");
     expect((await identify.queue("waiting", 0, 10)).total).toBe(0);
 
-    // Every file in use; cancelling drops the write and keeps the result accepted.
+    // Every file in use; cancelling drops the write and puts the result back to review.
     identify.setFileInUse(true);
     expect((await identify.apply([{ resultId: second!.resultId, fields: ["label"] }]))[0]?.deferred).toBe(true);
-    expect(await identify.cancelWaiting(second!.resultId)).toMatchObject({ state: "accepted", waiting: null });
+    expect(await identify.cancelWaiting(second!.resultId)).toMatchObject({ state: "pending", waiting: null });
+    expect((await identify.queue("needsReview", 0, 10)).items.map((i) => i.resultId)).toContain(second!.resultId);
     await expect(identify.cancelWaiting(second!.resultId)).rejects.toMatchObject({ kind: "malformed" });
     identify.setFileInUse(false);
     expect(await identify.retryWaiting()).toEqual([]);

@@ -1980,7 +1980,7 @@ export interface IdentifyBackend {
   acceptAbove(threshold: number): Promise<number>;
   /** Tries every waiting write now; one outcome each, `deferred` again for a file still in use. */
   retryWaiting(): Promise<IdentifyWriteOutcome[]>;
-  /** Drops a result's waiting write without writing anything. */
+  /** Drops a result's waiting write without writing anything; the result goes back to `pending`. */
   cancelWaiting(resultId: number): Promise<IdentifyQueueItem>;
   onChanged(listener: (event: IdentifyChangedEvent) => void): () => void;
   /** Keys are reported by where they come from, never by value. */

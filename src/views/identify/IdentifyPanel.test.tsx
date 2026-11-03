@@ -267,7 +267,10 @@ describe("IdentifyPanel", () => {
     await click(button("Cancel write"));
     expect(cancel).toHaveBeenCalledTimes(1);
     expect(host.querySelector("section[aria-label='Waiting for file']")).toBeNull();
-    expect(byText("[role=dialog] section span", "Accepted")).toBeDefined();
+    // Back to review, writable again.
+    expect(byText("[role=dialog] section header span", "Needs review")).toBeDefined();
+    expect(button("Accept")?.disabled).toBe(false);
+    expect(options().some((row) => row.textContent?.includes("Needs review"))).toBe(true);
     identify.setFileInUse(false);
     await click(byText("[role=tab]", "Waiting for file"));
     expect(options()).toHaveLength(0);

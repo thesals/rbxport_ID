@@ -519,7 +519,9 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       const detail = changeable(resultId);
       if (!detail) return fail("notFound", "That identification result is no longer in the store.");
       if (!detail.item.waiting) return fail("malformed", "This result has no write waiting.");
+      // Nothing was written: the result goes back to review.
       detail.item.waiting = null;
+      detail.item.state = "pending";
       waitingAuto.delete(resultId);
       const item = touch(detail);
       tellChanged([resultId]);
