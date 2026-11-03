@@ -1614,5 +1614,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Independientemente de lo que se elija aquí, los estilos de Discogs (el subgénero) siempre se proponen para comentario, para revisión.",
   "autoApply": "aplicar automáticamente",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 (tu@ejemplo.com)",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "La variable de entorno {variable} establece esto y tiene prioridad sobre cualquier cosa guardada aquí. Cámbielo o elimínelo fuera de rbxport.",
+  "The identification settings could not be saved.": "No se pudieron guardar los ajustes de identificación.",
+  "The identification settings file is not UTF-8 text.": "El archivo de configuración de identificación no es texto UTF-8.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Esto proviene del archivo de desarrollo {file}, que no se puede cambiar aquí. Un valor guardado aquí tiene prioridad sobre él.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Cuando está activado, una coincidencia de huellas dactilares con una puntuación de al menos el mínimo siguiente que solo llena los campos vacíos se escribe en las etiquetas del archivo tan pronto como se identifica. Aparece debajo de {applied}; si la escritura falla, permanece en {needsReview}. Todo lo demás espera revisión. Desactivado de forma predeterminada.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} se aplicó automáticamente · {review} para revisar · {unidentified} no identificado · {failed} falló"
 }

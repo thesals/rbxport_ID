@@ -1611,5 +1611,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "여기에서 무엇을 선택하든 Discogs 스타일(하위 장르)은 항상 검토를 위해 댓글로 제안됩니다.",
   "autoApply": "자동 적용",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( you@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "환경 변수 {variable}이 이를 설정하고 여기에 저장된 모든 것보다 우선순위를 갖습니다. rbxport 외부에서 변경하거나 제거하십시오.",
+  "The identification settings could not be saved.": "식별 설정을 저장할 수 없습니다.",
+  "The identification settings file is not UTF-8 text.": "식별 설정 파일이 UTF-8 텍스트가 아닙니다.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "이는 개발 파일 {file}에서 가져온 것으로 여기에서는 변경할 수 없습니다. 여기에 저장된 값이 그 값보다 우선합니다.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "켜져 있으면 빈 필드만 채우는 최소값 이하의 지문 일치 점수가 식별되는 즉시 파일 태그에 기록됩니다. {applied} 아래에 나타납니다. 쓰기가 실패하면 {needsReview} 아래에 유지됩니다. 다른 모든 것은 검토를 기다립니다. 기본적으로 꺼져 있습니다.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified}이 자동으로 적용됨 · 검토를 위해 {review} · {unidentified} 미식별됨 · {failed} 실패"
 }

@@ -1612,5 +1612,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Burada seçilen ne olursa olsun, Discogs stilleri (alt tür) her zaman Yorum ve inceleme için önerilir.",
   "autoApply": "otomatikUygula",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( siz@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "{variable} ortam değişkeni bunu ayarlar ve burada kaydedilen her şeye göre önceliklidir. Onu rbxport dışında değiştirin veya kaldırın.",
+  "The identification settings could not be saved.": "Kimlik ayarları kaydedilemedi.",
+  "The identification settings file is not UTF-8 text.": "Kimlik ayarları dosyası UTF-8 metni değil.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Bu, burada değiştirilemeyen {file} geliştirme dosyasından gelir. Burada kaydedilen bir değer ona göre önceliklidir.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Açık olduğunda, yalnızca boş alanları dolduran en az aşağıdaki minimum puanı alan bir parmak izi eşleşmesi, tanımlandığı anda dosyanın etiketlerine yazılır. {applied} altında görünür; yazma başarısız olursa {needsReview} altında kalır. Geriye kalan her şey incelenmeyi bekliyor. Varsayılan olarak kapalıdır.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} otomatik olarak uygulandı · {review} incelenecek · {unidentified} tanımlanamadı · {failed} başarısız oldu"
 }

@@ -1605,5 +1605,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Uanset hvad der vælges her, foreslås Discogs-stilene (undergenren) altid til kommentar til gennemgang.",
   "autoApply": "autoAnvend",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( you@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "Miljøvariablen {variable} indstiller dette og prioriterer alt, hvad der er gemt her. Skift eller fjern det uden for rbxport.",
+  "The identification settings could not be saved.": "Identifikationsindstillingerne kunne ikke gemmes.",
+  "The identification settings file is not UTF-8 text.": "Identifikationsindstillingsfilen er ikke UTF-8-tekst.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Dette kommer fra udviklingsfilen {file}, som ikke kan ændres her. En værdi gemt her har prioritet over den.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Når den er aktiveret, skrives et fingeraftryksmatch, der scorer på mindst det minimum nedenfor, som kun udfylder tomme felter, til filens tags, så snart det er identificeret. Det vises under {applied}; hvis skrivningen mislykkes, forbliver den under {needsReview}. Alt andet venter på anmeldelse. Fra som standard.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} anvendte automatisk · {review} til anmeldelse · {unidentified} uidentificeret · {failed} mislykkedes"
 }

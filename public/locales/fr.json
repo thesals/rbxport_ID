@@ -1612,5 +1612,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Quel que soit le choix choisi ici, les styles Discogs (le sous-genre) sont toujours proposés en commentaire, pour révision.",
   "autoApply": "Application automatique",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( vous@exemple.com )",
-  "rekordbox: {value}": "rekordbox : {value}"
+  "rekordbox: {value}": "rekordbox : {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "La variable d'environnement {variable} définit cela et a la priorité sur tout ce qui est enregistré ici. Modifiez-le ou supprimez-le en dehors de rbxport.",
+  "The identification settings could not be saved.": "Les paramètres d'identification n'ont pas pu être enregistrés.",
+  "The identification settings file is not UTF-8 text.": "Le fichier de paramètres d'identification n'est pas du texte UTF-8.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Cela vient du fichier de développement {file}, qui ne peut pas être modifié ici. Une valeur enregistrée ici est prioritaire sur elle.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Lorsque cette option est activée, une correspondance d'empreinte digitale avec un score au moins inférieur au minimum qui ne remplit que les champs vides est écrite dans les balises du fichier dès qu'elle est identifiée. Il apparaît sous {applied} ; si l'écriture échoue, elle reste sous {needsReview}. Tout le reste attend d'être examiné. Désactivé par défaut.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} appliqué automatiquement · {review} pour réviser · {unidentified} non identifié · {failed} a échoué"
 }

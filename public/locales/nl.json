@@ -1609,5 +1609,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Wat hier ook wordt gekozen, de Discogs-stijlen (het subgenre) worden altijd voorgesteld voor commentaar, ter beoordeling.",
   "autoApply": "automatisch toepassen",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( jij@voorbeeld.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "De omgevingsvariabele {variable} stelt dit in en heeft voorrang op alles wat hier wordt opgeslagen. Wijzig of verwijder het buiten rbxport.",
+  "The identification settings could not be saved.": "De identificatie-instellingen konden niet worden opgeslagen.",
+  "The identification settings file is not UTF-8 text.": "Het identificatie-instellingenbestand is geen UTF-8-tekst.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Dit komt uit het ontwikkelingsbestand {file}, dat hier niet kan worden gewijzigd. Een hier opgeslagen waarde heeft voorrang.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Wanneer deze optie is ingeschakeld, wordt een vingerafdrukmatch die ten minste het minimum scoort dat alleen lege velden vult, naar de tags van het bestand geschreven zodra deze wordt geïdentificeerd. Het verschijnt onder {applied}; als het schrijven mislukt, blijft het onder {needsReview}. Al het andere wacht op beoordeling. Standaard uitgeschakeld.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automatisch toegepast · {review} om te beoordelen · {unidentified} ongeïdentificeerd · {failed} mislukt"
 }

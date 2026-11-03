@@ -1607,5 +1607,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Oavsett vad som väljs här, föreslås alltid Discogs-stilarna (undergenren) för kommentar, för granskning.",
   "autoApply": "autoApply",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( du@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "Miljövariabeln {variable} ställer in detta och har prioritet över allt som sparas här. Ändra eller ta bort det utanför rbxport.",
+  "The identification settings could not be saved.": "Det gick inte att spara identifieringsinställningarna.",
+  "The identification settings file is not UTF-8 text.": "Filen för identifieringsinställningar är inte UTF-8-text.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Detta kommer från utvecklingsfilen {file}, som inte kan ändras här. Ett värde som sparas här har prioritet framför det.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "När den är aktiverad skrivs en fingeravtrycksmatchning med minst det minimum som bara fyller tomma fält till filens taggar så snart den identifieras. Det visas under {applied}; om skrivningen misslyckas stannar den under {needsReview}. Allt annat väntar på granskning. Av som standard.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} ansökte automatiskt · {review} för att granska · {unidentified} oidentifierad · {failed} misslyckades"
 }

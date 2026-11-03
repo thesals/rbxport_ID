@@ -1615,5 +1615,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Qualquer que seja a escolha aqui, os estilos do Discogs (o subgênero) são sempre propostos para Comentário, para revisão.",
   "autoApply": "aplicar automaticamente",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 (você@exemplo.com)",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "A variável de ambiente {variable} define isso e tem prioridade sobre qualquer coisa salva aqui. Altere ou remova-o fora do rbxport.",
+  "The identification settings could not be saved.": "As configurações de identificação não puderam ser salvas.",
+  "The identification settings file is not UTF-8 text.": "O arquivo de configurações de identificação não é texto UTF-8.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Isso vem do arquivo de desenvolvimento {file}, que não pode ser alterado aqui. Um valor salvo aqui tem prioridade sobre ele.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Quando ativado, uma correspondência de impressão digital com pontuação mínima abaixo, que preenche apenas os campos vazios, é gravada nas tags do arquivo assim que ele é identificado. Aparece em {applied}; se a gravação falhar, ela permanecerá em {needsReview}. Todo o resto aguarda revisão. Desativado por padrão.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} aplicado automaticamente · {review} para revisar · {unidentified} não identificado · {failed} falhou"
 }

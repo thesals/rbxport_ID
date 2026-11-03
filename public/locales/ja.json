@@ -1618,5 +1618,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "ここで何を選択しても、Discogs スタイル (サブジャンル) がレビューのために常にコメントに提案されます。",
   "autoApply": "自動適用",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( you@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "環境変数 {variable} によってこれが設定され、ここに保存されたものよりも優先されます。 rbxport の外部で変更または削除します。",
+  "The identification settings could not be saved.": "識別設定を保存できませんでした。",
+  "The identification settings file is not UTF-8 text.": "識別設定ファイルはUTF-8テキストではありません。",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "これは開発ファイル {file} から取得されており、ここでは変更できません。ここで保存した値が優先されます。",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "オンにすると、空のフィールドのみを埋める、少なくとも最小値を下回るフィンガープリント一致スコアが、識別されるとすぐにファイルのタグに書き込まれます。これは {applied} の下に表示されます。書き込みが失敗すると、{needsReview} の下に残ります。それ以外はすべてレビューを待っています。デフォルトではオフです。",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} が自動的に適用されました · {review} がレビューします · {unidentified} 未確認 · {failed} が失敗しました"
 }

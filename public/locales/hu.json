@@ -1611,5 +1611,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Bármit is választunk itt, a Discogs stílusokat (az alműfajt) mindig javasoljuk megjegyzésre, áttekintésre.",
   "autoApply": "autoApply",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( you@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "A {variable} környezeti változó beállítja ezt, és elsőbbséget élvez az itt elmentett dolgokkal szemben. Módosítsa vagy távolítsa el az rbxporton kívül.",
+  "The identification settings could not be saved.": "Az azonosítási beállításokat nem sikerült elmenteni.",
+  "The identification settings file is not UTF-8 text.": "Az azonosító beállítási fájl nem UTF-8 szöveg.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Ez a {file} fejlesztői fájlból származik, amely itt nem módosítható. Az itt elmentett érték elsőbbséget élvez vele szemben.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Ha be van kapcsolva, az azonosítás után azonnal a fájl címkéibe íródik egy ujjlenyomat-egyezés, amely legalább az alatta lévő minimumpontszámmal csak az üres mezőket tölti ki. Az {applied} alatt jelenik meg; ha az írás sikertelen, akkor a {needsReview} alatt marad. Minden más felülvizsgálatra vár. Alapértelmezés szerint ki.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} automatikusan alkalmazva · {review} az áttekintéshez · {unidentified} azonosítatlan · {failed} sikertelen"
 }

@@ -1616,5 +1616,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Что бы здесь ни было выбрано, стили Discogs (поджанр) всегда предлагаются для комментариев и рассмотрения.",
   "autoApply": "автоприменить",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 (you@example.com)",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "Переменная среды {variable} устанавливает это и имеет приоритет над всем, что здесь сохранено. Измените или удалите его за пределами rbxport.",
+  "The identification settings could not be saved.": "Настройки идентификации не удалось сохранить.",
+  "The identification settings file is not UTF-8 text.": "Файл настроек идентификации не является текстом UTF-8.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Это происходит из файла разработки {file}, который здесь нельзя изменить. Значение, сохраненное здесь, имеет приоритет над ним.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Если эта функция включена, в теги файла записывается совпадение отпечатков пальцев с оценкой не ниже минимального значения, которое заполняет только пустые поля, как только он идентифицирован. Он отображается в разделе {applied}; если запись не удалась, она остается под {needsReview}. Все остальное ждет рассмотрения. По умолчанию выключено.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} применен автоматически · {review} для проверки · {unidentified} unidentified · {failed} не удалось"
 }

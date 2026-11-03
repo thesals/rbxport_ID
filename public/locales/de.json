@@ -1608,5 +1608,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Was auch immer hier ausgewählt wird, die Discogs-Stile (das Subgenre) werden immer zum Kommentieren und zur Überprüfung vorgeschlagen.",
   "autoApply": "automatisch anwenden",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( you@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "Die Umgebungsvariable {variable} legt dies fest und hat Vorrang vor allem, was hier gespeichert wird. Ändern oder entfernen Sie es außerhalb von rbxport.",
+  "The identification settings could not be saved.": "Die Identifikationseinstellungen konnten nicht gespeichert werden.",
+  "The identification settings file is not UTF-8 text.": "Die Identifikationseinstellungsdatei besteht nicht aus UTF-8-Text.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Dies stammt aus der Entwicklungsdatei {file}, die hier nicht geändert werden kann. Ein hier gespeicherter Wert hat Vorrang vor diesem.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Wenn diese Option aktiviert ist, wird eine Fingerabdruck-Übereinstimmung, die mindestens dem unten stehenden Minimum entspricht und nur leere Felder ausfüllt, in die Tags der Datei geschrieben, sobald sie identifiziert wird. Es erscheint unter {applied}; Wenn der Schreibvorgang fehlschlägt, bleibt er unter {needsReview}. Alles andere wartet auf eine Überprüfung. Standardmäßig deaktiviert.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} hat sich automatisch beworben · {review} zur Überprüfung · {unidentified} nicht identifiziert · {failed} fehlgeschlagen"
 }

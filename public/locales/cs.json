@@ -1611,5 +1611,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Ať už je zde vybráno cokoliv, styly Discogs (podžánr) jsou vždy navrženy pro komentář ke kontrole.",
   "autoApply": "autoApply",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( vy@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "Proměnná prostředí {variable} to nastavuje a má přednost před čímkoli zde uloženým. Změňte nebo odeberte jej mimo rbxport.",
+  "The identification settings could not be saved.": "Nastavení identifikace nebylo možné uložit.",
+  "The identification settings file is not UTF-8 text.": "Soubor nastavení identifikace není text UTF-8.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Toto pochází z vývojového souboru {file}, který zde nelze změnit. Zde uložená hodnota má přednost před ní.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Je-li tato funkce zapnutá, je do značek souboru zapsána shoda otisku prstu s alespoň níže uvedeným minimem, která vyplňuje pouze prázdná pole, jakmile je identifikována. Objeví se pod {applied}; pokud se zápis nezdaří, zůstane pod {needsReview}. Vše ostatní čeká na recenzi. Ve výchozím nastavení vypnuto.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} použito automaticky · {review} ke kontrole · {unidentified} neidentifikováno · {failed} se nezdařilo"
 }

@@ -1616,5 +1616,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "無論此處選擇什麼，Discogs 風格（子流派）始終會建議進行評論和審查。",
   "autoApply": "自動應用",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( you@example.com )",
-  "rekordbox: {value}": "rekordbox：{value}"
+  "rekordbox: {value}": "rekordbox：{value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "環境變數 {variable} 設定它並優先於此處保存的任何內容。在 rbxport 之外更改或刪除它。",
+  "The identification settings could not be saved.": "無法儲存識別設定。",
+  "The identification settings file is not UTF-8 text.": "標識設定檔不是 UTF-8 文字。",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "這個來自開發檔案{file}，這裡不能更改。此處保存的值優先於它。",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "啟用後，指紋匹配分數至少低於僅填充空白欄位的最小值，一旦被識別，就會將其寫入檔案的標籤。它出現在{applied}下；如果寫入失敗，它將保留在 {needsReview} 下。其他一切等待審核。預設關閉。",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} 自動套用 · {review} 待審核 · {unidentified} 未辨識 · {failed} 失敗"
 }

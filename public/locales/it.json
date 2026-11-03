@@ -1612,5 +1612,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Qualunque sia la scelta qui, gli stili di Discogs (il sottogenere) sono sempre proposti per il commento, per la revisione.",
   "autoApply": "applicazione automatica",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 (tu@esempio.com)",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "La variabile d'ambiente {variable} imposta questo e ha la priorità su qualsiasi cosa salvata qui. Modificalo o rimuovilo all'esterno di rbxport.",
+  "The identification settings could not be saved.": "Non è stato possibile salvare le impostazioni di identificazione.",
+  "The identification settings file is not UTF-8 text.": "Il file delle impostazioni di identificazione non è testo UTF-8.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Questo proviene dal file di sviluppo {file}, che non può essere modificato qui. Un valore salvato qui ha la priorità su di esso.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Quando questa opzione è attivata, una corrispondenza dell'impronta digitale con un punteggio pari almeno al minimo inferiore che riempie solo i campi vuoti viene scritta nei tag del file non appena viene identificato. Appare sotto {applied}; se la scrittura fallisce, rimane in {needsReview}. Tutto il resto attende la revisione. Disattivato per impostazione predefinita.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "{identified} applicato automaticamente · {review} per rivedere · {unidentified} non identificato · {failed} non riuscito"
 }

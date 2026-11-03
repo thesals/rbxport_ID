@@ -1613,5 +1613,11 @@
   "Whatever is chosen here, the Discogs styles (the sub-genre) are always proposed for Comment, for review.": "Ό,τι κι αν επιλεγεί εδώ, τα στυλ Discogs (το υπο-είδος) προτείνονται πάντα για Σχόλιο, για αναθεώρηση.",
   "autoApply": "αυτόματη εφαρμογή",
   "rbxport/1.2 ( you@example.com )": "rbxport/1.2 ( you@example.com )",
-  "rekordbox: {value}": "rekordbox: {value}"
+  "rekordbox: {value}": "rekordbox: {value}",
+  "The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.": "Η μεταβλητή περιβάλλοντος {variable} το ορίζει και έχει προτεραιότητα έναντι οτιδήποτε έχει αποθηκευτεί εδώ. Αλλάξτε ή αφαιρέστε το εκτός rbxport.",
+  "The identification settings could not be saved.": "Δεν ήταν δυνατή η αποθήκευση των ρυθμίσεων αναγνώρισης.",
+  "The identification settings file is not UTF-8 text.": "Το αρχείο ρυθμίσεων αναγνώρισης δεν είναι κείμενο UTF-8.",
+  "This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.": "Αυτό προέρχεται από το αρχείο ανάπτυξης {file}, το οποίο δεν μπορεί να αλλάξει εδώ. Μια τιμή που αποθηκεύεται εδώ έχει προτεραιότητα από αυτήν.",
+  "When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.": "Όταν είναι ενεργοποιημένη, μια αντιστοίχιση δακτυλικών αποτυπωμάτων που σκοράρει τουλάχιστον την ελάχιστη κάτω από την οποία γεμίζει μόνο κενά πεδία, εγγράφεται στις ετικέτες του αρχείου μόλις εντοπιστεί. Εμφανίζεται στο {applied}. Εάν η εγγραφή αποτύχει, παραμένει στο {needsReview}. Όλα τα άλλα περιμένουν αναθεώρηση. Απενεργοποίηση από προεπιλογή.",
+  "{identified} applied automatically · {review} to review · {unidentified} unidentified · {failed} failed": "Το {identified} εφαρμόστηκε αυτόματα · {review} για έλεγχο · {unidentified} unidentified · {failed} απέτυχε"
 }
