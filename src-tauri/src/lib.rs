@@ -689,14 +689,16 @@ pub fn run() {
                 // (Windows) is installed now, silently.
                 if matches!(event, tauri::RunEvent::Exit) {
                     crate::screen_cache::save(handle);
-                    crate::update::on_exit(handle);
                     // Identify writes waiting for a file another program
                     // held open, and open writes whose file was locked at
                     // start: tried once more, for at most a few seconds.
-                    // What is left is tried at the next start.
+                    // What is left is tried at the next start. Before the
+                    // updater, which may end the process or start an
+                    // installer that replaces the executable.
                     if let Some(identify) = handle.try_state::<Arc<crate::identify::IdentifyState>>() {
                         identify.settle_on_exit(crate::identify::EXIT_BUDGET);
                     }
+                    crate::update::on_exit(handle);
                 }
             });
         }
