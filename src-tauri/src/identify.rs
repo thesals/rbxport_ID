@@ -2703,6 +2703,10 @@ mod tests {
         }
         let edit = [FieldEditDto { field: "title".into(), proposed: "Other".into() }];
         assert_eq!(identify.edit(result, &edit).unwrap_err().kind, ErrorKind::ReadOnly);
+        // Nor can it be applied again: only its retry makes it.
+        let again = identify.apply_items(&ticked(result, &["title"])).remove(0);
+        assert!(!again.ok && !again.deferred, "{again:?}");
+        assert!(again.error.unwrap_or_default().contains("already waiting"));
 
         let item = identify.cancel_waiting(result).unwrap();
         assert_eq!((item.state.as_str(), item.waiting), ("pending", None));

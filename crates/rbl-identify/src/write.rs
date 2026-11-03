@@ -1142,8 +1142,14 @@ pub struct Applied {
 /// ([`Store::defer_write`]: the result `Accepted`, these `fields`) and the
 /// call answers [`IdentifyError::Deferred`]. [`retry_waiting`] makes it once
 /// the file is free, through this same path and its checks. A write that
-/// lands ends the result's waiting write.
+/// lands ends the result's waiting write. A result that already has a
+/// waiting write is refused here: only its retry may make it.
 pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result<Applied> {
+    if store.waiting_write(result)?.is_some() {
+        return Err(refuse(
+            "This result is already waiting to be written once the file is closed. Retry it, or cancel the waiting write.",
+        ));
+    }
     apply(store, result, fields, false, Deadline::NONE)
 }
 
@@ -1466,6 +1472,24 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with(TEMP_PREFIX))
             .collect()
+    }
+
+    #[test]
+    fn a_waiting_result_is_refused_by_a_plain_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("a.wav");
+        wav(&audio, 1);
+        let store = Store::open_in_memory().unwrap();
+        let result = reviewed(&store, &audio);
+        store.defer_write(result, &[Field::Title], OPEN_ELSEWHERE).unwrap();
+        let original = std::fs::read(&audio).unwrap();
+        let error = apply_result(&store, result, &[Field::CatalogNumber]).unwrap_err().to_string();
+        assert!(error.contains("already waiting"), "{error}");
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        // Its retry is the one way to make it.
+        let waiting = store.waiting_write(result).unwrap().unwrap();
+        assert!(matches!(retry_waiting(&store, &waiting, Deadline::NONE).unwrap(), Retried::Written(_)));
+        assert_eq!(current(&tags::read(&audio).unwrap().snapshot, Field::CatalogNumber), "", "only the waiting fields");
     }
 
     /// A pass that read the list before the user cancelled (and accepted
