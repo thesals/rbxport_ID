@@ -771,16 +771,33 @@ fn rekordbox_record(
 /// in-memory library does not hold), read through the app's read-only
 /// connection. Tracks without one are left out.
 fn read_isrcs(db: &rbl_db::Library, ids: &[String]) -> Result<std::collections::HashMap<String, String>, rbl_db::DbError> {
-    let mut stmt = db.connection().prepare("SELECT ISRC FROM djmdContent WHERE ID = ?1")?;
+    // One query per chunk of ids, not per id: the reader is shared, and a
+    // whole-library job must not hold it for one query per track. A short
+    // last chunk is padded with "", which no track id is.
+    let marks = vec!["?"; ISRC_CHUNK].join(", ");
+    let mut stmt = db
+        .connection()
+        .prepare(&format!("SELECT ID, ISRC FROM djmdContent WHERE ID IN ({marks}) AND ISRC IS NOT NULL AND ISRC != ''"))?;
     let mut isrcs = std::collections::HashMap::new();
-    for id in ids {
-        let mut rows = stmt.query_map([id.as_str()], |r| r.get::<_, Option<String>>(0))?;
-        if let Some(isrc) = rows.next().transpose()?.flatten().filter(|i| !i.trim().is_empty()) {
-            isrcs.insert(id.clone(), isrc.trim().to_owned());
+    for chunk in ids.chunks(ISRC_CHUNK) {
+        let mut params = [""; ISRC_CHUNK];
+        for (slot, id) in params.iter_mut().zip(chunk) {
+            *slot = id.as_str();
+        }
+        let rows = stmt.query_map(params, |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, isrc) = row?;
+            if !isrc.trim().is_empty() {
+                isrcs.insert(id, isrc.trim().to_owned());
+            }
         }
     }
     Ok(isrcs)
 }
+
+/// Track ids per ISRC query: the largest fixed-size array rusqlite binds
+/// as parameters (32), so ~1,600 queries for 50,000 tracks instead of 50,000.
+const ISRC_CHUNK: usize = 32;
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -815,10 +832,18 @@ pub async fn identify_start<R: tauri::Runtime>(
         identify.with_store(|_| Ok(()))?;
         // Read-only: the imported records lack an ISRC rather than the
         // job failing when the library cannot be read.
-        let isrcs = state.read_db(|db| read_isrcs(db, &track_ids)).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "identify: the library's ISRCs could not be read");
-            std::collections::HashMap::new()
-        });
+        // The shared reader is taken per batch, so other readers get a turn
+        // during a whole-library job.
+        let mut isrcs = std::collections::HashMap::new();
+        for batch in track_ids.chunks(ISRC_CHUNK * 16) {
+            match state.read_db(|db| read_isrcs(db, batch)) {
+                Ok(found) => isrcs.extend(found),
+                Err(e) => {
+                    tracing::warn!(error = %e, "identify: the library's ISRCs could not be read");
+                    break;
+                }
+            }
+        }
         let tracks = resolve_tracks(&library, track_ids, &isrcs, now_unix());
         spawn_job(app, &identify, engine, tracks)
     })
@@ -2227,6 +2252,33 @@ mod tests {
             let applied = identify.apply_items(&ticked(result, &["title"])).remove(0);
             assert!(applied.ok, "share {share:#x}: {applied:?}");
         }
+    }
+
+    #[test]
+    fn isrcs_are_read_in_chunks_for_every_id_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        // A copy of the disposable fixture, given ISRCs through a writable
+        // connection of its own; the app reads it read-only.
+        {
+            let mut db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadWrite).unwrap();
+            let conn = db.connection_mut();
+            for n in 1..=3 {
+                let isrc = if n == 2 { " ".to_owned() } else { format!("GBAAA140000{n}") };
+                conn.execute("UPDATE djmdContent SET ISRC = ?1 WHERE ID = ?2", [isrc, rbl_db::fixture::track_id(n)]).unwrap();
+            }
+        }
+        let db = rbl_db::Library::open(location, rbl_db::OpenMode::ReadOnly).unwrap();
+        // More ids than one chunk, the known ones at both ends.
+        let mut ids: Vec<String> = (0..ISRC_CHUNK + 7).map(|n| format!("no-such-{n}")).collect();
+        ids.insert(0, rbl_db::fixture::track_id(1));
+        ids.push(rbl_db::fixture::track_id(2));
+        ids.push(rbl_db::fixture::track_id(3));
+        let isrcs = read_isrcs(&db, &ids).unwrap();
+        assert_eq!(isrcs.len(), 2, "{isrcs:?}");
+        assert_eq!(isrcs.get(&rbl_db::fixture::track_id(1)).map(String::as_str), Some("GBAAA1400001"));
+        assert_eq!(isrcs.get(&rbl_db::fixture::track_id(3)).map(String::as_str), Some("GBAAA1400003"));
+        assert!(read_isrcs(&db, &[]).unwrap().is_empty());
     }
 
     #[test]
