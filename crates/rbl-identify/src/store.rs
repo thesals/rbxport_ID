@@ -27,6 +27,14 @@
 //! written, and a permanent record of each undo. A version 1 store is
 //! migrated in place on open; its results simply have no library track.
 //!
+//! Version 3 adds a read-only import of the rekordbox library record each
+//! result was identified for ([`RekordboxRecord`]: title, artist, album,
+//! label, genre, year, comment and ISRC as the library held them), saved
+//! with the result. Identification never writes to the library; this copy
+//! is how its data reaches the identify store. The library-values columns
+//! of version 2 (`library_snapshot`, `library_after`) are kept for writes
+//! an older build recorded, but nothing writes them any more.
+//!
 //! Snapshots are taken only for writes, not for every track scanned: the raw
 //! ID3 block includes embedded artwork, and a whole library of those would
 //! run to gigabytes. They are stored as JSON for the parsed values and as
@@ -44,14 +52,14 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{IdentifyError, Result};
 use crate::model::{
-    ArtworkRef, Decision, Enrichment, ExistingTags, Field, FieldChange, FrameValues, Proposal, RawId3, Scored,
+    ArtworkRef, CandidateSource, Decision, Enrichment, ExistingTags, Field, FieldChange, FrameValues, Proposal, RawId3, Scored,
     TagSnapshot,
 };
 use crate::pipeline::TrackResult;
 
 /// The schema this build creates and understands, kept in
 /// `PRAGMA user_version`. A newer file is refused rather than guessed at.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// `PRAGMA application_id` of an identify store ("RBID"), so a SQLite file
 /// that belongs to something else is recognised and refused.
@@ -214,6 +222,35 @@ WHEN EXISTS (SELECT 1 FROM application_undos WHERE application_id = NEW.applicat
 BEGIN SELECT RAISE(ABORT, 'an undo is a permanent record'); END;
 ";
 
+/// Version 3, on top of version 2: the rekordbox record imported with each
+/// result. Insert-only, like every record of a write.
+const SCHEMA_V3: &str = r"
+-- The rekordbox library record a result was identified for, as the library
+-- held it when the job ran: read from the library, never written back. One
+-- row per result (none for a result without a library track, or saved
+-- before version 3), never updated or deleted. Absent values are ''.
+CREATE TABLE rekordbox_imports (
+    result_id     INTEGER PRIMARY KEY REFERENCES results(id),
+    track_id      TEXT    NOT NULL,
+    title         TEXT    NOT NULL,
+    artist        TEXT    NOT NULL,
+    album         TEXT    NOT NULL,
+    label         TEXT    NOT NULL,
+    genre         TEXT    NOT NULL,
+    year          TEXT    NOT NULL,
+    comment       TEXT    NOT NULL,
+    isrc          TEXT    NOT NULL,
+    imported_unix INTEGER NOT NULL
+);
+CREATE TRIGGER rekordbox_imports_never_update BEFORE UPDATE ON rekordbox_imports
+BEGIN SELECT RAISE(ABORT, 'an imported rekordbox record is a permanent record'); END;
+CREATE TRIGGER rekordbox_imports_never_delete BEFORE DELETE ON rekordbox_imports
+BEGIN SELECT RAISE(ABORT, 'an imported rekordbox record is a permanent record'); END;
+CREATE TRIGGER rekordbox_imports_never_replace BEFORE INSERT ON rekordbox_imports
+WHEN EXISTS (SELECT 1 FROM rekordbox_imports WHERE result_id = NEW.result_id)
+BEGIN SELECT RAISE(ABORT, 'an imported rekordbox record is a permanent record'); END;
+";
+
 /// A track's row id in the store.
 pub type TrackId = i64;
 /// An identification result's row id in the store.
@@ -260,6 +297,26 @@ impl TrackKey {
 pub struct LibraryTrack {
     pub track_id: String,
     pub path: String,
+}
+
+/// A rekordbox library record as it was when a track was identified:
+/// imported READ-ONLY from the library into the identify store, never
+/// written back. Absent values are empty strings.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RekordboxRecord {
+    /// `djmdContent.ID`.
+    pub track_id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub label: String,
+    pub genre: String,
+    /// The release year as text (`"2014"`); empty when unknown.
+    pub year: String,
+    pub comment: String,
+    pub isrc: String,
+    /// When it was read from the library, seconds since the Unix epoch.
+    pub imported_unix: i64,
 }
 
 /// Where a result stands in the review flow. Stored as its variant name.
@@ -418,6 +475,9 @@ pub struct QueueItem {
     /// The library track it was identified for; `None` for a version 1
     /// result.
     pub library: Option<LibraryTrack>,
+    /// Where the proposed (best) candidate came from; `None` without a
+    /// proposal.
+    pub source: Option<CandidateSource>,
 }
 
 /// A result in full: its queue row, all its candidates (best first), the
@@ -554,7 +614,8 @@ impl RawApplication {
 }
 
 const QUEUE_COLUMNS: &str = "t.id, r.id, t.path, r.state, r.decision, r.score, t.existing_json, r.proposal_json, r.updated_unix, \
-     r.library_track_id, r.library_path";
+     r.library_track_id, r.library_path, \
+     CASE WHEN r.proposal_json IS NOT NULL THEN json_extract(r.candidates_json, '$[0].candidate.source') END";
 
 fn queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawQueueItem> {
     Ok(RawQueueItem {
@@ -569,6 +630,7 @@ fn queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawQueueItem> {
         updated_unix: row.get(8)?,
         library_track_id: row.get(9)?,
         library_path: row.get(10)?,
+        source: row.get(11)?,
     })
 }
 
@@ -585,6 +647,7 @@ struct RawQueueItem {
     updated_unix: i64,
     library_track_id: Option<String>,
     library_path: Option<String>,
+    source: Option<String>,
 }
 
 impl RawQueueItem {
@@ -602,6 +665,11 @@ impl RawQueueItem {
             library: self
                 .library_track_id
                 .map(|track_id| LibraryTrack { track_id, path: self.library_path.unwrap_or_default() }),
+            source: self
+                .source
+                .map(|s| serde_json::from_value(serde_json::Value::String(s)))
+                .transpose()
+                .map_err(|_| IdentifyError::Store("unknown candidate source in the store".to_owned()))?,
         })
     }
 }
@@ -688,6 +756,9 @@ impl Store {
         }
         if from <= 1 {
             tx.execute_batch(SCHEMA_V2).map_err(|e| sql("migrate the schema to version 2", &e))?;
+        }
+        if from <= 2 {
+            tx.execute_batch(SCHEMA_V3).map_err(|e| sql("migrate the schema to version 3", &e))?;
         }
         tx.pragma_update(None, "application_id", APPLICATION_ID).map_err(|e| sql("set the application id", &e))?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(|e| sql("set the schema version", &e))?;
@@ -890,6 +961,20 @@ impl Store {
         library: Option<&LibraryTrack>,
         allow_replacing_applied: bool,
     ) -> Result<(TrackId, ResultId)> {
+        self.save_track_result_with(key, result, library, None, allow_replacing_applied)
+    }
+
+    /// [`Store::save_track_result`], also importing the track's rekordbox
+    /// record (read from the library by the caller) in the same transaction,
+    /// so a result and its import are stored together or not at all.
+    pub fn save_track_result_with(
+        &self,
+        key: &TrackKey,
+        result: &TrackResult,
+        library: Option<&LibraryTrack>,
+        rekordbox: Option<&RekordboxRecord>,
+        allow_replacing_applied: bool,
+    ) -> Result<(TrackId, ResultId)> {
         let wanted = result.proposal.as_ref().and_then(|p| p.artwork.as_ref()).map(|a| a.sha256.as_str());
         let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
         match (&result.artwork, wanted) {
@@ -918,6 +1003,9 @@ impl Store {
             },
             allow_replacing_applied,
         )?;
+        if let Some(record) = rekordbox {
+            insert_rekordbox_record(&tx, saved, record)?;
+        }
         tx.commit().map_err(|e| sql("commit the track result", &e))?;
         Ok((track, saved))
     }
@@ -1231,7 +1319,7 @@ impl Store {
         let row = self
             .conn
             .query_row(&query, [id], |r| {
-                Ok((queue_item(r)?, r.get::<_, String>(11)?, r.get::<_, Option<String>>(12)?, r.get::<_, String>(13)?))
+                Ok((queue_item(r)?, r.get::<_, String>(12)?, r.get::<_, Option<String>>(13)?, r.get::<_, String>(14)?))
             })
             .optional()
             .map_err(|e| sql("read the result", &e))?;
@@ -1338,6 +1426,33 @@ impl Store {
         }
         tx.commit().map_err(|e| sql("commit the accepts", &e))?;
         Ok(ids)
+    }
+
+    /// The rekordbox record imported with a result; `None` for a result
+    /// without one (no library track, or saved before version 3).
+    pub fn rekordbox_record(&self, result: ResultId) -> Result<Option<RekordboxRecord>> {
+        self.conn
+            .query_row(
+                "SELECT track_id, title, artist, album, label, genre, year, comment, isrc, imported_unix
+                 FROM rekordbox_imports WHERE result_id = ?1",
+                [result],
+                |r| {
+                    Ok(RekordboxRecord {
+                        track_id: r.get(0)?,
+                        title: r.get(1)?,
+                        artist: r.get(2)?,
+                        album: r.get(3)?,
+                        label: r.get(4)?,
+                        genre: r.get(5)?,
+                        year: r.get(6)?,
+                        comment: r.get(7)?,
+                        isrc: r.get(8)?,
+                        imported_unix: r.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| sql("read the imported rekordbox record", &e))
     }
 
     /// Stores an image once per content and returns its lowercase hex
@@ -1447,6 +1562,18 @@ fn save_result(conn: &Connection, id: TrackId, new: &NewResult<'_>, allow_replac
         |r| r.get(0),
     )
     .map_err(|e| sql("store the result", &e))
+}
+
+/// Inserts the rekordbox record imported with `result`.
+fn insert_rekordbox_record(conn: &Connection, result: ResultId, r: &RekordboxRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO rekordbox_imports (result_id, track_id, title, artist, album, label, genre, year, comment, isrc,
+                                        imported_unix)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![result, r.track_id, r.title, r.artist, r.album, r.label, r.genre, r.year, r.comment, r.isrc, r.imported_unix],
+    )
+    .map_err(|e| sql("import the rekordbox record", &e))?;
+    Ok(())
 }
 
 /// [`Store::put_artwork`] on a connection or transaction.
@@ -2163,8 +2290,10 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(store.has_table("application_undos").unwrap());
+        assert!(store.has_table("rekordbox_imports").unwrap());
+        assert_eq!(store.rekordbox_record(1).unwrap(), None, "nothing was imported before version 3");
         let item = &store.list(Filter::All, 0, 10).unwrap()[0];
         assert_eq!((item.path.as_str(), item.state, item.library.as_ref()), ("old.mp3", ReviewState::Applied, None));
         let app = store.last_application(item.result).unwrap().unwrap();
@@ -2179,7 +2308,57 @@ mod tests {
         assert!(store.conn.execute("UPDATE application_undos SET undone_unix = 0", []).is_err());
         drop(store);
         // Opening again is a no-op.
-        assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 2);
+        assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_2_store_gains_the_rekordbox_imports_and_keeps_its_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identify.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert!(store.has_table("rekordbox_imports").unwrap());
+        let (_, old) = store.save_track_result(&key("a.mp3"), &track_result(None, None), None, false).unwrap();
+        assert_eq!(store.rekordbox_record(old).unwrap(), None);
+    }
+
+    #[test]
+    fn a_rekordbox_record_is_imported_with_its_result_and_never_changed() {
+        let store = Store::open_in_memory().unwrap();
+        let record = RekordboxRecord {
+            track_id: "123456".into(),
+            title: "Heart (Original Mix)".into(),
+            artist: "Someone".into(),
+            album: String::new(),
+            label: "Label".into(),
+            genre: "House".into(),
+            year: "2014".into(),
+            comment: "a note".into(),
+            isrc: "GBAAA1400001".into(),
+            imported_unix: 1_800_000_000,
+        };
+        let library = LibraryTrack { track_id: "123456".into(), path: "D:/Music/a.mp3".into() };
+        let (_, saved) = store
+            .save_track_result_with(&key("a.mp3"), &track_result(None, None), Some(&library), Some(&record), false)
+            .unwrap();
+        assert_eq!(store.rekordbox_record(saved).unwrap(), Some(record.clone()));
+        for statement in ["UPDATE rekordbox_imports SET title = 'x'", "DELETE FROM rekordbox_imports"] {
+            assert!(store.conn.execute(statement, []).is_err(), "{statement}");
+        }
+        assert!(insert_rekordbox_record(&store.conn, saved, &record).is_err(), "one per result");
+        // A refused save imports nothing either.
+        apply(&store, saved);
+        let again = store.save_track_result_with(&key("a.mp3"), &track_result(None, None), None, Some(&record), false);
+        assert!(again.is_err());
+        let count: i64 = store.conn.query_row("SELECT COUNT(*) FROM rekordbox_imports", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

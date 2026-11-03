@@ -36,7 +36,9 @@ use rbl_identify::model::{Decision, Field, FieldChange, Proposal, Scored};
 use rbl_identify::musicbrainz::MusicBrainzClient;
 use rbl_identify::pipeline::{self, Services, Settings, TrackResult};
 use rbl_identify::ratelimit::Limiters;
-use rbl_identify::store::{Filter, LibraryTrack, QueueItem, Reconciliation, ResultId, ReviewState, Store, TrackKey};
+use rbl_identify::store::{
+    Filter, LibraryTrack, QueueItem, Reconciliation, RekordboxRecord, ResultId, ReviewState, Store, TrackKey,
+};
 use rbl_identify::transport::{HttpTransport, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -310,7 +312,9 @@ impl IdentifyState {
             let (item, candidates, enrichment, warnings) =
                 store.result(result).map_err(store_error)?.ok_or_else(no_such_result)?;
             let write_in_progress = write_open(store, &item.path)?;
+            let rekordbox = store.rekordbox_record(result).map_err(store_error)?.map(|r| rekordbox_dto(&r));
             Ok(IdentifyDetailDto {
+                rekordbox,
                 existing: ExistingTagsDto::from(&item.existing),
                 artwork: item.proposal.as_ref().and_then(|p| p.artwork.as_ref()).map(|a| ArtworkDto {
                     source: camel(&a.source),
@@ -466,6 +470,10 @@ pub(crate) struct JobTrack {
     pub title: String,
     /// `None` when the library holds no path for it.
     pub path: Option<String>,
+    /// The library record, read (never written) when the job started, to
+    /// be imported into the identify store with the result. `None` for a
+    /// track the library cannot place.
+    pub rekordbox: Option<RekordboxRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -561,16 +569,24 @@ fn identify_and_save(
     let result_id = state
         .with_store(|store| {
             let library = LibraryTrack { track_id: track.track_id.clone(), path: raw.to_owned() };
-            save(store, &key, &mut result, &library).map_err(|e| AppError::new(ErrorKind::Malformed, e.to_string()))
+            save(store, &key, &mut result, &library, track.rekordbox.as_ref())
+                .map_err(|e| AppError::new(ErrorKind::Malformed, e.to_string()))
         })
         .map_err(|e| e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message)))?;
     Ok((path_text, result_id, decision, score))
 }
 
-/// Saves a finished track (its cover, row and result) in one call, then
-/// drops the cover's bytes: the store holds them now.
-fn save(store: &Store, key: &TrackKey, result: &mut TrackResult, library: &LibraryTrack) -> rbl_identify::Result<ResultId> {
-    let (_, saved) = store.save_track_result(key, result, Some(library), false)?;
+/// Saves a finished track (its cover, row, result and the imported library
+/// record) in one transaction, then drops the cover's bytes: the store
+/// holds them now.
+fn save(
+    store: &Store,
+    key: &TrackKey,
+    result: &mut TrackResult,
+    library: &LibraryTrack,
+    rekordbox: Option<&RekordboxRecord>,
+) -> rbl_identify::Result<ResultId> {
+    let (_, saved) = store.save_track_result_with(key, result, Some(library), rekordbox, false)?;
     result.artwork = None;
     Ok(saved)
 }
@@ -622,23 +638,77 @@ fn spawn_job<R: tauri::Runtime>(
 
 /// The library's tracks for these ids, in order, each id once. A track the
 /// library cannot place gets no path, and fails on its own in the job.
-fn resolve_tracks(library: &rbl_index::Library, ids: Vec<String>) -> Vec<JobTrack> {
+/// Each placed track carries its library record as of now (`imported_unix`),
+/// read from the in-memory library; the ISRC, which that does not hold,
+/// comes from `isrcs`.
+fn resolve_tracks(
+    library: &rbl_index::Library,
+    ids: Vec<String>,
+    isrcs: &std::collections::HashMap<String, String>,
+    imported_unix: i64,
+) -> Vec<JobTrack> {
     let mut seen = std::collections::HashSet::new();
     ids.into_iter()
         .filter(|id| seen.insert(id.clone()))
         .map(|id| {
             let path = library.audio_path_of(&id).filter(|p| !p.is_empty()).map(str::to_owned);
-            let title = library
-                .row_of(&id)
-                .map(|row| library.title.get(row as usize).to_owned())
+            let row = library.row_of(&id).map(|row| row as usize);
+            let title = row
+                .map(|row| library.title.get(row).to_owned())
                 .filter(|t| !t.is_empty())
                 .or_else(|| {
                     path.as_deref().and_then(|p| Path::new(p).file_name()).map(|n| n.to_string_lossy().into_owned())
                 })
                 .unwrap_or_default();
-            JobTrack { track_id: id, title, path }
+            let rekordbox = row.map(|row| rekordbox_record(library, row, &id, isrcs, imported_unix));
+            JobTrack { track_id: id, title, path, rekordbox }
         })
         .collect()
+}
+
+/// One track's library record, read from the in-memory library.
+fn rekordbox_record(
+    library: &rbl_index::Library,
+    row: usize,
+    id: &str,
+    isrcs: &std::collections::HashMap<String, String>,
+    imported_unix: i64,
+) -> RekordboxRecord {
+    let lookup = |ids: &[u32], names: &rbl_index::strings::Interner| ids.get(row).map_or("", |&n| names.name(n)).to_owned();
+    let year = library.year.get(row).copied().unwrap_or(0);
+    RekordboxRecord {
+        track_id: id.to_owned(),
+        title: library.title.get(row).to_owned(),
+        artist: lookup(&library.artist, &library.artists),
+        album: lookup(&library.album, &library.albums),
+        label: lookup(&library.label, &library.labels),
+        genre: lookup(&library.genre, &library.genres),
+        year: if year == 0 { String::new() } else { year.to_string() },
+        comment: library.comment.get(row).to_owned(),
+        isrc: isrcs.get(id).cloned().unwrap_or_default(),
+        imported_unix,
+    }
+}
+
+/// The ISRCs of these library tracks (`djmdContent.ISRC`, which the
+/// in-memory library does not hold), read through the app's read-only
+/// connection. Tracks without one are left out.
+fn read_isrcs(db: &rbl_db::Library, ids: &[String]) -> Result<std::collections::HashMap<String, String>, rbl_db::DbError> {
+    let mut stmt = db.connection().prepare("SELECT ISRC FROM djmdContent WHERE ID = ?1")?;
+    let mut isrcs = std::collections::HashMap::new();
+    for id in ids {
+        let mut rows = stmt.query_map([id.as_str()], |r| r.get::<_, Option<String>>(0))?;
+        if let Some(isrc) = rows.next().transpose()?.flatten().filter(|i| !i.trim().is_empty()) {
+            isrcs.insert(id.clone(), isrc.trim().to_owned());
+        }
+    }
+    Ok(isrcs)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 // ---------------------------------------------------------------- commands
@@ -660,12 +730,19 @@ pub async fn identify_start<R: tauri::Runtime>(
         return Err(already_running());
     }
     let library = state.library()?;
+    let state = Arc::clone(&state);
     blocking("identify_start", move || {
         let engine: Arc<dyn Identifier> = identify.engine()?;
         // Opened now so a store that cannot open fails the start, not
         // every track.
         identify.with_store(|_| Ok(()))?;
-        let tracks = resolve_tracks(&library, track_ids);
+        // Read-only: the imported records lack an ISRC rather than the
+        // job failing when the library cannot be read.
+        let isrcs = state.read_db(|db| read_isrcs(db, &track_ids)).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "identify: the library's ISRCs could not be read");
+            std::collections::HashMap::new()
+        });
+        let tracks = resolve_tracks(&library, track_ids, &isrcs, now_unix());
         spawn_job(app, &identify, engine, tracks)
     })
     .await
@@ -1022,6 +1099,9 @@ pub struct IdentifyQueueItemDto {
     pub updated_unix: i64,
     /// Applied, so `identify_undo` can put its last write back.
     pub undoable: bool,
+    /// Where the proposed candidate came from: `fingerprint`, `textSearch`
+    /// or `discogsText`; `None` without a proposal.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1133,6 +1213,50 @@ pub struct IdentifyDetailDto {
     /// A write to the file is open: review changes are refused until it is
     /// reconciled.
     pub write_in_progress: bool,
+    /// The rekordbox library record as imported when the track was
+    /// identified; `None` for a result saved before imports existed.
+    pub rekordbox: Option<IdentifyRekordboxRecordDto>,
+}
+
+/// A rekordbox library record imported into the identify store. Read from
+/// the library; identification never writes it back. Absent values are "".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentifyRekordboxRecordDto {
+    pub track_id: String,
+    /// RFC 3339, UTC.
+    pub imported_at: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub label: String,
+    pub genre: String,
+    pub year: String,
+    pub comment: String,
+    pub isrc: String,
+}
+
+fn rekordbox_dto(r: &RekordboxRecord) -> IdentifyRekordboxRecordDto {
+    IdentifyRekordboxRecordDto {
+        track_id: r.track_id.clone(),
+        imported_at: rfc3339(r.imported_unix),
+        title: r.title.clone(),
+        artist: r.artist.clone(),
+        album: r.album.clone(),
+        label: r.label.clone(),
+        genre: r.genre.clone(),
+        year: r.year.clone(),
+        comment: r.comment.clone(),
+        isrc: r.isrc.clone(),
+    }
+}
+
+/// Seconds since the Unix epoch as RFC 3339 in UTC; "" when out of range.
+fn rfc3339(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_default()
 }
 
 /// A model enum as the frontend spells it: its serde name with the first
@@ -1191,6 +1315,7 @@ fn queue_item_dto(item: &QueueItem) -> IdentifyQueueItemDto {
         changes: item.proposal.as_ref().map(|p: &Proposal| p.changes.iter().map(change_dto).collect()).unwrap_or_default(),
         updated_unix: item.updated_unix,
         undoable: item.state.is_applied(),
+        source: item.source.as_ref().map(camel),
     }
 }
 
@@ -1337,7 +1462,12 @@ mod tests {
         if create {
             std::fs::write(&path, b"x").unwrap();
         }
-        JobTrack { track_id: name.to_owned(), title: name.to_owned(), path: Some(path.to_string_lossy().into_owned()) }
+        JobTrack {
+            track_id: name.to_owned(),
+            title: name.to_owned(),
+            path: Some(path.to_string_lossy().into_owned()),
+            rekordbox: None,
+        }
     }
 
     fn run(state: &IdentifyState, tracks: &[JobTrack], fake: &Fake, cancel: &AtomicBool) -> Vec<JobEvent> {
@@ -1356,7 +1486,7 @@ mod tests {
             track(files.path(), "unknown.mp3", true),
             track(files.path(), "broken.mp3", true),
             track(files.path(), "gone.mp3", false),
-            JobTrack { track_id: "nopath".into(), title: "No path".into(), path: None },
+            JobTrack { track_id: "nopath".into(), title: "No path".into(), path: None, rekordbox: None },
         ];
         let events = run(&state, &tracks, &Fake::new(), &AtomicBool::new(false));
 
@@ -1465,6 +1595,9 @@ mod tests {
         let detail = state.detail(review.result_id).unwrap();
         assert_eq!(detail.item.state, "accepted");
         assert_eq!(detail.candidates[0].source, "fingerprint");
+        assert_eq!(detail.item.source.as_deref(), Some("fingerprint"));
+        assert_eq!(unknown.source, None, "no proposal, no source");
+        assert_eq!(detail.rekordbox, None, "the fake job imported no record");
         assert_eq!(detail.artwork.as_ref().map(|a| a.source.as_str()), Some("coverArtArchive"));
         assert!(!detail.write_in_progress);
 
@@ -1673,6 +1806,38 @@ mod tests {
         assert!(!undone.ok);
         assert!(undone.error.as_deref().unwrap_or_default().contains("changed since"), "{undone:?}");
         assert_eq!(identify.detail(result).unwrap().item.state, "applied");
+    }
+
+    #[test]
+    fn a_job_imports_the_tracks_rekordbox_record_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location, rbl_db::OpenMode::ReadOnly).unwrap();
+        let (library, _) = rbl_index::load(&db).unwrap();
+        let id = rbl_db::fixture::track_id(1);
+        let isrcs = read_isrcs(&db, std::slice::from_ref(&id)).unwrap();
+        let tracks = resolve_tracks(&library, vec![id.clone(), id.clone(), "no-such".into()], &isrcs, 1_800_000_000);
+        assert_eq!(tracks.len(), 2, "each id once");
+        assert!(tracks[1].rekordbox.is_none(), "a track the library cannot place has no record");
+        let mut record = tracks[0].rekordbox.clone().unwrap();
+        let row = library.row_of(&id).unwrap() as usize;
+        assert_eq!((record.track_id.as_str(), record.title.as_str()), (id.as_str(), library.title.get(row)));
+        assert_eq!(record.artist, library.artists.name(library.artist[row]));
+        assert_eq!(record.imported_unix, 1_800_000_000);
+        record.isrc = "GBAAA1400001".into();
+
+        // Saved with the result, in the store, and shown with it.
+        let files = tempfile::tempdir().unwrap();
+        let state = IdentifyState::with_root(dir.path().join("identify"));
+        let mut job = track(files.path(), "review.mp3", true);
+        job.rekordbox = Some(record.clone());
+        run(&state, &[job], &Fake::new(), &AtomicBool::new(false));
+        let item = state.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items.remove(0);
+        let shown = state.detail(item.result_id).unwrap().rekordbox.unwrap();
+        assert_eq!(shown.imported_at, "2027-01-15T08:00:00Z");
+        assert_eq!((shown.title, shown.isrc, shown.year), (record.title, record.isrc, record.year));
+        let json = serde_json::to_value(state.detail(item.result_id).unwrap()).unwrap();
+        assert!(json["rekordbox"]["importedAt"].is_string() && json["item"]["source"] == "fingerprint", "{json}");
     }
 
     #[test]
