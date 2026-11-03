@@ -39,11 +39,15 @@ test("identify a selection, review a result, apply ticked fields and undo", asyn
   const detail = panel.getByRole("region", { name: "Identification result" });
   await expect(detail.getByRole("row").filter({ hasText: "Sub-genre (added to Comment)" })).toContainText("Purchased at Beatport.com; Tech House");
   await expect(detail.getByRole("checkbox", { name: "Write Track Title" })).toBeChecked();
+  // rekordbox's imported record, where it differs from the file.
+  await expect(detail).toContainText("rekordbox: Older Label");
+  await expect(list.getByRole("option").first()).toContainText("Fingerprint");
   await detail.getByRole("checkbox", { name: "Write Label" }).uncheck();
 
   await detail.getByRole("button", { name: "Accept", exact: true }).click();
   await expect(detail.locator("header")).toContainText("Applied");
   await expect(detail.getByRole("button", { name: "Accept", exact: true })).toBeDisabled();
+  await expect(detail).toContainText("select the tracks there and choose Reload Tag");
   await expect(list.getByRole("option")).toHaveCount(1);
 
   await panel.getByRole("tab", { name: "Applied (undoable)" }).click();
@@ -95,4 +99,39 @@ test("All Tracks offers identifying the whole library and the review queue", asy
   const panel = page.getByRole("dialog", { name: "Identify Tracks" });
   await expect(panel).toContainText("No identification has run yet.");
   await expect(panel.getByRole("tab", { name: "Needs review" })).toHaveAttribute("aria-selected", "true");
+});
+
+test("the Identify settings pane reports keys by source and saves a change", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("banner").getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Preferences" });
+  await dialog.getByRole("tab", { name: "Identify", exact: true }).click();
+
+  // The mock's AcoustID key is stored in the settings; its Discogs token comes from the environment.
+  const acoustid = dialog.getByRole("region", { name: "AcoustID API key" });
+  await expect(acoustid).toContainText("Set (from settings)");
+  const discogs = dialog.getByRole("region", { name: "Discogs personal token" });
+  await expect(discogs).toContainText("Set (from environment)");
+  await expect(discogs.getByRole("button", { name: "Remove Discogs personal token" })).toHaveCount(0);
+  await expect(dialog).toContainText("identify\\settings.json");
+
+  await acoustid.getByRole("button", { name: "Replace…" }).click();
+  const key = acoustid.getByLabel("New AcoustID API key");
+  await expect(key).toHaveValue("");
+  await key.fill("not-a-real-key");
+  await acoustid.getByRole("button", { name: "Save" }).click();
+  await expect(key).toHaveCount(0);
+  await expect(dialog).not.toContainText("not-a-real-key");
+
+  const auto = dialog.getByRole("region", { name: "Auto-apply" });
+  await expect(auto.getByRole("switch")).not.toBeChecked();
+  await auto.getByRole("switch").check();
+  const threshold = auto.getByRole("spinbutton", { name: "Minimum score" });
+  await threshold.fill("0.5");
+  await threshold.press("Enter");
+  await expect(auto.getByRole("alert")).toHaveText("Choose a threshold from 0.92 to 1.00.");
+  await threshold.fill("0.95");
+  await threshold.press("Enter");
+  await expect(auto.getByRole("alert")).toHaveCount(0);
+  await expect(threshold).toHaveValue("0.95");
 });
