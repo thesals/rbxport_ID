@@ -406,10 +406,10 @@ impl IdentifyState {
                     IdentifyWriteOutcomeDto::written(waiting.result)
                 }
                 Some(Ok(Ok(Retried::StillWaiting(message)))) => IdentifyWriteOutcomeDto::deferred(waiting.result, message),
-                Some(Ok(Ok(Retried::Dropped { warning, returned }))) => {
-                    if returned {
-                        changed.push(waiting.result);
-                    }
+                // The waiting write ended, whether or not the result's state
+                // changed with it.
+                Some(Ok(Ok(Retried::Dropped { warning, .. }))) => {
+                    changed.push(waiting.result);
                     IdentifyWriteOutcomeDto::failed(waiting.result, warning)
                 }
                 Some(Ok(Ok(Retried::NoLongerWaiting))) => continue,
