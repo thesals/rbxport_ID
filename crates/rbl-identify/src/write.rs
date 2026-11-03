@@ -58,9 +58,11 @@
 //! the write's, as for any tag editor. A read-only file, and a file another
 //! program holds open, are refused with a clear message. The rename replaces
 //! the file object, so alternate data streams (`Zone.Identifier`), hard
-//! links and explicit ACLs of the original are not carried over; a crash
-//! between staging and renaming can leave a `.rbxport-tags-*.tmp` beside the
-//! file, which is safe to delete.
+//! links and explicit ACLs of the original are not carried over. A crash
+//! between staging and renaming can leave a `.rbxport-tags-*` file beside
+//! the track; [`remove_stale_temps`] deletes those (exactly that name, and
+//! nothing else) before the next write or undo there and when the store is
+//! reconciled at startup.
 //!
 //! AIFF and WAV keep their ID3 tag in a chunk: it is edited with the same
 //! frame-level editor, the chunk's and the container's sizes set to match,
@@ -172,6 +174,8 @@ pub fn write(path: &Path, before: &TagSnapshot, edits: &[Edit], artwork: Option<
     if edits.contains(&Edit::AddArtwork) && artwork.is_none() {
         return Err(refuse("The proposed artwork is not in the identify store."));
     }
+    // A leftover from a crash during an earlier write beside this file.
+    remove_stale_temps(path);
     let original = std::fs::read(path).map_err(|e| io_error(path, &e))?;
     if tags::read(path)?.snapshot != *before {
         return Err(refuse("The file's tags changed while the write was being prepared. Try again."));
@@ -231,6 +235,7 @@ fn verify(after: &TagSnapshot, edits: &[Edit]) -> Result<()> {
 /// A file already back at `before` is left alone. `fields` are the ones the
 /// write changed (used where tags are restored field by field).
 pub fn restore(path: &Path, before: &TagSnapshot, after: &TagSnapshot, fields: &[Field]) -> Result<()> {
+    remove_stale_temps(path);
     let now = tags::read(path)?.snapshot;
     if now == *before {
         return Ok(());
@@ -311,6 +316,49 @@ fn id3_kind(path: &Path, bytes: &[u8]) -> Result<Id3Kind> {
     Ok(if kind == Some(FileType::Mpeg) { Id3Kind::Untagged } else { Id3Kind::Other })
 }
 
+/// The staged files' name: `.rbxport-tags-`, tempfile's six random
+/// characters, then `.tmp` ([`replace`]) or the track's own extension
+/// ([`stage_copy`]).
+const TEMP_PREFIX: &str = ".rbxport-tags-";
+const TEMP_RANDOM_LEN: usize = 6;
+
+/// Whether `name` is exactly a staged file this writer makes beside a track
+/// with extension `ext` (`None` for a track without one).
+fn is_our_temp(name: &str, ext: Option<&str>) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else { return false };
+    let (random, suffix) = rest.split_at(rest.char_indices().nth(TEMP_RANDOM_LEN).map_or(rest.len(), |(i, _)| i));
+    if random.len() != TEMP_RANDOM_LEN || !random.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return false;
+    }
+    suffix == ".tmp" || ext.is_some_and(|ext| !ext.is_empty() && suffix.strip_prefix('.') == Some(ext))
+}
+
+/// Deletes staged files a crash between staging and renaming left beside
+/// `track` (the file whose tags were being written): plain files named
+/// exactly as [`replace`] and [`stage_copy`] name them, nothing else.
+/// Best effort: one that cannot be deleted (open elsewhere) stays. Returns
+/// how many were deleted.
+pub fn remove_stale_temps(track: &Path) -> usize {
+    let Some(folder) = track.parent().filter(|p| !p.as_os_str().is_empty()) else { return 0 };
+    let ext = track.extension().and_then(|e| e.to_str());
+    let Ok(entries) = std::fs::read_dir(folder) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_our_temp(name, ext) {
+            continue;
+        }
+        // Never follow a link or touch a folder, whatever its name.
+        let is_file = std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.file_type().is_file());
+        if is_file && std::fs::remove_file(entry.path()).is_ok() {
+            tracing::info!("identify: removed a staged tag file left by an interrupted write");
+            removed += 1;
+        }
+    }
+    removed
+}
+
 fn io_error(path: &Path, e: &std::io::Error) -> IdentifyError {
     IdentifyError::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
@@ -324,7 +372,8 @@ pub(crate) fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let mut staged = tempfile::Builder::new()
-        .prefix(".rbxport-tags-")
+        .prefix(TEMP_PREFIX)
+        .rand_bytes(TEMP_RANDOM_LEN)
         .suffix(".tmp")
         .tempfile_in(parent)
         .map_err(|e| refuse(format!("The file's folder cannot be written to: {e}")))?;
@@ -445,7 +494,8 @@ fn lofty_restore(path: &Path, before: &TagSnapshot, fields: &[Field]) -> Result<
 fn stage_copy(path: &Path) -> Result<tempfile::NamedTempFile> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let mut staged = tempfile::Builder::new()
-        .prefix(".rbxport-tags-")
+        .prefix(TEMP_PREFIX)
+        .rand_bytes(TEMP_RANDOM_LEN)
         .suffix(&path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default())
         .tempfile_in(parent)
         .map_err(|e| refuse(format!("The file's folder cannot be written to: {e}")))?;
@@ -1043,4 +1093,58 @@ pub fn undo_result(store: &Store, result: ResultId) -> Result<Undone> {
     restore(path, &before, &after, &fields)?;
     store.record_undo(application.id)?;
     Ok(Undone { application: application.id })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_our_exact_temp_names_match() {
+        for name in [".rbxport-tags-a1B2c3.tmp", ".rbxport-tags-ZZZZZZ.mp3"] {
+            assert!(is_our_temp(name, Some("mp3")), "{name}");
+        }
+        for name in [
+            ".rbxport-tags-a1B2c.tmp",
+            ".rbxport-tags-a1B2c34.tmp",
+            ".rbxport-tags-a1-2c3.tmp",
+            ".rbxport-tags-a1B2c3.tmp.bak",
+            ".rbxport-tags-a1B2c3.flac",
+            ".rbxport-tags-a1B2c3.",
+            "rbxport-tags-a1B2c3.tmp",
+            ".rbxport-tags-.tmp",
+            "track.mp3",
+            ".rbxport-tags-a1B2\u{e9}3.tmp",
+        ] {
+            assert!(!is_our_temp(name, Some("mp3")), "{name}");
+        }
+        assert!(!is_our_temp(".rbxport-tags-a1B2c3.", None));
+    }
+
+    #[test]
+    fn stale_temps_beside_a_track_are_removed_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let track = dir.path().join("track.mp3");
+        std::fs::write(&track, b"audio").unwrap();
+        let ours = [".rbxport-tags-abc123.tmp", ".rbxport-tags-XyZ789.mp3"];
+        let others = [".rbxport-tags-abc12.tmp", ".rbxport-tags-abc123.flac", "notes.tmp", ".rbxport-tags-abc123.tmp.keep"];
+        for name in ours.iter().chain(&others) {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // A folder with our name is never touched.
+        std::fs::create_dir(dir.path().join(".rbxport-tags-dir456.tmp")).unwrap();
+        assert_eq!(remove_stale_temps(&track), 2);
+        for name in ours {
+            assert!(!dir.path().join(name).exists(), "{name}");
+        }
+        for name in others {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+        assert!(dir.path().join(".rbxport-tags-dir456.tmp").is_dir());
+        assert_eq!(std::fs::read(&track).unwrap(), b"audio");
+        // Nothing left to remove; a file in no folder is a no-op.
+        assert_eq!(remove_stale_temps(&track), 0);
+        assert_eq!(remove_stale_temps(Path::new("track.mp3")), 0);
+    }
 }

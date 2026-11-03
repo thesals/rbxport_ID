@@ -1841,6 +1841,44 @@ mod tests {
     }
 
     #[test]
+    fn startup_removes_staged_files_an_interrupted_write_left_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let result = identified(&identify, &audio, "42", title.clone());
+        // A write begun, then a crash between staging and the rename.
+        identify
+            .with_store(|store| {
+                store.set_state(result, ReviewState::Accepted).map_err(store_error)?;
+                let before = tags::read(&audio).map_err(store_error)?.snapshot;
+                store.begin_application(result, &title, None, &before, None).map_err(store_error)
+            })
+            .unwrap();
+        let leftovers = [".rbxport-tags-Ab12Cd.tmp", ".rbxport-tags-Ef34Gh.wav"];
+        let keep = [".rbxport-tags-Ab12C.tmp", "other.tmp", ".rbxport-tags-Ab12Cd.mp3"];
+        for name in leftovers.iter().chain(&keep) {
+            std::fs::write(dir.path().join(name), b"staged").unwrap();
+        }
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join(leftovers[0]), b"not beside an open write").unwrap();
+
+        identify.reconcile_on_startup();
+        for name in leftovers {
+            assert!(!dir.path().join(name).exists(), "{name}");
+        }
+        for name in keep {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+        assert!(elsewhere.path().join(leftovers[0]).exists(), "only open applications' folders are cleaned");
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        // The file was untouched, so the write was abandoned, as before.
+        assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
+    }
+
+    #[test]
     fn model_names_reach_the_frontend_in_camel_case_and_back() {
         assert_eq!(camel(&Field::CatalogNumber), "catalogNumber");
         assert_eq!(camel(&Field::MbRecordingId), "mbRecordingId");

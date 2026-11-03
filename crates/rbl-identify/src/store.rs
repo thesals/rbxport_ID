@@ -1244,9 +1244,14 @@ impl Store {
     }
 
     /// [`Store::reconcile_open_applications`] reading each file's tags from
-    /// disk at its stored path.
+    /// disk at its stored path, after deleting any staged file the
+    /// interrupted write left beside it ([`crate::write::remove_stale_temps`]).
     pub fn reconcile_open_applications_from_files(&self) -> Result<Vec<Reconciliation>> {
-        self.reconcile_open_applications(|application| Ok(crate::tags::read(Path::new(&application.path))?.snapshot))
+        self.reconcile_open_applications(|application| {
+            let path = Path::new(&application.path);
+            crate::write::remove_stale_temps(path);
+            Ok(crate::tags::read(path)?.snapshot)
+        })
     }
 
     /// What the last written application of a result wrote; empty when
