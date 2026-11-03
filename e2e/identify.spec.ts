@@ -242,3 +242,57 @@ test("with auto-apply on, the job writes a qualifying match and files it under A
   await expect(detail.locator("header")).toContainText("Undone");
   await expect(written).toHaveCount(0);
 });
+
+test("with writing to audio files off, nothing is written until it is turned on and confirmed", async ({ page }) => {
+  await page.goto("/?writable=1");
+  await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  const rows = page.getByRole("row").filter({ has: page.getByRole("gridcell") });
+  await rows.nth(0).click();
+  await rows.nth(4).click({ modifiers: ["Shift"] });
+  await page.locator('[role="gridcell"][data-col="title"]').nth(2).click({ button: "right" });
+  await page.getByRole("menu", { name: "Track" }).getByRole("menuitem", { name: "Identify Tracks" }).click();
+  const panel = page.getByRole("dialog", { name: "Identify Tracks" });
+  await expect(panel.getByRole("status").first()).toHaveText("Identified 5 of 5", { timeout: 10_000 });
+
+  const notice = "Writing to audio files is off. Results are saved for review only.";
+  await expect(panel.getByRole("note").filter({ hasText: notice })).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Apply accepted" })).toBeDisabled();
+  const list = panel.getByRole("listbox");
+  await list.getByRole("option").filter({ hasText: "81%" }).first().click();
+  const detail = panel.getByRole("region", { name: "Identification result" });
+  const accept = detail.getByRole("button", { name: "Accept", exact: true });
+  await expect(accept).toBeDisabled();
+  await expect(accept).toHaveAttribute("title", notice);
+  // Review changes touch only the identify store.
+  await expect(detail.getByRole("button", { name: "Reject" })).toBeEnabled();
+
+  // Turning it on asks first; Cancel leaves it off.
+  await panel.getByRole("button", { name: "Close" }).click();
+  await page.getByRole("banner").getByRole("button", { name: "Settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Preferences" });
+  await dialog.getByRole("tab", { name: "Identify", exact: true }).click();
+  const writes = dialog.getByRole("region", { name: "Write tags to audio files" });
+  await expect(writes.getByRole("switch")).not.toBeChecked();
+  await writes.getByRole("switch").click();
+  const confirm = writes.getByRole("group", { name: "Confirm writing tags to audio files" });
+  await expect(confirm).toContainText("including files in your rekordbox library");
+  await expect(writes.getByRole("switch")).not.toBeChecked();
+  await confirm.getByRole("button", { name: "Cancel" }).click();
+  await expect(confirm).toHaveCount(0);
+  await expect(writes.getByRole("switch")).not.toBeChecked();
+  await writes.getByRole("switch").click();
+  await confirm.getByRole("button", { name: "Turn on writing" }).click();
+  await expect(writes.getByRole("switch")).toBeChecked();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+
+  // Reopened, the panel reads the setting again and Accept writes.
+  await page.getByRole("treeitem").filter({ hasText: "All Tracks" }).first().click({ button: "right" });
+  await page.getByRole("menu", { name: "All Tracks" }).getByRole("menuitem", { name: "Review Identified Tracks" }).click();
+  await expect(panel).toBeVisible();
+  await expect(panel.getByRole("note").filter({ hasText: notice })).toHaveCount(0);
+  await list.getByRole("option").filter({ hasText: "81%" }).first().click();
+  await expect(accept).toBeEnabled();
+  await accept.click();
+  await expect(detail.locator("header")).toContainText("Applied");
+});

@@ -9,6 +9,10 @@
  * with its ticked fields, says why, and offers Retry now and Cancel write. A
  * deferred write is a notice, not an error.
  *
+ * While audio-file writes are off, Accept, Undo and Retry now are disabled
+ * with the reason as their tooltip; Reject, Edit and Back to review only
+ * change the identify store, so they stay.
+ *
  * One way: Accept and Undo write the audio file's tags and nothing else.
  * The rekordbox record imported when the track was identified is shown
  * under a field it disagrees with, for reference; it is never written.
@@ -21,7 +25,7 @@ import { useTranslation } from "@/i18n";
 import { errorMessage } from "@/lib/errorMessage";
 import {
   canApply, changes, decisionLabel, defaultFields, fieldLabel, formatScore, rekordboxValue, reloadHint, sourceLabel,
-  stateLabel, trackName, waitingLabel, waitingNotice,
+  stateLabel, trackName, waitingLabel, waitingNotice, WRITES_OFF_NOTICE_ID,
 } from "./identifyText";
 import styles from "./IdentifyPanel.module.css";
 
@@ -51,9 +55,13 @@ export interface IdentifyDetailPaneProps {
   resultId: number;
   /** After a call of this pane's own changed the result. */
   onChanged: () => void;
+  /** Writing to audio files is off, or not yet known to be on: nothing here may write. */
+  writesOff?: boolean;
+  /** Why, when writes are known to be off; shown as the write buttons' tooltip. */
+  writesOffReason?: string | null;
 }
 
-export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPaneProps) {
+export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, writesOffReason = null }: IdentifyDetailPaneProps) {
   const t = useTranslation();
   const [detail, setDetail] = useState<IdentifyDetail | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -136,6 +144,8 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
   // A waiting write is settled by Retry now or Cancel write first.
   const waiting = item.waiting !== null;
   const writable = canApply(item.state) && !detail.writeInProgress && !waiting;
+  const lockTitle = writesOff && writesOffReason !== null ? writesOffReason : undefined;
+  const lockNote = lockTitle !== undefined ? WRITES_OFF_NOTICE_ID : undefined;
   const reviewable = (item.state === "pending" || item.state === "accepted") && !detail.writeInProgress && !waiting;
   const setState = (action: IdentifyReviewAction) =>
     void run(async () => (await getBackend()).identify.setState(item.resultId, action));
@@ -184,7 +194,8 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
           </p>
           {item.waiting.reason ? <p className={styles.hint}>{item.waiting.reason}</p> : null}
           <div className={styles.actions}>
-            <button type="button" className={styles.button} disabled={busy} onClick={retry}>{t("Retry now")}</button>
+            <button type="button" className={styles.button} disabled={busy || writesOff} title={lockTitle}
+              aria-describedby={lockNote} onClick={retry}>{t("Retry now")}</button>
             <button type="button" className={styles.button} disabled={busy} onClick={cancelWaiting}>{t("Cancel write")}</button>
           </div>
         </section>
@@ -297,7 +308,9 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
         <button
           type="button"
           className={styles.button}
-          disabled={!writable || busy || ticked.size === 0}
+          disabled={!writable || busy || writesOff || ticked.size === 0}
+          title={writable ? lockTitle : undefined}
+          aria-describedby={writable ? lockNote : undefined}
           onClick={accept}
         >
           {t("Accept")}
@@ -311,7 +324,8 @@ export function IdentifyDetailPane({ resultId, onChanged }: IdentifyDetailPanePr
           </button>
         ) : null}
         {item.undoable ? (
-          <button type="button" className={styles.button} disabled={busy} onClick={undo}>
+          <button type="button" className={styles.button} disabled={busy || writesOff} title={lockTitle}
+            aria-describedby={lockNote} onClick={undo}>
             {t("Undo")}
           </button>
         ) : null}

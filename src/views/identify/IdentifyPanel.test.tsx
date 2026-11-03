@@ -5,14 +5,16 @@
  * Cancel, the filters, a result's per-field diff with its ticks, Accept
  * writing only the ticked fields, Undo, Edit, and bulk accept above a
  * threshold followed by Apply accepted, and writes deferred while a file is
- * in use: waiting, retried and cancelled.
+ * in use: waiting, retried and cancelled. Most of these turn "Write tags to
+ * audio files" on first; the last group leaves it off, as it is by default,
+ * where nothing may write.
  */
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __setBackend } from "@/ipc/client";
-import { createMockIdentify, type MockIdentifyBackend } from "@/ipc/mock-identify";
+import { AUTO_APPLY_LOCKED, FILE_WRITES_OFF, createMockIdentify, type MockIdentifyBackend } from "@/ipc/mock-identify";
 import type { Backend } from "@/ipc/types";
 import { useIdentifyJob } from "@/store/useIdentifyJob";
 import { IdentifyPanel } from "./IdentifyPanel";
@@ -321,5 +323,103 @@ describe("IdentifyPanel", () => {
     expect(list.getAttribute("aria-activedescendant")).toBe("identify-row-1");
     act(() => { list.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
     expect(onClose).toHaveBeenCalled();
+  });
+});
+
+describe("IdentifyPanel with writing to audio files off", () => {
+  const notice = "Writing to audio files is off. Results are saved for review only.";
+
+  it("says so, disables every write and keeps review changes", async () => {
+    useMock(false, false);
+    await identifyFive();
+    const apply = vi.spyOn(identify, "apply");
+    await render();
+    expect(host.querySelector("[role=note]#identify-writes-off")?.textContent).toBe(notice);
+    expect(button("Apply accepted")?.disabled).toBe(true);
+    expect(button("Apply accepted")?.title).toBe(notice);
+    expect(button("Accept above")?.disabled).toBe(false);
+    await click(options()[0]);
+    expect(button("Accept")?.disabled).toBe(true);
+    expect(button("Accept")?.title).toBe(notice);
+    expect(button("Accept")?.getAttribute("aria-describedby")).toBe("identify-writes-off");
+    // Edit, Reject and Back to review change only the identify store.
+    await click(host.querySelector<HTMLButtonElement>('button[aria-label="Edit Label"]') ?? undefined);
+    type(host.querySelector<HTMLInputElement>('input[aria-label="Proposed Label"]')!, "Edited Records");
+    await click(button("Save"));
+    expect(host.textContent).toContain("Edited Records");
+    expect(button("Reject")?.disabled).toBe(false);
+    await click(button("Reject"));
+    expect(byText("section span", "Rejected")).toBeDefined();
+    await click(button("Back to review"));
+    expect(byText("section span", "Needs review")).toBeDefined();
+    // Accept above only marks results accepted.
+    await click(button("Accept above"));
+    expect(host.textContent).toContain("1 result accepted.");
+    expect(apply).not.toHaveBeenCalled();
+  });
+
+  it("is enforced by the store: a forced apply, undo or retry is refused and nothing is written", async () => {
+    useMock(false, false);
+    await identifyFive();
+    const [first] = (await identify.queue("needsReview", 0, 10)).items;
+    expect(first).toBeDefined();
+    const fields = first!.changes.map((c) => c.field);
+    expect(await identify.apply([{ resultId: first!.resultId, fields }])).toEqual([
+      { resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF },
+    ]);
+    expect(FILE_WRITES_OFF).toBe("Writing to audio files is turned off. Turn on \"Write tags to audio files\" in Preferences → Identify to write.");
+    const after = await identify.result(first!.resultId);
+    expect(after.item.state).toBe("pending");
+    expect(after.item.changes).toEqual(first!.changes);
+    expect(await identify.undo(first!.resultId)).toEqual({ resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF });
+    expect((await identify.queue("applied", 0, 10)).total).toBe(0);
+
+    // Turned on, the same apply writes.
+    await identify.saveSettings({ fileWrites: true });
+    expect((await identify.apply([{ resultId: first!.resultId, fields }]))[0]?.ok).toBe(true);
+  });
+
+  it("keeps a waiting write waiting while off, and refuses its retry", async () => {
+    useMock(false, true);
+    await identifyFive();
+    identify.setFileInUse(true);
+    const [first] = (await identify.queue("needsReview", 0, 10)).items;
+    expect((await identify.apply([{ resultId: first!.resultId, fields: first!.changes.map((c) => c.field) }]))[0]?.deferred).toBe(true);
+    await identify.saveSettings({ fileWrites: false });
+    identify.setFileInUse(false);
+    await render();
+    await click(byText("[role=tab]", "Waiting for file"));
+    await click(options()[0]);
+    expect(button("Retry now")?.disabled).toBe(true);
+    expect(button("Retry now")?.title).toBe(notice);
+    expect(button("Cancel write")?.disabled).toBe(false);
+    expect(await identify.retryWaiting()).toEqual([{ resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF }]);
+    expect((await identify.queue("waiting", 0, 10)).total).toBe(1);
+  });
+
+  it("leaves a match auto-apply would write for review, with a warning", async () => {
+    useMock(true, false);
+    await identifyFive();
+    await render();
+    expect(host.textContent).toContain("0 applied automatically · 3 to review");
+    expect(options()).toHaveLength(3);
+    await click(options().find((row) => row.textContent?.includes("97%")));
+    expect(host.querySelector("section[aria-label=Warnings]")?.textContent).toContain(AUTO_APPLY_LOCKED);
+    expect((await identify.queue("applied", 0, 10)).total).toBe(0);
+  });
+
+  it("reads the setting again when the window gets focus back", async () => {
+    useMock(false, false);
+    await identifyFive();
+    await render();
+    await click(options()[0]);
+    expect(button("Accept")?.disabled).toBe(true);
+    // Saved in the Preferences window, which emits no event.
+    await identify.saveSettings({ fileWrites: true });
+    act(() => { window.dispatchEvent(new Event("focus")); });
+    await flush(200);
+    expect(host.querySelector("#identify-writes-off")).toBeNull();
+    expect(button("Accept")?.disabled).toBe(false);
+    expect(button("Apply accepted")?.disabled).toBe(false);
   });
 });

@@ -217,6 +217,14 @@
 .note { margin: 0; color: var(--c-text-dim); }
 .note { padding: 0 12px 6px; }
 .notice { margin: 0; color: var(--c-text); }
+.locked {
+  flex: none;
+  margin: 0 12px 8px;
+  padding: 6px 10px;
+  border: 1px dashed var(--c-text-dim);
+  border-radius: 4px;
+  color: var(--c-text);
+}
 
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .error { margin: 0; padding: 0 12px 6px; color: var(--c-error); }

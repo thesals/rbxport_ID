@@ -184,3 +184,6 @@ export function trackName(item: Pick<IdentifyQueueItem, "artist" | "title" | "pa
   const name = [item.artist, item.title].filter((part) => part.trim() !== "").join(" – ");
   return name || (item.path.split(/[\\/]/).at(-1) ?? item.path);
 }
+
+/** The review panel's "writing is off" notice, which the disabled write buttons point to. */
+export const WRITES_OFF_NOTICE_ID = "identify-writes-off";
