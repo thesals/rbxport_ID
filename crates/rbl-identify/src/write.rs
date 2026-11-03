@@ -117,6 +117,29 @@ pub struct Image<'a> {
     pub mime: &'a str,
 }
 
+/// Proof that the user lets identification write to audio files: every
+/// function here that changes a file ([`write`], [`write_until`],
+/// [`restore`], [`apply_result`], [`retry_waiting`], [`undo_result`])
+/// takes one, so no write can be made without it.
+///
+/// The app makes one in exactly one place, its file-writes gate, from the
+/// user's "Write tags to audio files" setting read just before each write
+/// (off by default). Nothing else should call [`FileWritesAllowed::if_enabled`]
+/// outside tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileWritesAllowed {
+    _granted: (),
+}
+
+impl FileWritesAllowed {
+    /// The proof, when the user's file-writes setting is on; `None` (no
+    /// write may be made) when it is off.
+    #[must_use]
+    pub fn if_enabled(setting_on: bool) -> Option<Self> {
+        setting_on.then_some(Self { _granted: () })
+    }
+}
+
 fn refuse(message: impl Into<String>) -> IdentifyError {
     IdentifyError::Write(message.into())
 }
@@ -196,8 +219,14 @@ pub fn plan(now: &TagSnapshot, changes: &[FieldChange]) -> Result<Vec<Edit>> {
 ///
 /// The write is checked by reading the file back: if any edit did not land
 /// as planned, the original tags are put back and the write is refused.
-pub fn write(path: &Path, before: &TagSnapshot, edits: &[Edit], artwork: Option<Image<'_>>) -> Result<TagSnapshot> {
-    write_until(path, before, edits, artwork, Deadline::NONE)
+pub fn write(
+    path: &Path,
+    before: &TagSnapshot,
+    edits: &[Edit],
+    artwork: Option<Image<'_>>,
+    allowed: FileWritesAllowed,
+) -> Result<TagSnapshot> {
+    write_until(path, before, edits, artwork, Deadline::NONE, allowed)
 }
 
 /// [`write`], stopping with [`IdentifyError::OutOfTime`] once `deadline`
@@ -211,6 +240,7 @@ pub fn write_until(
     edits: &[Edit],
     artwork: Option<Image<'_>>,
     deadline: Deadline<'_>,
+    _allowed: FileWritesAllowed,
 ) -> Result<TagSnapshot> {
     if edits.is_empty() {
         return Err(refuse("Nothing to write."));
@@ -306,7 +336,13 @@ pub fn holds_exactly(before: &TagSnapshot, now: &TagSnapshot, changes: &[FieldCh
 /// or another program changed them since, and restoring would lose that.
 /// A file already back at `before` is left alone. `fields` are the ones the
 /// write changed (used where tags are restored field by field).
-pub fn restore(path: &Path, before: &TagSnapshot, after: &TagSnapshot, fields: &[Field]) -> Result<()> {
+pub fn restore(
+    path: &Path,
+    before: &TagSnapshot,
+    after: &TagSnapshot,
+    fields: &[Field],
+    _allowed: FileWritesAllowed,
+) -> Result<()> {
     remove_stale_temps(path);
     let now = tags::read(path)?.snapshot;
     if now == *before {
@@ -1144,19 +1180,26 @@ pub struct Applied {
 /// the file is free, through this same path and its checks. A write that
 /// lands ends the result's waiting write. A result that already has a
 /// waiting write is refused here: only its retry may make it.
-pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result<Applied> {
+pub fn apply_result(store: &Store, result: ResultId, fields: &[Field], allowed: FileWritesAllowed) -> Result<Applied> {
     if store.waiting_write(result)?.is_some() {
         return Err(refuse(
             "This result is already waiting to be written once the file is closed. Retry it, or cancel the waiting write.",
         ));
     }
-    apply(store, result, fields, false, Deadline::NONE)
+    apply(store, result, fields, false, Deadline::NONE, allowed)
 }
 
 /// [`apply_result`]'s path. `retrying`: the call is the retry of the
 /// result's own waiting write (checked by [`retry_waiting`]), which may
 /// stop for `deadline` and then keeps waiting.
-fn apply(store: &Store, result: ResultId, fields: &[Field], retrying: bool, deadline: Deadline<'_>) -> Result<Applied> {
+fn apply(
+    store: &Store,
+    result: ResultId,
+    fields: &[Field],
+    retrying: bool,
+    deadline: Deadline<'_>,
+    allowed: FileWritesAllowed,
+) -> Result<Applied> {
     let (item, ..) = store.result(result)?.ok_or_else(|| refuse("That identification result is no longer in the store."))?;
     let accepted_here = match item.state {
         ReviewState::Accepted => false,
@@ -1231,7 +1274,7 @@ fn apply(store: &Store, result: ResultId, fields: &[Field], retrying: bool, dead
         }
     };
     let image = image.as_ref().map(|(bytes, mime)| Image { bytes, mime });
-    let after = match write_until(path, &info.snapshot, &edits, image, deadline) {
+    let after = match write_until(path, &info.snapshot, &edits, image, deadline, allowed) {
         Ok(after) => after,
         Err(e) => {
             let e = in_use_or(path, e);
@@ -1290,7 +1333,12 @@ pub enum Retried {
 /// fields it holds now ([`Retried::NoLongerWaiting`] otherwise). Stops,
 /// still waiting, once `deadline` passes, before the file is changed. A
 /// store failure is the only error; the waiting write is then kept.
-pub fn retry_waiting(store: &Store, waiting: &WaitingWrite, deadline: Deadline<'_>) -> Result<Retried> {
+pub fn retry_waiting(
+    store: &Store,
+    waiting: &WaitingWrite,
+    deadline: Deadline<'_>,
+    allowed: FileWritesAllowed,
+) -> Result<Retried> {
     let Some(waiting) = store.waiting_write(waiting.result)?.filter(|w| w.id == waiting.id) else {
         return Ok(Retried::NoLongerWaiting);
     };
@@ -1304,7 +1352,7 @@ pub fn retry_waiting(store: &Store, waiting: &WaitingWrite, deadline: Deadline<'
     if store.open_applications()?.iter().any(|a| a.path == waiting.path) {
         return Ok(Retried::StillWaiting("An earlier write to this file is still being settled.".to_owned()));
     }
-    match apply(store, waiting.result, &waiting.fields, true, deadline) {
+    match apply(store, waiting.result, &waiting.fields, true, deadline, allowed) {
         Ok(applied) => Ok(Retried::Written(applied)),
         Err(IdentifyError::Deferred(message) | IdentifyError::OutOfTime(message)) => Ok(Retried::StillWaiting(message)),
         Err(e @ IdentifyError::Store(_)) => Err(e),
@@ -1327,7 +1375,7 @@ pub struct Undone {
 /// changed since the write), then the undo is recorded
 /// ([`Store::record_undo`]). The file only: a library side recorded by an
 /// older build (which also wrote the rekordbox library) is ignored.
-pub fn undo_result(store: &Store, result: ResultId) -> Result<Undone> {
+pub fn undo_result(store: &Store, result: ResultId, allowed: FileWritesAllowed) -> Result<Undone> {
     let (item, ..) = store.result(result)?.ok_or_else(|| refuse("That identification result is no longer in the store."))?;
     if !item.state.is_applied() {
         return Err(refuse("Only an applied result can be undone."));
@@ -1343,7 +1391,7 @@ pub fn undo_result(store: &Store, result: ResultId) -> Result<Undone> {
         .ok_or_else(|| refuse("The tags after this write were not recorded, so it cannot be checked and undone."))?;
     let path = Path::new(&item.path);
     let fields: Vec<Field> = application.changes.iter().map(|c| c.field).collect();
-    restore(path, &before, &after, &fields)?;
+    restore(path, &before, &after, &fields, allowed)?;
     store.record_undo(application.id)?;
     Ok(Undone { application: application.id })
 }
@@ -1352,6 +1400,9 @@ pub fn undo_result(store: &Store, result: ResultId) -> Result<Undone> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// These tests write their own temporary files.
+    const ALLOW: FileWritesAllowed = FileWritesAllowed { _granted: () };
 
     #[test]
     fn only_sharing_and_lock_violations_read_as_open_elsewhere() {
@@ -1483,12 +1534,12 @@ mod tests {
         let result = reviewed(&store, &audio);
         store.defer_write(result, &[Field::Title], OPEN_ELSEWHERE).unwrap();
         let original = std::fs::read(&audio).unwrap();
-        let error = apply_result(&store, result, &[Field::CatalogNumber]).unwrap_err().to_string();
+        let error = apply_result(&store, result, &[Field::CatalogNumber], ALLOW).unwrap_err().to_string();
         assert!(error.contains("already waiting"), "{error}");
         assert_eq!(std::fs::read(&audio).unwrap(), original);
         // Its retry is the one way to make it.
         let waiting = store.waiting_write(result).unwrap().unwrap();
-        assert!(matches!(retry_waiting(&store, &waiting, Deadline::NONE).unwrap(), Retried::Written(_)));
+        assert!(matches!(retry_waiting(&store, &waiting, Deadline::NONE, ALLOW).unwrap(), Retried::Written(_)));
         assert_eq!(current(&tags::read(&audio).unwrap().snapshot, Field::CatalogNumber), "", "only the waiting fields");
     }
 
@@ -1507,21 +1558,21 @@ mod tests {
         let stale = store.waiting_writes().unwrap().remove(0);
 
         store.cancel_waiting(result).unwrap();
-        assert_eq!(retry_waiting(&store, &stale, Deadline::NONE).unwrap(), Retried::NoLongerWaiting);
+        assert_eq!(retry_waiting(&store, &stale, Deadline::NONE, ALLOW).unwrap(), Retried::NoLongerWaiting);
         assert_eq!(std::fs::read(&audio).unwrap(), original, "a cancelled write is never made");
         assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Pending);
 
         // Accepted again with only the catalog number, the file still held.
         store.defer_write(result, &[Field::CatalogNumber], OPEN_ELSEWHERE).unwrap();
-        assert_eq!(retry_waiting(&store, &stale, Deadline::NONE).unwrap(), Retried::NoLongerWaiting);
+        assert_eq!(retry_waiting(&store, &stale, Deadline::NONE, ALLOW).unwrap(), Retried::NoLongerWaiting);
         assert_eq!(std::fs::read(&audio).unwrap(), original);
         let fresh = store.waiting_write(result).unwrap().unwrap();
         assert_eq!(fresh.fields, [Field::CatalogNumber]);
-        assert!(matches!(retry_waiting(&store, &fresh, Deadline::NONE).unwrap(), Retried::Written(_)));
+        assert!(matches!(retry_waiting(&store, &fresh, Deadline::NONE, ALLOW).unwrap(), Retried::Written(_)));
         let now = tags::read(&audio).unwrap().snapshot;
         assert_eq!((current(&now, Field::CatalogNumber).as_str(), current(&now, Field::Title).as_str()), ("CAT001", ""));
         // A second pass holding the same (now made) write skips it quietly.
-        assert_eq!(retry_waiting(&store, &fresh, Deadline::NONE).unwrap(), Retried::NoLongerWaiting);
+        assert_eq!(retry_waiting(&store, &fresh, Deadline::NONE, ALLOW).unwrap(), Retried::NoLongerWaiting);
         assert_eq!(store.count(Filter::Waiting).unwrap(), 0);
     }
 
@@ -1561,7 +1612,7 @@ mod tests {
             let clock = Ticking::default();
             let deadline = Deadline::new(&clock, Duration::from_secs(budget));
             let waiting = store.waiting_write(result).unwrap().unwrap();
-            match retry_waiting(&store, &waiting, deadline).unwrap() {
+            match retry_waiting(&store, &waiting, deadline, ALLOW).unwrap() {
                 Retried::StillWaiting(why) => {
                     stopped += 1;
                     assert!(why.contains("no time left"), "{why}");

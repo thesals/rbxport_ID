@@ -17,6 +17,13 @@
 //! snapshotted in the store before it is touched), so `identify_undo` can
 //! put the file back. Nothing here goes near the USB export path.
 //!
+//! Every audio-file write (apply, undo, a job's auto-apply, every retry of
+//! a waiting write) passes one gate first, [`IdentifyState::file_writes`]:
+//! while the user's "Write tags to audio files" setting is off (the
+//! default) it is refused with [`FILE_WRITES_OFF`], nothing is written, no
+//! waiting write is made and results stay as they are. Startup
+//! reconciliation never writes a file, so it runs either way.
+//!
 //! A write to a file another program holds open is not a failure: it is
 //! kept as a waiting write and tried again when the app starts (after
 //! reconciliation) and exits, before every job and every apply, and on
@@ -49,7 +56,7 @@ use rbl_identify::ratelimit::Limiters;
 use rbl_identify::store::{
     Filter, LibraryTrack, QueueItem, Reconciliation, RekordboxRecord, ResultId, ReviewState, Store, TrackKey,
 };
-use rbl_identify::write::Retried;
+use rbl_identify::write::{FileWritesAllowed, Retried};
 use rbl_identify::IdentifyError;
 use rbl_identify::transport::{HttpTransport, Transport};
 use serde::{Deserialize, Serialize};
@@ -68,6 +75,14 @@ pub const PROGRESS_EVENT: &str = "identify:progress";
 pub const RESULT_EVENT: &str = "identify:result";
 /// Results changed by apply, undo or bulk accept: `{ resultIds }`.
 pub const CHANGED_EVENT: &str = "identify:changed";
+
+/// What every write refused by the file-writes lock answers.
+pub const FILE_WRITES_OFF: &str =
+    "Writing to audio files is turned off. Turn on \"Write tags to audio files\" in Preferences → Identify to write.";
+
+/// The warning a job's auto-apply leaves on its result while the
+/// file-writes lock is on.
+pub const AUTO_APPLY_LOCKED: &str = "Not applied automatically: writing to audio files is turned off. It waits for review.";
 
 /// How long the exit pass may take, in all.
 pub const EXIT_BUDGET: Duration = Duration::from_secs(10);
@@ -192,6 +207,9 @@ pub struct IdentifyState {
     next_job: AtomicU32,
     /// Set once the exit pass has run.
     exited: AtomicBool,
+    /// No audio file is ever written, whatever the settings say (the
+    /// headless import, [`import`]).
+    never_write_files: bool,
 }
 
 impl Default for IdentifyState {
@@ -234,7 +252,22 @@ impl IdentifyState {
             progress: Mutex::new(None),
             next_job: AtomicU32::new(1),
             exited: AtomicBool::new(false),
+            never_write_files: false,
         }
+    }
+
+    /// THE file-writes gate: every write to an audio file (apply, undo, a
+    /// job's auto-apply, every waiting-write retry) asks here first, just
+    /// before it writes, and cannot write without the proof this hands out
+    /// (`rbl_identify::write` takes it). Reads the user's "Write tags to
+    /// audio files" setting afresh each time; off, unreadable or absent
+    /// means no. Refused (`Err`, [`FILE_WRITES_OFF`]) also whenever this
+    /// state was made never to write.
+    fn file_writes(&self) -> Result<FileWritesAllowed, String> {
+        if self.never_write_files {
+            return Err(FILE_WRITES_OFF.to_owned());
+        }
+        FileWritesAllowed::if_enabled(self.sources.stored().file_writes).ok_or_else(|| FILE_WRITES_OFF.to_owned())
     }
 
     fn store_path(&self) -> PathBuf {
@@ -393,11 +426,15 @@ impl IdentifyState {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
+            // Locked: a background pass (start, exit, a job's, an apply's)
+            // stops silently; every write keeps waiting as it is, to be
+            // made once writes are turned on again.
+            let Ok(allowed) = self.file_writes() else { break };
             // Read again under the lock: only the result's waiting write as
             // it is now is tried (one cancelled or replaced meanwhile, or
             // made by an overlapping pass, is skipped quietly).
             let tried = self.with_store_until(deadline, true, |store| {
-                Ok(rbl_identify::write::retry_waiting(store, waiting, self.deadline(deadline)).map_err(store_error))
+                Ok(rbl_identify::write::retry_waiting(store, waiting, self.deadline(deadline), allowed).map_err(store_error))
             });
             let outcome = match tried {
                 None => break,
@@ -418,6 +455,25 @@ impl IdentifyState {
             outcomes.push(outcome);
         }
         (outcomes, changed)
+    }
+
+    /// `identify_retry_waiting`, the user's Retry now: [`IdentifyState::retry_waiting`],
+    /// except that while the file-writes lock is on it answers a refusal
+    /// for each waiting write (which keeps waiting) and tries none.
+    pub(crate) fn retry_waiting_now(&self) -> (Vec<IdentifyWriteOutcomeDto>, Vec<ResultId>) {
+        if let Err(message) = self.file_writes() {
+            let waiting = match self.with_store_until(None, true, |store| store.waiting_writes().map_err(store_error)) {
+                Some(Ok(waiting)) => waiting,
+                Some(Err(e)) => {
+                    tracing::warn!(error = %e, "identify: the waiting writes could not be read");
+                    Vec::new()
+                }
+                None => Vec::new(),
+            };
+            let outcomes = waiting.iter().map(|w| IdentifyWriteOutcomeDto::failed(w.result, message.clone())).collect();
+            return (outcomes, Vec::new());
+        }
+        self.retry_waiting(None, &[])
     }
 
     /// The user gives up a waiting write: the result goes back to review.
@@ -806,7 +862,7 @@ fn identify_and_save(state: &IdentifyState, identifier: &dyn Identifier, track: 
             // at or above the threshold that fills empty fields): written now,
             // or left for review with the reason.
             if decision == Decision::AutoApply {
-                match auto_apply(store, id) {
+                match auto_apply(store, id, state.file_writes().ok()) {
                     Ok(AutoApplied::Written) => {}
                     Ok(AutoApplied::Waiting) => {
                         tracing::info!(result = id, "identify: an auto-apply waits for its file to be closed");
@@ -840,14 +896,21 @@ enum AutoApplied {
 /// sub-genre, never an overwrite; artwork only for a file without any).
 /// A file open in another program keeps it as a waiting write (still
 /// accepted, still decided auto-apply), written once the file is free.
-/// When it is not written otherwise the result becomes a pending review
-/// carrying the reason; the error is that reason.
-fn auto_apply(store: &Store, result: ResultId) -> Result<AutoApplied, String> {
+/// When it is not written otherwise (the file-writes lock among the
+/// reasons: `allowed` is the gate's answer) the result becomes a pending
+/// review carrying the reason; the error is that reason.
+fn auto_apply(store: &Store, result: ResultId, allowed: Option<FileWritesAllowed>) -> Result<AutoApplied, String> {
+    let Some(allowed) = allowed else {
+        if let Err(e) = store.demote_auto_apply(result, AUTO_APPLY_LOCKED) {
+            tracing::warn!(error = %e, "identify: an unwritten auto-apply could not be returned to review");
+        }
+        return Err(AUTO_APPLY_LOCKED.to_owned());
+    };
     let written = (|| {
         let (item, ..) = store.result(result).map_err(|e| e.to_string())?.ok_or("the result is not in the store")?;
         let proposal = item.proposal.as_ref().filter(|p| p.fills_only_empty()).ok_or("the proposal does not only fill empty fields")?;
         let fields: Vec<Field> = proposal.changes.iter().map(|c| c.field).collect();
-        match rbl_identify::write::apply_result(store, result, &fields) {
+        match rbl_identify::write::apply_result(store, result, &fields, allowed) {
             Ok(_) => Ok(AutoApplied::Written),
             Err(IdentifyError::Deferred(_)) => Ok(AutoApplied::Waiting),
             Err(e) => Err(e.to_string()),
@@ -922,6 +985,29 @@ fn spawn_job<R: tauri::Runtime>(
             Err(AppError::internal(format!("could not start the identify job: {e}")))
         }
     }
+}
+
+/// A job's tracks for these library ids, as [`resolve_tracks`] makes them,
+/// each with its library record as of now; the ISRCs come from `read`, a
+/// read-only query of the library, called per batch of ids. When it fails
+/// the records lack an ISRC rather than the job failing. Shared by
+/// `identify_start` and the headless import ([`import`]).
+pub(crate) fn job_tracks<E: std::fmt::Display>(
+    library: &rbl_index::Library,
+    ids: Vec<String>,
+    mut read: impl FnMut(&[String]) -> Result<std::collections::HashMap<String, String>, E>,
+) -> Vec<JobTrack> {
+    let mut isrcs = std::collections::HashMap::new();
+    for batch in ids.chunks(ISRC_CHUNK * 16) {
+        match read(batch) {
+            Ok(found) => isrcs.extend(found),
+            Err(e) => {
+                tracing::warn!(error = %e, "identify: the library's ISRCs could not be read");
+                break;
+            }
+        }
+    }
+    resolve_tracks(library, ids, &isrcs, now_unix())
 }
 
 /// The library's tracks for these ids, in order, each id once. A track the
@@ -1043,21 +1129,9 @@ pub async fn identify_start<R: tauri::Runtime>(
         identify.with_store(|_| Ok(()))?;
         // Writes waiting for their file to be closed go first.
         announce(&app, identify.retry_waiting(None, &[]).1);
-        // Read-only: the imported records lack an ISRC rather than the
-        // job failing when the library cannot be read.
         // The shared reader is taken per batch, so other readers get a turn
         // during a whole-library job.
-        let mut isrcs = std::collections::HashMap::new();
-        for batch in track_ids.chunks(ISRC_CHUNK * 16) {
-            match state.read_db(|db| read_isrcs(db, batch)) {
-                Ok(found) => isrcs.extend(found),
-                Err(e) => {
-                    tracing::warn!(error = %e, "identify: the library's ISRCs could not be read");
-                    break;
-                }
-            }
-        }
-        let tracks = resolve_tracks(&library, track_ids, &isrcs, now_unix());
+        let tracks = job_tracks(&library, track_ids, |batch| state.read_db(|db| read_isrcs(db, batch)));
         spawn_job(app, &identify, engine, tracks)
     })
     .await
@@ -1146,6 +1220,11 @@ impl IdentifyState {
     /// the write can be undone. The file only: never the library. A file
     /// open in another program is kept as a waiting write (`deferred`).
     fn apply_one(&self, item: &ApplyItemDto) -> IdentifyWriteOutcomeDto {
+        // Locked: refused before anything, so no waiting write is made.
+        let allowed = match self.file_writes() {
+            Ok(allowed) => allowed,
+            Err(message) => return IdentifyWriteOutcomeDto::failed(item.result_id, message),
+        };
         let fields = item
             .fields
             .iter()
@@ -1155,7 +1234,7 @@ impl IdentifyState {
             Ok(fields) => fields,
             Err(message) => return IdentifyWriteOutcomeDto::failed(item.result_id, message),
         };
-        let outcome = self.with_store(|store| Ok(rbl_identify::write::apply_result(store, item.result_id, &fields)));
+        let outcome = self.with_store(|store| Ok(rbl_identify::write::apply_result(store, item.result_id, &fields, allowed)));
         match outcome {
             Ok(Ok(_)) => IdentifyWriteOutcomeDto::written(item.result_id),
             Ok(Err(IdentifyError::Deferred(message))) => IdentifyWriteOutcomeDto::deferred(item.result_id, message),
@@ -1167,8 +1246,9 @@ impl IdentifyState {
     /// Undoes one result's write: the file's exact tags. A library side an
     /// older build recorded is ignored; the library is never written.
     fn undo_one(&self, result: ResultId) -> Result<(), String> {
+        let allowed = self.file_writes()?;
         let outcome = self.with_store(|store| {
-            Ok(rbl_identify::write::undo_result(store, result).map(|_| ()).map_err(|e| e.to_string()))
+            Ok(rbl_identify::write::undo_result(store, result, allowed).map(|_| ()).map_err(|e| e.to_string()))
         });
         flatten(outcome)
     }
@@ -1243,7 +1323,7 @@ pub async fn identify_retry_waiting<R: tauri::Runtime>(
     identify: State<'_, Arc<IdentifyState>>,
 ) -> AppResult<Vec<IdentifyWriteOutcomeDto>> {
     let identify = Arc::clone(&identify);
-    let (outcomes, changed) = blocking("identify_retry_waiting", move || Ok(identify.retry_waiting(None, &[]))).await?;
+    let (outcomes, changed) = blocking("identify_retry_waiting", move || Ok(identify.retry_waiting_now())).await?;
     announce(&app, changed);
     Ok(outcomes)
 }
@@ -1982,7 +2062,7 @@ mod tests {
     fn an_auto_apply_result_is_written_by_the_job_and_can_be_undone() {
         let files = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let state = IdentifyState::with_root(root.path());
+        let state = writable(root.path());
         let audio = files.path().join("auto.wav");
         wav(&audio);
         let original = std::fs::read(&audio).unwrap();
@@ -2010,7 +2090,7 @@ mod tests {
     fn an_auto_apply_that_cannot_be_written_is_left_for_review_and_the_job_goes_on() {
         let files = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let state = IdentifyState::with_root(root.path());
+        let state = writable(root.path());
         let audio = files.path().join("auto.wav");
         wav(&audio);
         let original = std::fs::read(&audio).unwrap();
@@ -2171,6 +2251,124 @@ mod tests {
         assert!(state.queue(QueueFilter::All, 0, u32::MAX).unwrap().items.len() <= MAX_ROWS as usize);
     }
 
+    /// For the tests that write their own temporary files directly.
+    fn test_writes() -> FileWritesAllowed {
+        FileWritesAllowed::if_enabled(true).unwrap()
+    }
+
+    /// Turns the user's "Write tags to audio files" setting on or off, as
+    /// Preferences does.
+    fn set_file_writes(state: &IdentifyState, on: bool) {
+        state.save_settings(&IdentifySettingsUpdateDto { file_writes: Some(on), ..Default::default() }).unwrap();
+    }
+
+    /// State in `root` whose user has turned file writes on: for the tests
+    /// that write (to their own temporary files).
+    fn writable(root: impl Into<PathBuf>) -> IdentifyState {
+        let state = IdentifyState::with_root(root);
+        set_file_writes(&state, true);
+        state
+    }
+
+    fn locked(result: ResultId) -> IdentifyWriteOutcomeDto {
+        IdentifyWriteOutcomeDto { result_id: result, ok: false, error: Some(FILE_WRITES_OFF.to_owned()), deferred: false }
+    }
+
+    #[test]
+    fn while_file_writes_are_off_apply_and_undo_are_refused_and_change_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        // Off by default.
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        assert!(!identify.settings().file_writes);
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let result = identified(&identify, &audio, "42", title);
+
+        assert_eq!(identify.apply_items(&ticked(result, &["title"])), [locked(result)]);
+        let (outcomes, changed) = identify.apply_with_retry(&ticked(result, &["title"]));
+        assert_eq!((outcomes, changed), (vec![locked(result)], Vec::new()));
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "nothing written");
+        let item = identify.detail(result).unwrap().item;
+        assert_eq!((item.state.as_str(), item.waiting), ("pending", None), "the result as it was");
+        assert_eq!(identify.queue(QueueFilter::Waiting, 0, 10).unwrap().total, 0, "no waiting write made");
+        assert_eq!(open_writes(&identify), 0);
+
+        // Turned on, it takes effect at the next write: no restart.
+        set_file_writes(&identify, true);
+        assert!(identify.apply_items(&ticked(result, &["title"]))[0].ok);
+        let written = std::fs::read(&audio).unwrap();
+        assert_ne!(written, original);
+
+        // Off again: undo is refused, and nothing changes.
+        set_file_writes(&identify, false);
+        assert_eq!(identify.undo_item(result), locked(result));
+        assert_eq!(std::fs::read(&audio).unwrap(), written);
+        assert_eq!(identify.detail(result).unwrap().item.state, "applied");
+        set_file_writes(&identify, true);
+        assert!(identify.undo_item(result).ok);
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+    }
+
+    #[test]
+    fn while_file_writes_are_off_a_jobs_auto_apply_is_left_for_review() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = IdentifyState::with_root(root.path());
+        let audio = files.path().join("auto.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let job = JobTrack { track_id: "1".into(), title: "auto".into(), path: Some(audio.to_string_lossy().into_owned()), rekordbox: None };
+        let events = run(&state, &[job], &Fake::new(), &AtomicBool::new(false));
+        let JobEvent::Result(done) = &events[1] else { panic!("expected a result") };
+        assert_eq!((done.decision, done.error.as_deref()), (ResultDecision::Review, None));
+        let Some(JobEvent::Progress(last)) = events.last() else { panic!("no final progress") };
+        assert_eq!((last.identified, last.review), (0, 1));
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "nothing written");
+        let item = state.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items.remove(0);
+        assert_eq!((item.state.as_str(), item.decision.as_str(), item.waiting), ("pending", "review", None));
+        let detail = state.detail(item.result_id).unwrap();
+        assert!(detail.warnings.iter().any(|w| w == AUTO_APPLY_LOCKED), "{:?}", detail.warnings);
+        assert_eq!(state.queue(QueueFilter::Waiting, 0, 10).unwrap().total, 0);
+        assert_eq!(open_writes(&state), 0);
+    }
+
+    #[test]
+    fn while_file_writes_are_off_no_waiting_write_is_tried() {
+        let dir = tempfile::tempdir().unwrap();
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let (audio, other) = (dir.path().join("waiting.wav"), dir.path().join("other.wav"));
+        wav(&audio);
+        wav(&other);
+        let original = std::fs::read(&audio).unwrap();
+        let result = identified(&identify, &audio, "1", title.clone());
+        let asked = identified(&identify, &other, "2", title);
+        // A write left waiting (made while writes were on).
+        identify
+            .with_store(|s| s.defer_write(result, &[Field::Title], rbl_identify::write::OPEN_ELSEWHERE).map_err(store_error))
+            .unwrap();
+
+        // Retry now answers a refusal; the start pass, an apply's pass (as
+        // a job's) and the exit pass skip it silently.
+        assert_eq!(identify.retry_waiting_now(), (vec![locked(result)], Vec::new()));
+        assert_eq!(identify.retry_waiting(None, &[]), (Vec::new(), Vec::new()));
+        assert_eq!(identify.settle_on_start(), Vec::<ResultId>::new());
+        let (outcomes, changed) = identify.apply_with_retry(&ticked(asked, &["title"]));
+        assert_eq!((outcomes, changed), (vec![locked(asked)], Vec::new()));
+        identify.settle_on_exit(EXIT_BUDGET);
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "nothing written");
+        let item = identify.detail(result).unwrap().item;
+        assert_eq!(item.state, "accepted");
+        assert!(item.waiting.is_some(), "still waiting");
+
+        // The next start, with writes turned on, writes it.
+        let next_run = writable(dir.path().join("identify"));
+        assert_eq!(next_run.settle_on_start(), [result]);
+        assert_eq!(next_run.detail(result).unwrap().item.state, "applied");
+    }
+
     /// State in `root` that sees no environment and no developer's file.
     fn isolated(root: &Path) -> IdentifyState {
         IdentifyState::with_sources(root.to_owned(), Vec::new(), Arc::new(|_: &str| None))
@@ -2327,7 +2525,7 @@ mod tests {
         wav(&audio);
         let original = std::fs::read(&audio).unwrap();
 
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let changes = vec![
             FieldChange { field: Field::Title, current: String::new(), proposed: "New Title (Extended Mix)".into() },
             FieldChange { field: Field::SubGenre, current: String::new(), proposed: "Tech House".into() },
@@ -2368,7 +2566,7 @@ mod tests {
         let audio = dir.path().join("track.wav");
         wav(&audio);
         let original = std::fs::read(&audio).unwrap();
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let result = identified(&identify, &audio, "42", title.clone());
         // As an older build recorded it: library values before and after.
@@ -2380,7 +2578,7 @@ mod tests {
                 let application =
                     store.begin_application(result, &title, None, &before, Some(library_before)).map_err(store_error)?;
                 let edits = rbl_identify::write::plan(&before, &title).map_err(store_error)?;
-                let after = rbl_identify::write::write(&audio, &before, &edits, None).map_err(store_error)?;
+                let after = rbl_identify::write::write(&audio, &before, &edits, None, test_writes()).map_err(store_error)?;
                 let key = TrackKey::for_file(&audio).map_err(store_error)?;
                 let library_after = r#"{"trackId":"42","values":[{"column":"Title","value":{"Text":"Mine"}}]}"#;
                 store.complete_application_with(application, &key, Some(&after), Some(library_after)).map_err(store_error)
@@ -2397,7 +2595,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("track.wav");
         wav(&audio);
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let result = identified(&identify, &audio, "42", title);
         let outcomes = identify.apply_items(&ticked(result, &["title"]));
@@ -2409,7 +2607,7 @@ mod tests {
             &[FieldChange { field: Field::Title, current: "Mine".into(), proposed: "By Hand".into() }],
         )
         .unwrap();
-        rbl_identify::write::write(&audio, &after, &edits, None).unwrap();
+        rbl_identify::write::write(&audio, &after, &edits, None, test_writes()).unwrap();
         let undone = identify.undo_item(result);
         assert!(!undone.ok);
         assert!(undone.error.as_deref().unwrap_or_default().contains("changed since"), "{undone:?}");
@@ -2489,7 +2687,7 @@ mod tests {
     #[test]
     fn startup_records_a_write_that_landed_and_frees_one_it_cannot_tell() {
         let dir = tempfile::tempdir().unwrap();
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let begin = |audio: &Path, result: ResultId| {
             identify
@@ -2507,7 +2705,7 @@ mod tests {
         let landed_result = identified(&identify, &landed, "1", title.clone());
         begin(&landed, landed_result);
         let before = tags::read(&landed).unwrap().snapshot;
-        rbl_identify::write::write(&landed, &before, &rbl_identify::write::plan(&before, &title).unwrap(), None).unwrap();
+        rbl_identify::write::write(&landed, &before, &rbl_identify::write::plan(&before, &title).unwrap(), None, test_writes()).unwrap();
         // Crash, then someone else retagged the file: cannot be told.
         let other = dir.path().join("other.wav");
         wav(&other);
@@ -2515,7 +2713,7 @@ mod tests {
         begin(&other, other_result);
         let before = tags::read(&other).unwrap().snapshot;
         let by_hand = [FieldChange { field: Field::Title, current: String::new(), proposed: "By Hand".into() }];
-        rbl_identify::write::write(&other, &before, &rbl_identify::write::plan(&before, &by_hand).unwrap(), None).unwrap();
+        rbl_identify::write::write(&other, &before, &rbl_identify::write::plan(&before, &by_hand).unwrap(), None, test_writes()).unwrap();
         let other_bytes = std::fs::read(&other).unwrap();
 
         identify.reconcile_on_startup();
@@ -2536,7 +2734,7 @@ mod tests {
     #[test]
     fn startup_leaves_a_write_open_while_its_file_cannot_be_read() {
         let dir = tempfile::tempdir().unwrap();
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let audio = dir.path().join("held.wav");
         wav(&audio);
@@ -2550,7 +2748,7 @@ mod tests {
             .unwrap();
         // The write landed, then the crash.
         let before = tags::read(&audio).unwrap().snapshot;
-        rbl_identify::write::write(&audio, &before, &rbl_identify::write::plan(&before, &title).unwrap(), None).unwrap();
+        rbl_identify::write::write(&audio, &before, &rbl_identify::write::plan(&before, &title).unwrap(), None, test_writes()).unwrap();
 
         let held = hold(&audio, 0);
         identify.reconcile_on_startup();
@@ -2605,7 +2803,7 @@ mod tests {
             let audio = dir.path().join("track.wav");
             wav(&audio);
             let original = std::fs::read(&audio).unwrap();
-            let identify = IdentifyState::with_root(dir.path().join("identify"));
+            let identify = writable(dir.path().join("identify"));
             let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
             let result = identified(&identify, &audio, "42", title);
 
@@ -2661,7 +2859,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("track.wav");
         wav(&audio);
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let result = identified(&identify, &audio, "42", title);
         let held = hold(&audio, FILE_SHARE_READ);
@@ -2670,7 +2868,7 @@ mod tests {
         // Someone retags the file before the retry.
         let before = tags::read(&audio).unwrap().snapshot;
         let by_hand = [FieldChange { field: Field::Title, current: String::new(), proposed: "By Hand".into() }];
-        rbl_identify::write::write(&audio, &before, &rbl_identify::write::plan(&before, &by_hand).unwrap(), None).unwrap();
+        rbl_identify::write::write(&audio, &before, &rbl_identify::write::plan(&before, &by_hand).unwrap(), None, test_writes()).unwrap();
         let retagged = std::fs::read(&audio).unwrap();
 
         let (tried, changed) = identify.retry_waiting(None, &[]);
@@ -2691,7 +2889,7 @@ mod tests {
         let audio = dir.path().join("track.wav");
         wav(&audio);
         let original = std::fs::read(&audio).unwrap();
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let result = identified(&identify, &audio, "42", title);
         let held = hold(&audio, FILE_SHARE_READ);
@@ -2725,7 +2923,7 @@ mod tests {
     fn a_jobs_auto_apply_to_a_held_file_waits_and_is_written_once_free() {
         let files = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let state = IdentifyState::with_root(root.path());
+        let state = writable(root.path());
         let audio = files.path().join("auto.wav");
         wav(&audio);
         let original = std::fs::read(&audio).unwrap();
@@ -2754,7 +2952,7 @@ mod tests {
     #[test]
     fn an_apply_first_tries_the_other_waiting_writes() {
         let dir = tempfile::tempdir().unwrap();
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let (first, second) = (dir.path().join("first.wav"), dir.path().join("second.wav"));
         wav(&first);
@@ -2777,7 +2975,7 @@ mod tests {
     #[test]
     fn overlapping_passes_write_each_waiting_write_once_without_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let identify = Arc::new(IdentifyState::with_root(dir.path().join("identify")));
+        let identify = Arc::new(writable(dir.path().join("identify")));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let mut results = Vec::new();
         for n in 0..6 {
@@ -2815,7 +3013,7 @@ mod tests {
         let audio = dir.path().join("track.wav");
         wav(&audio);
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let result = identified(&identify, &audio, "42", title);
         let held = hold(&audio, FILE_SHARE_READ);
         assert!(identify.apply_items(&ticked(result, &["title"]))[0].deferred);
@@ -2825,7 +3023,7 @@ mod tests {
         identify.settle_on_exit(EXIT_BUDGET);
         assert!(identify.detail(result).unwrap().item.waiting.is_some(), "only once per run");
 
-        let next_run = IdentifyState::with_root(dir.path().join("identify"));
+        let next_run = writable(dir.path().join("identify"));
         next_run.settle_on_exit(EXIT_BUDGET);
         let item = next_run.detail(result).unwrap().item;
         assert_eq!((item.state.as_str(), item.waiting), ("applied", None));
@@ -2848,7 +3046,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audio = dir.path().join("track.wav");
         wav(&audio);
-        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let identify = writable(dir.path().join("identify"));
         let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
         let result = identified(&identify, &audio, "42", title);
         assert!(identify.apply_items(&ticked(result, &["title"]))[0].ok);

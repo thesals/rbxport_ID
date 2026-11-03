@@ -1,5 +1,5 @@
-//! Identification's settings: the service keys, the genre policy and
-//! auto-apply.
+//! Identification's settings: the service keys, the genre policy,
+//! auto-apply and whether tags may be written to audio files at all.
 //!
 //! Secrets (the AcoustID key, the Discogs token) and the MusicBrainz user
 //! agent live in `.env.identify` in the identify data folder; the rest in
@@ -75,6 +75,9 @@ pub struct IdentifySettingsDto {
     pub genre_policy: GenrePolicyDto,
     pub auto_apply: bool,
     pub auto_apply_threshold: f64,
+    /// Whether identification may write tags to audio files at all (apply,
+    /// undo, auto-apply, waiting writes). Off by default.
+    pub file_writes: bool,
     /// The data-folder `.env.identify`, for display.
     pub settings_file: String,
 }
@@ -138,6 +141,8 @@ pub struct IdentifySettingsUpdateDto {
     pub auto_apply: Option<bool>,
     #[serde(default)]
     pub auto_apply_threshold: Option<f64>,
+    #[serde(default)]
+    pub file_writes: Option<bool>,
 }
 
 /// The non-secret settings, as `settings.json` holds them.
@@ -147,11 +152,19 @@ pub(crate) struct Stored {
     pub genre_policy: GenrePolicyDto,
     pub auto_apply: bool,
     pub auto_apply_threshold: f64,
+    /// The hard lock on audio-file writes: off (nothing is written) unless
+    /// the user turns it on.
+    pub file_writes: bool,
 }
 
 impl Default for Stored {
     fn default() -> Self {
-        Self { genre_policy: GenrePolicyDto::FillEmpty, auto_apply: false, auto_apply_threshold: DEFAULT_AUTO_APPLY_THRESHOLD }
+        Self {
+            genre_policy: GenrePolicyDto::FillEmpty,
+            auto_apply: false,
+            auto_apply_threshold: DEFAULT_AUTO_APPLY_THRESHOLD,
+            file_writes: false,
+        }
     }
 }
 
@@ -232,7 +245,7 @@ impl Sources {
     /// `settings.json` as saved (the defaults when there is none), a
     /// threshold out of range brought back into it; an error when the file
     /// is there but cannot be read or parsed.
-    fn read_stored(&self) -> Result<Stored, String> {
+    pub(crate) fn read_stored(&self) -> Result<Stored, String> {
         let mut stored = match std::fs::read(self.settings_json()) {
             Ok(bytes) => serde_json::from_slice::<Stored>(&bytes).map_err(|e| e.to_string())?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stored::default(),
@@ -256,6 +269,7 @@ impl Sources {
             genre_policy: stored.genre_policy,
             auto_apply: stored.auto_apply,
             auto_apply_threshold: stored.auto_apply_threshold,
+            file_writes: stored.file_writes,
             settings_file: self.env_file().display().to_string(),
         }
     }
@@ -290,7 +304,10 @@ impl Sources {
             }
             changes.push((MB_USER_AGENT, (!agent.is_empty()).then(|| agent.to_owned())));
         }
-        let non_secret = update.genre_policy.is_some() || update.auto_apply.is_some() || update.auto_apply_threshold.is_some();
+        let non_secret = update.genre_policy.is_some()
+            || update.auto_apply.is_some()
+            || update.auto_apply_threshold.is_some()
+            || update.file_writes.is_some();
         let json = if non_secret {
             let mut stored = self.read_stored().map_err(|e| {
                 AppError::new(
@@ -311,6 +328,9 @@ impl Sources {
             }
             if let Some(t) = update.auto_apply_threshold {
                 stored.auto_apply_threshold = t;
+            }
+            if let Some(on) = update.file_writes {
+                stored.file_writes = on;
             }
             Some(serde_json::to_vec_pretty(&stored).map_err(|e| AppError::internal(format!("identify settings: {e}")))?)
         } else {
@@ -646,8 +666,28 @@ mod tests {
     }
 
     #[test]
+    fn file_writes_are_off_by_default_and_saved_on_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sources(dir.path(), &[], Vec::new());
+        assert!(!s.dto().file_writes, "off with no settings file");
+        // A settings file from before the lock existed: still off.
+        std::fs::write(dir.path().join(SETTINGS_FILE), r#"{"autoApply":true}"#).unwrap();
+        assert!(!s.dto().file_writes && s.dto().auto_apply);
+        s.save(&update(r#"{"fileWrites":true}"#), || {}).unwrap();
+        let dto = s.dto();
+        assert!(dto.file_writes && dto.auto_apply, "the other settings are kept");
+        assert_eq!(serde_json::to_value(&dto).unwrap()["fileWrites"], true);
+        s.save(&update(r#"{"fileWrites":false}"#), || {}).unwrap();
+        assert!(!s.dto().file_writes);
+        // An unreadable file reads as off.
+        std::fs::write(dir.path().join(SETTINGS_FILE), "{ broken").unwrap();
+        assert!(!s.stored().file_writes);
+    }
+
+    #[test]
     fn the_stored_settings_become_the_pipeline_settings() {
-        let stored = Stored { genre_policy: GenrePolicyDto::Replace, auto_apply: true, auto_apply_threshold: 0.95 };
+        let stored =
+            Stored { genre_policy: GenrePolicyDto::Replace, auto_apply: true, auto_apply_threshold: 0.95, file_writes: true };
         assert_eq!(
             stored.pipeline(),
             pipeline::Settings { auto_apply: true, genre: GenrePolicy::Replace, auto_apply_threshold: 0.95 }

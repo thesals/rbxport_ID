@@ -42,7 +42,7 @@ Each service's rate limit is built in, so a large batch takes a while. MusicBrai
 
 **Write tags to audio files** is off by default. While it's off, identification only reads your files: proposals are saved for review, but nothing is written to any file. That includes Accept, Apply accepted, Undo, auto-apply and waiting writes. You can still review, reject and edit results, and mark them accepted with **Accept above**; they wait until writing is turned on.
 
-Turning it on asks you to confirm first. Waiting writes stay queued while it's off and are tried again once you turn it on.
+Turning it on asks you to confirm first. Waiting writes stay queued while it's off and are tried again once you turn it on. The lock is checked at every write, so switching it takes effect at once, even during a run.
 
 ### Genre
 
@@ -151,6 +151,6 @@ Everything lives in rbxport's data folder, under `rbxport\identify\` (on Windows
 |---|---|
 | `identify.db` | Results, candidates, the copied rekordbox records, the original tags used for undo, and history |
 | `.env.identify` | Your service keys |
-| `settings.json` | Genre policy and auto-apply settings |
+| `settings.json` | Genre policy, auto-apply and "Write tags to audio files" settings |
 
 Deleting the folder resets identification, without touching rekordbox or your music files. It also deletes your saved keys, and the original tags behind every applied change, so those changes can no longer be undone.

@@ -47,6 +47,11 @@ fn tag_len(file: &[u8]) -> usize {
     10 + file[6..10].iter().fold(0_usize, |acc, &x| (acc << 7) | usize::from(x & 0x7f))
 }
 
+/// These tests write only their own temporary copies.
+fn allow() -> write::FileWritesAllowed {
+    write::FileWritesAllowed::if_enabled(true).unwrap()
+}
+
 fn change(field: Field, current: &str, proposed: &str) -> FieldChange {
     FieldChange { field, current: current.into(), proposed: proposed.into() }
 }
@@ -68,7 +73,7 @@ fn an_id3v23_write_keeps_the_version_every_other_frame_and_the_audio() {
         change(Field::DiscogsReleaseId, "", "2509031"),
     ];
     let edits = write::plan(&before, &changes).unwrap();
-    let after = write::write(&path, &before, &edits, None).unwrap();
+    let after = write::write(&path, &before, &edits, None, allow()).unwrap();
     let written = std::fs::read(&path).unwrap();
 
     // The version is kept and the audio and ID3v1 trailer are untouched.
@@ -104,7 +109,7 @@ fn an_id3v23_write_keeps_the_version_every_other_frame_and_the_audio() {
 
     // Undo puts the exact bytes back.
     let fields: Vec<Field> = changes.iter().map(|c| c.field).collect();
-    write::restore(&path, &before, &after, &fields).unwrap();
+    write::restore(&path, &before, &after, &fields, allow()).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
@@ -117,7 +122,7 @@ fn the_comment_is_appended_to_once_and_an_id3v24_tag_stays_24() {
     let comment = rbl_identify::pipeline::current(&before, Field::SubGenre);
     assert_eq!(comment, "Purchased at Beatport.com", "read from COMM in the bogus language `Pur`");
     let sub = change(Field::SubGenre, &comment, "Purchased at Beatport.com; Minimal Techno; Acid");
-    let after = write::write(&path, &before, &write::plan(&before, std::slice::from_ref(&sub)).unwrap(), None).unwrap();
+    let after = write::write(&path, &before, &write::plan(&before, std::slice::from_ref(&sub)).unwrap(), None, allow()).unwrap();
     let written = std::fs::read(&path).unwrap();
     assert_eq!(written[3], 4);
     let now = rbl_identify::pipeline::current(&after, Field::SubGenre);
@@ -131,7 +136,7 @@ fn the_comment_is_appended_to_once_and_an_id3v24_tag_stays_24() {
     let (_, new) = frames(&written);
     let comm = new.iter().find(|f| f.0 == "COMM").unwrap();
     assert_eq!(&comm.1[11..14], b"Pur");
-    write::restore(&path, &before, &after, &[Field::SubGenre]).unwrap();
+    write::restore(&path, &before, &after, &[Field::SubGenre], allow()).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
@@ -154,13 +159,13 @@ fn undo_is_refused_once_the_file_has_changed_since_the_write() {
     let before = tags::read(&path).unwrap().snapshot;
     let label = rbl_identify::pipeline::current(&before, Field::Label);
     let edits = write::plan(&before, &[change(Field::Label, &label, "Other Label")]).unwrap();
-    let after = write::write(&path, &before, &edits, None).unwrap();
+    let after = write::write(&path, &before, &edits, None, allow()).unwrap();
     // Someone edits the title afterwards.
     let title = rbl_identify::pipeline::current(&after, Field::Title);
     let edits = write::plan(&after, &[change(Field::Title, &title, "Edited By Hand")]).unwrap();
-    let edited = write::write(&path, &after, &edits, None).unwrap();
+    let edited = write::write(&path, &after, &edits, None, allow()).unwrap();
     let bytes = std::fs::read(&path).unwrap();
-    let error = write::restore(&path, &before, &after, &[Field::Label]).unwrap_err();
+    let error = write::restore(&path, &before, &after, &[Field::Label], allow()).unwrap_err();
     assert!(matches!(error, IdentifyError::Write(_)), "{error}");
     assert!(error.to_string().contains("changed since"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), bytes, "nothing was touched");
@@ -177,7 +182,7 @@ fn a_read_only_file_is_refused_and_left_alone() {
     std::fs::set_permissions(&path, permissions.clone()).unwrap();
     let before = tags::read(&path).unwrap().snapshot;
     let edits = write::plan(&before, &[change(Field::DiscogsReleaseId, "", "1")]).unwrap();
-    let error = write::write(&path, &before, &edits, None).unwrap_err().to_string();
+    let error = write::write(&path, &before, &edits, None, allow()).unwrap_err().to_string();
     assert!(error.contains("read-only"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), original);
     #[allow(clippy::permissions_set_readonly_false)]
@@ -197,12 +202,12 @@ fn a_flac_file_is_written_through_lofty_and_undone_field_by_field() {
         change(Field::SubGenre, "", "Tech House"),
         change(Field::CatalogNumber, "", "CAT001"),
     ];
-    let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+    let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None, allow()).unwrap();
     assert_eq!(after.format, "VorbisComments");
     assert_eq!(rbl_identify::pipeline::current(&after, Field::Title), "A Title (Extended Mix)");
     assert_eq!(rbl_identify::pipeline::current(&after, Field::SubGenre), "Tech House");
     let fields: Vec<Field> = changes.iter().map(|c| c.field).collect();
-    write::restore(&path, &before, &after, &fields).unwrap();
+    write::restore(&path, &before, &after, &fields, allow()).unwrap();
     let back = tags::read(&path).unwrap().snapshot;
     for field in fields {
         assert_eq!(
@@ -239,7 +244,7 @@ fn an_applied_result_is_recorded_and_undone_through_the_store() {
     );
 
     // Only the ticked field is written.
-    let applied = write::apply_result(&store, result, &[Field::SubGenre]).unwrap();
+    let applied = write::apply_result(&store, result, &[Field::SubGenre], allow()).unwrap();
     assert_eq!(
         store.application(applied.application).unwrap().unwrap().changes[0].proposed,
         format!("{comment}; Deep House")
@@ -251,10 +256,10 @@ fn an_applied_result_is_recorded_and_undone_through_the_store() {
     assert_eq!(store.application_after_snapshot(applied.application).unwrap(), Some(applied.after.clone()));
     assert_eq!(store.list(Filter::Applied, 0, 10).unwrap().len(), 1);
 
-    write::undo_result(&store, result).unwrap();
+    write::undo_result(&store, result, allow()).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), original, "byte for byte");
     assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Undone);
-    assert!(write::undo_result(&store, result).is_err(), "once");
+    assert!(write::undo_result(&store, result, allow()).is_err(), "once");
 }
 
 #[test]
@@ -268,14 +273,14 @@ fn a_refused_apply_leaves_the_file_and_the_result_as_they_were() {
     let result = pending(&store, &path, vec![change(Field::Label, &label, "New Label"), change(Field::Isrc, "x", "y")]);
 
     // A stale field (the file's ISRC is not "x") is refused before anything.
-    let error = write::apply_result(&store, result, &[Field::Label, Field::Isrc]).unwrap_err();
+    let error = write::apply_result(&store, result, &[Field::Label, Field::Isrc], allow()).unwrap_err();
     assert!(error.to_string().contains("changed since"), "{error}");
     assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Pending);
     // A field the proposal does not list is refused.
-    assert!(write::apply_result(&store, result, &[Field::Genre]).is_err());
+    assert!(write::apply_result(&store, result, &[Field::Genre], allow()).is_err());
     // A rejected result is not written.
     store.set_state(result, ReviewState::Rejected).unwrap();
-    assert!(write::apply_result(&store, result, &[Field::Label]).is_err());
+    assert!(write::apply_result(&store, result, &[Field::Label], allow()).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), original);
 }
 
@@ -327,11 +332,11 @@ fn wav_and_aiff_files_are_written_and_undone() {
             change(Field::Artist, "", "Someone"),
             change(Field::SubGenre, "", "Tech House"),
         ];
-        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None, allow()).unwrap();
         assert_eq!(rbl_identify::pipeline::current(&after, Field::Title), "Wave Title", "{name}");
         assert_eq!(rbl_identify::pipeline::current(&after, Field::SubGenre), "Tech House", "{name}");
         let fields: Vec<Field> = changes.iter().map(|c| c.field).collect();
-        write::restore(&path, &before, &after, &fields).unwrap();
+        write::restore(&path, &before, &after, &fields, allow()).unwrap();
         let back = tags::read(&path).unwrap().snapshot;
         for field in fields {
             assert_eq!(rbl_identify::pipeline::current(&back, field), "", "{name} {field:?}");
@@ -458,13 +463,13 @@ fn synthetic_mp3s_keep_their_version_frames_and_audio_and_undo_exactly() {
         let before = tags::read(&path).unwrap().snapshot;
         assert_eq!(rbl_identify::pipeline::current(&before, Field::SubGenre), "Purchased at Beatport.com");
         let changes = store_changes();
-        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None, allow()).unwrap();
         let written = std::fs::read(&path).unwrap();
         assert_eq!(written.len(), file.len(), "fits in the padding");
         check_store_write(&tag, &written[..tag.len()], version);
         assert_eq!(&written[tag.len()..], &file[tag.len()..], "audio and ID3v1 untouched");
 
-        write::restore(&path, &before, &after, &[Field::CatalogNumber, Field::SubGenre]).unwrap();
+        write::restore(&path, &before, &after, &[Field::CatalogNumber, Field::SubGenre], allow()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), file, "v2.{version} undo is byte for byte");
     }
 }
@@ -477,12 +482,12 @@ fn an_mp3_without_a_tag_gets_one_and_loses_it_on_undo() {
     std::fs::write(&path, &file).unwrap();
     let before = tags::read(&path).unwrap().snapshot;
     let changes = [change(Field::Title, "", "Bare"), change(Field::SubGenre, "", "Acid")];
-    let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+    let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None, allow()).unwrap();
     let written = std::fs::read(&path).unwrap();
     assert_eq!(written[3], 3, "a new tag is ID3v2.3");
     assert!(written.ends_with(&file));
     assert_eq!(rbl_identify::pipeline::current(&after, Field::SubGenre), "Acid");
-    write::restore(&path, &before, &after, &[Field::Title, Field::SubGenre]).unwrap();
+    write::restore(&path, &before, &after, &[Field::Title, Field::SubGenre], allow()).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), file);
 }
 
@@ -546,7 +551,7 @@ fn aiff_and_wav_id3_chunks_are_edited_frame_by_frame() {
             "neither iTunNORM nor the ID3v1 Comment is the comment"
         );
         let changes = [change(Field::CatalogNumber, "ANCD2K10E", "ANCD2K10X"), change(Field::SubGenre, "", "Tech House")];
-        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None).unwrap();
+        let after = write::write(&path, &before, &write::plan(&before, &changes).unwrap(), None, allow()).unwrap();
         assert_eq!(rbl_identify::pipeline::current(&after, Field::SubGenre), "Tech House");
         let written = std::fs::read(&path).unwrap();
         // The audio chunk is where it was, byte for byte, and the sizes add up.
@@ -572,7 +577,7 @@ fn aiff_and_wav_id3_chunks_are_edited_frame_by_frame() {
         }
         assert!(String::from_utf8_lossy(&new.last().unwrap().1).ends_with("\0Tech House"));
 
-        write::restore(&path, &before, &after, &[Field::CatalogNumber, Field::SubGenre]).unwrap();
+        write::restore(&path, &before, &after, &[Field::CatalogNumber, Field::SubGenre], allow()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), file, "undo is byte for byte");
     }
 }
