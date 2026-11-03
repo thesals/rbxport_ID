@@ -302,11 +302,17 @@ impl IdentifyState {
     /// with. Blocking: call from a worker thread.
     pub(crate) fn save_settings(&self, update: &IdentifySettingsUpdateDto) -> AppResult<IdentifySettingsDto> {
         let _saving = self.settings_lock.lock();
-        // Dropped from the cache before the first file is written, so even
-        // a save that fails halfway leaves no engine built from the old
-        // settings.
+        // The engine slot stays locked across the writes: a job starting
+        // meanwhile waits in `engine()` and then builds from the new files,
+        // never caching one from the old ones. The cached engine is dropped
+        // before the first file is written, so even a save that fails
+        // halfway leaves none built from the old settings. (Lock order:
+        // settings, then engine; `engine()` takes only the engine lock.)
         let mut old = None;
-        let saved = self.sources.save(update, || old = self.engine.lock().take());
+        let saved = {
+            let mut slot = self.engine.lock();
+            self.sources.save(update, || old = slot.take())
+        };
         // reqwest's blocking client must not be dropped on the async
         // runtime; a running job's own Arc keeps it alive meanwhile.
         if let Some(old) = old {
@@ -1957,6 +1963,30 @@ mod tests {
         let next = state.engine().unwrap();
         assert!(!Arc::ptr_eq(&first, &next), "not the services built from the old settings");
         assert!(next.settings.auto_apply, "the settings that were written are used");
+    }
+
+    #[test]
+    fn a_job_starting_during_a_save_never_caches_the_old_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(isolated(dir.path()));
+        let keys: IdentifySettingsUpdateDto =
+            serde_json::from_str(r#"{"acoustidKey":"sekrit-key","mbUserAgent":"rbxport-test/1 ( a@b.c )"}"#).unwrap();
+        state.save_settings(&keys).unwrap();
+        for round in 0..20 {
+            let on = round % 2 == 0;
+            let change: IdentifySettingsUpdateDto = serde_json::from_str(&format!(r#"{{"autoApply":{on}}}"#)).unwrap();
+            let starter = {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        drop(state.engine().unwrap());
+                    }
+                })
+            };
+            state.save_settings(&change).unwrap();
+            starter.join().unwrap();
+            assert_eq!(state.engine().unwrap().settings.auto_apply, on, "round {round}");
+        }
     }
 
     /// One second of silent 16-bit mono WAV.
