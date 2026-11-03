@@ -326,7 +326,10 @@ export function IdentifyPane() {
           />
         </label>
         <p id={`${id}-auto-help`} className={layout.help}>
-          {t("When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under Applied (undoable); if the write fails, it stays under Needs review. Everything else waits for review. Off by default.")}
+          {t("When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.", {
+            // The review queue's own filter names, in the same words.
+            applied: t("Applied (undoable)"), needsReview: t("Needs review"),
+          })}
         </p>
         <div className={styles.actions}>
           <label htmlFor={`${id}-threshold`}>{t("Minimum score")}</label>
