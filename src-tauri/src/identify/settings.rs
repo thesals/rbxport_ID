@@ -282,6 +282,12 @@ impl Sources {
         update.discogs_token.push_to(DISCOGS_TOKEN, &mut changes);
         if let Some(agent) = &update.mb_user_agent {
             let agent = agent.trim();
+            if !valid_header_value(agent) {
+                return Err(AppError::new(
+                    ErrorKind::Malformed,
+                    "The MusicBrainz user agent can hold only plain ASCII letters, digits, spaces and punctuation.",
+                ));
+            }
             changes.push((MB_USER_AGENT, (!agent.is_empty()).then(|| agent.to_owned())));
         }
         let non_secret = update.genre_policy.is_some() || update.auto_apply.is_some() || update.auto_apply_threshold.is_some();
@@ -341,6 +347,12 @@ impl Sources {
         }
         Ok(())
     }
+}
+
+/// Whether `value` can be sent as an HTTP header value as it is: visible
+/// ASCII and spaces only (no control characters, no other bytes).
+fn valid_header_value(value: &str) -> bool {
+    value.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
 }
 
 /// A `.env.identify`'s text, without a BOM; `None` when it cannot be read.
@@ -600,6 +612,19 @@ mod tests {
         s.save(&update(r#"{"acoustidKey":"k"}"#), || {}).unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap(), "{ hand edited");
         assert_eq!(s.resolve(ACOUSTID_KEY).map(|r| r.1), Some(KeySource::Settings));
+    }
+
+    #[test]
+    fn the_user_agent_must_be_a_valid_header_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sources(dir.path(), &[], Vec::new());
+        for bad in ["rbxport/1 ( m\u{e9}@x.org )", "ua\u{7f}", "ua\tone"] {
+            let error = s.save(&IdentifySettingsUpdateDto { mb_user_agent: Some(bad.into()), ..Default::default() }, || {}).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Malformed, "{bad:?}");
+        }
+        assert_eq!(s.resolve(MB_USER_AGENT), None, "nothing saved");
+        s.save(&update(r#"{"mbUserAgent":"rbxport/1.2 ( me@example.org )"}"#), || {}).unwrap();
+        assert_eq!(s.dto().mb_user_agent, "rbxport/1.2 ( me@example.org )");
     }
 
     #[test]
