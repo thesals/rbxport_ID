@@ -5,9 +5,13 @@
  *
  * Keys are secrets. The backend reports only where each comes from, never
  * its value; a new one is typed into an empty password box and sent once,
- * and nothing here keeps or shows it afterwards. A key from the environment
- * or the development file is not stored in the settings file, so it cannot
- * be cleared from here.
+ * and nothing here keeps or shows it afterwards.
+ *
+ * The backend reads a key from the environment first, then the data
+ * folder's `.env.identify` (which this pane writes), then a development
+ * checkout's. So an environment variable cannot be replaced or cleared from
+ * here at all, and a development-file key can be replaced (the saved one
+ * wins) but not cleared.
  *
  * Every save sends only what changed: an absent member is kept, a null key
  * is cleared.
@@ -43,11 +47,19 @@ function sourceText(source: IdentifyKeySource, t: Translate): string {
   }
 }
 
-/** Why a key cannot be cleared here, or null when it can. */
-function lockedReason(source: IdentifyKeySource, t: Translate): string | null {
+/** The development file's name: a file name, never translated. */
+const DEV_FILE = ".env.identify";
+
+/**
+ * Why a value cannot be changed or cleared here, or null when it can. The
+ * variable and file names go in as values so no translation touches them.
+ */
+function lockedReason(source: IdentifyKeySource, variable: string, t: Translate): string | null {
   switch (source) {
-    case "environment": return t("This key comes from an environment variable, so it can't be cleared here.");
-    case "devFile": return t("This key comes from the development file .env.identify, so it can't be cleared here.");
+    case "environment":
+      return t("The environment variable {variable} sets this and takes priority over anything saved here. Change or remove it outside rbxport.", { variable });
+    case "devFile":
+      return t("This comes from the development file {file}, which can't be changed here. A value saved here takes priority over it.", { file: DEV_FILE });
     default: return null;
   }
 }
@@ -58,8 +70,10 @@ function Link({ url }: { url: string }) {
   return <button type="button" role="link" className={styles.link} onClick={open}>{url}</button>;
 }
 
-function KeyCard({ name, source, getAt, busy, error, onSave }: {
+function KeyCard({ name, variable, source, getAt, busy, error, onSave }: {
   name: string;
+  /** The environment variable that would set it. */
+  variable: string;
   source: IdentifyKeySource;
   /** Where to get one, without the scheme. */
   getAt: string;
@@ -73,7 +87,7 @@ function KeyCard({ name, source, getAt, busy, error, onSave }: {
   const [editing, setEditing] = useState(false);
   // Only ever what the user is typing now; never filled from the backend.
   const [value, setValue] = useState("");
-  const locked = lockedReason(source, t);
+  const locked = lockedReason(source, variable, t);
   const close = () => {
     setEditing(false);
     setValue("");
@@ -86,7 +100,7 @@ function KeyCard({ name, source, getAt, busy, error, onSave }: {
     <section className={`${layout.card} ${styles.card}`} aria-label={name}>
       <strong id={`${id}-name`}>{name}</strong>
       <p className={styles.status} data-set={source !== null || undefined} role="status">{sourceText(source, t)}</p>
-      {editing ? (
+      {editing && source !== "environment" ? (
         <form className={styles.actions} onSubmit={(event) => { event.preventDefault(); void save(); }}>
           <input
             type="password"
@@ -110,10 +124,13 @@ function KeyCard({ name, source, getAt, busy, error, onSave }: {
         </form>
       ) : (
         <div className={styles.actions}>
-          <button type="button" className={controls.button} aria-describedby={`${id}-name`} disabled={busy}
-            onClick={() => setEditing(true)}>
-            {source === null ? t("Add…") : t("Replace…")}
-          </button>
+          {/* Saving under an environment variable would change nothing: the variable wins. */}
+          {source !== "environment" ? (
+            <button type="button" className={controls.button} aria-describedby={`${id}-name`} disabled={busy}
+              onClick={() => setEditing(true)}>
+              {source === null ? t("Add…") : t("Replace…")}
+            </button>
+          ) : null}
           {source === "settings" ? (
             <button type="button" className={controls.button} aria-label={t("Remove {name}", { name })} disabled={busy}
               onClick={() => void onSave(null)}>
@@ -208,6 +225,9 @@ export function IdentifyPane() {
       help: t("Leave Genre alone.") },
   ];
 
+  const agentFromEnvironment = settings.mbUserAgentSource === "environment";
+  const agentLocked = lockedReason(settings.mbUserAgentSource, "MB_USER_AGENT", t);
+
   return (
     <Section title={t("Identify")}>
       <p className={`${layout.help} ${styles.intro}`}>
@@ -216,6 +236,7 @@ export function IdentifyPane() {
 
       <KeyCard
         name={t("AcoustID API key")}
+        variable="ACOUSTID_API_KEY"
         source={settings.acoustidKey}
         getAt="acoustid.org/new-application"
         busy={busy}
@@ -224,6 +245,7 @@ export function IdentifyPane() {
       />
       <KeyCard
         name={t("Discogs personal token")}
+        variable="DISCOGS_TOKEN"
         source={settings.discogsToken}
         getAt="discogs.com/settings/developers"
         busy={busy}
@@ -247,15 +269,18 @@ export function IdentifyPane() {
             spellCheck={false}
             placeholder="rbxport/1.2 ( you@example.com )"
             value={agent}
+            disabled={agentFromEnvironment}
             onChange={(event) => setAgent(event.target.value)}
           />
-          <button type="submit" className={controls.button} disabled={busy || agent.trim() === settings.mbUserAgent}>
+          <button type="submit" className={controls.button}
+            disabled={busy || agentFromEnvironment || agent.trim() === settings.mbUserAgent}>
             {t("Save")}
           </button>
         </form>
         <p className={layout.help}>
           {t("MusicBrainz asks every app to name itself and a contact, in the form App/version ( contact ).")}
         </p>
+        {agentLocked !== null ? <p className={layout.help}>{agentLocked}</p> : null}
         {errors.mbUserAgent !== undefined ? <p className={styles.error} role="alert">{errors.mbUserAgent}</p> : null}
       </section>
 

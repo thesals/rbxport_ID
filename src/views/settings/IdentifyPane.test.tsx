@@ -129,16 +129,25 @@ describe("IdentifyPane", () => {
     expect(auto.querySelector('[role="alert"]')).toBeNull();
   });
 
-  it("does not offer to clear a key that comes from the environment", async () => {
-    await render({ settings: { discogsToken: "environment", acoustidKey: "devFile" } });
+  it("leaves a key from the environment alone, and lets a development-file key be replaced but not cleared", async () => {
+    await render({ settings: { discogsToken: "environment", acoustidKey: "devFile", mbUserAgentSource: "environment" } });
     const discogs = card("Discogs personal token");
     expect(discogs.textContent).toContain("Set (from environment)");
+    // The variable wins over anything saved, so neither change is offered.
     expect(buttonIn(discogs, "Remove Discogs personal token")).toBeUndefined();
-    expect(discogs.textContent).toContain("comes from an environment variable, so it can't be cleared here");
-    expect(buttonIn(discogs, "Replace…")).toBeDefined();
+    expect(buttonIn(discogs, "Replace…")).toBeUndefined();
+    expect(discogs.textContent).toContain("The environment variable DISCOGS_TOKEN sets this and takes priority");
+    expect(discogs.textContent).toContain("Change or remove it outside rbxport.");
+
     const acoustid = card("AcoustID API key");
     expect(buttonIn(acoustid, "Remove AcoustID API key")).toBeUndefined();
-    expect(acoustid.textContent).toContain(".env.identify");
+    expect(buttonIn(acoustid, "Replace…")).toBeDefined();
+    expect(acoustid.textContent).toContain("development file .env.identify");
+    expect(acoustid.textContent).toContain("A value saved here takes priority over it.");
+
+    const agent = card("MusicBrainz user agent");
+    expect(agent.querySelector<HTMLInputElement>('input[type="text"]')?.disabled).toBe(true);
+    expect(agent.textContent).toContain("The environment variable MB_USER_AGENT sets this");
   });
 
   it("shows a refused save beside the control, and the settings file", async () => {
