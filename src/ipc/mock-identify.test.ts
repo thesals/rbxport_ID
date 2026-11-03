@@ -200,10 +200,16 @@ describe("mock identify", () => {
     const saved = await identify.saveSettings({ acoustidKey: "secret-key", genrePolicy: "never" });
     expect(saved).toMatchObject({ acoustidKey: "settings", discogsToken: "environment", genrePolicy: "never" });
     expect(JSON.stringify(saved)).not.toContain("secret-key");
-    // Clearing the stored token leaves the environment's in place.
-    expect(await identify.saveSettings({ discogsToken: "token" })).toMatchObject({ discogsToken: "settings" });
+    // The environment beats a saved token, as Sources::resolve does.
+    expect(await identify.saveSettings({ discogsToken: "token" })).toMatchObject({ discogsToken: "environment" });
     expect(await identify.saveSettings({ discogsToken: null })).toMatchObject({ discogsToken: "environment" });
+    expect((await identify.settings()).settingsFile).toMatch(/\.env\.identify$/);
     expect(await identify.saveSettings({ acoustidKey: null })).toMatchObject({ acoustidKey: null });
+    // A saved key beats the development file, and clearing it goes back to that file's.
+    const dev = createMockIdentify({ settings: { acoustidKey: "devFile", mbUserAgent: "env/1 ( e )", mbUserAgentSource: "environment" } });
+    expect(await dev.saveSettings({ acoustidKey: "k" })).toMatchObject({ acoustidKey: "settings" });
+    expect(await dev.saveSettings({ acoustidKey: null })).toMatchObject({ acoustidKey: "devFile" });
+    expect(await dev.saveSettings({ mbUserAgent: "mine/2 ( m )" })).toMatchObject({ mbUserAgent: "env/1 ( e )", mbUserAgentSource: "environment" });
     await expect(identify.saveSettings({ autoApplyThreshold: 0.91 })).rejects.toMatchObject({ kind: "malformed" });
     await expect(identify.saveSettings({ autoApplyThreshold: 1.01 })).rejects.toMatchObject({ kind: "malformed" });
     expect(await identify.saveSettings({ autoApply: true, autoApplyThreshold: 0.95 })).toMatchObject({ autoApply: true, autoApplyThreshold: 0.95 });

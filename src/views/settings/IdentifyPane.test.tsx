@@ -152,7 +152,7 @@ describe("IdentifyPane", () => {
 
   it("shows a refused save beside the control, and the settings file", async () => {
     await render();
-    expect(host.textContent).toContain("identify\\settings.json");
+    expect(host.textContent).toContain("identify\\.env.identify");
     save.mockRejectedValueOnce(Object.assign(new Error("The settings file could not be written."), { kind: "io" }));
     const genre = card("Genre");
     await click([...genre.querySelectorAll<HTMLInputElement>('input[type="radio"]')].find((r) => r.value === "never"));

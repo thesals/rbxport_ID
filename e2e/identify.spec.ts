@@ -113,7 +113,7 @@ test("the Identify settings pane reports keys by source and saves a change", asy
   const discogs = dialog.getByRole("region", { name: "Discogs personal token" });
   await expect(discogs).toContainText("Set (from environment)");
   await expect(discogs.getByRole("button", { name: "Remove Discogs personal token" })).toHaveCount(0);
-  await expect(dialog).toContainText("identify\\settings.json");
+  await expect(dialog).toContainText("identify\\.env.identify");
 
   await acoustid.getByRole("button", { name: "Replace…" }).click();
   const key = acoustid.getByLabel("New AcoustID API key");

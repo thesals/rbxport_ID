@@ -15,7 +15,7 @@
 import type {
   AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyChangedEvent, IdentifyDecision, IdentifyDetail, IdentifyFieldChange,
   IdentifyFilter, IdentifyProgress, IdentifyQueueItem, IdentifyResultEvent, IdentifyReviewAction, IdentifyReviewState,
-  IdentifySettings, IdentifyWriteOutcome,
+  IdentifyKeySource, IdentifySettings, IdentifyWriteOutcome,
 } from "./types";
 
 /** The most rows one queue call answers, as `MAX_ROWS` is in Rust. */
@@ -30,8 +30,32 @@ export interface MockIdentifyOptions {
   settings?: Partial<IdentifySettings>;
 }
 
-/** Keys found in the environment or the development file, which this window cannot clear. */
-type KeyOrigin = "devFile" | "environment" | null;
+/**
+ * Where a value can be found, by layer. The backend resolves environment
+ * first, then the data folder's `.env.identify` (what a save writes), then
+ * a development checkout's `.env.identify` (`Sources::resolve`).
+ */
+interface Layers<T> {
+  environment: T | null;
+  saved: T | null;
+  devFile: T | null;
+}
+
+function resolve<T>(layers: Layers<T>): [T | null, IdentifyKeySource] {
+  if (layers.environment !== null) return [layers.environment, "environment"];
+  if (layers.saved !== null) return [layers.saved, "settings"];
+  if (layers.devFile !== null) return [layers.devFile, "devFile"];
+  return [null, null];
+}
+
+/** Layers holding one value at the reported source. */
+function layersAt<T>(source: IdentifyKeySource, value: T): Layers<T> {
+  return {
+    environment: source === "environment" ? value : null,
+    saved: source === "settings" ? value : null,
+    devFile: source === "devFile" ? value : null,
+  };
+}
 
 type Outcome = IdentifyDecision | "failed";
 /** What the tracks of a job come out as, in turn. */
@@ -108,19 +132,21 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   let nextJob = 1;
   let running: { jobId: number; cancelled: boolean } | null = null;
   let last: IdentifyProgress | null = null;
-  // Settings: a stored key is only ever known by where it came from.
+  // Settings: a key is only ever known by where it came from, so its layers
+  // hold `true` for "a key is here".
   let settings: IdentifySettings = {
     acoustidKey: "settings", discogsToken: "environment",
     mbUserAgent: "rbxport/1.2.0 ( dj@example.com )", mbUserAgentSource: "settings",
     genrePolicy: "fillEmpty", autoApply: false, autoApplyThreshold: 0.92,
-    settingsFile: "C:\\Users\\dj\\AppData\\Roaming\\rbxport\\identify\\settings.json",
+    // The file a save writes: the data folder's `.env.identify`.
+    settingsFile: "C:\\Users\\dj\\AppData\\Roaming\\rbxport\\identify\\.env.identify",
     ...options.settings,
   };
-  /** What a key falls back to once its stored value is cleared. */
-  const origins: Record<"acoustidKey" | "discogsToken", KeyOrigin> = {
-    acoustidKey: settings.acoustidKey === "settings" ? null : settings.acoustidKey,
-    discogsToken: settings.discogsToken === "settings" ? null : settings.discogsToken,
+  const keys = {
+    acoustidKey: layersAt(settings.acoustidKey, true),
+    discogsToken: layersAt(settings.discogsToken, true),
   };
+  const agentLayers = layersAt(settings.mbUserAgentSource, settings.mbUserAgent);
 
   const tellProgress = (progress: IdentifyProgress) => {
     // A final progress frees the slot first, as it does in Rust.
@@ -412,14 +438,19 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
         return fail("malformed", "The auto-apply threshold must be between 0.92 and 1.");
       }
       const next = { ...settings };
+      // A save writes the data folder's file; an environment variable still wins.
       for (const key of ["acoustidKey", "discogsToken"] as const) {
         const value = update[key];
         if (value === undefined) continue;
-        next[key] = value === null || value.trim() === "" ? origins[key] : "settings";
+        keys[key].saved = value === null || value.trim() === "" ? null : true;
+        next[key] = resolve(keys[key])[1];
       }
       if (update.mbUserAgent !== undefined) {
-        next.mbUserAgent = update.mbUserAgent.trim();
-        next.mbUserAgentSource = next.mbUserAgent === "" ? null : "settings";
+        const agent = update.mbUserAgent.trim();
+        agentLayers.saved = agent === "" ? null : agent;
+        const [value, source] = resolve(agentLayers);
+        next.mbUserAgent = value ?? "";
+        next.mbUserAgentSource = source;
       }
       if (update.genrePolicy !== undefined) next.genrePolicy = update.genrePolicy;
       if (update.autoApply !== undefined) next.autoApply = update.autoApply;
