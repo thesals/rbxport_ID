@@ -4,7 +4,10 @@
 //! Each factor is in `0..=1` and the total is their weighted sum, with hard
 //! rules on top: a duration more than 10 s off rejects the candidate, a mix
 //! conflict caps it below the review threshold, and a candidate with no
-//! fingerprint behind it can never reach the auto-apply threshold.
+//! fingerprint behind it, one whose duration cannot be compared or one whose
+//! mix cannot be compared is capped below the auto-apply floor
+//! ([`crate::decide::AUTO_APPLY_FLOOR`]). Those caps are a second guard: the
+//! decision also takes only fingerprint matches.
 
 use crate::mixname::{agree, parse_candidate, parse_title, MixAgreement, MixKind, ParsedTitle};
 use crate::model::{Candidate, ExistingTags, ScoreBreakdown, Scored};
@@ -32,8 +35,14 @@ const DURATION_EXACT_SECS: f64 = 2.0;
 const DURATION_REJECT_SECS: f64 = 10.0;
 /// A mix conflict caps the total here, under the 0.5 review threshold.
 const MIX_CONFLICT_CAP: f64 = 0.49;
-/// The ceiling for a candidate without an AcoustID score.
-const TEXT_ONLY_CAP: f64 = 0.90;
+/// The ceiling for a candidate without an AcoustID score: below the
+/// auto-apply floor, whatever its source says.
+const TEXT_ONLY_CAP: f64 = 0.89;
+/// The ceiling when the duration cannot be compared (no length for the
+/// candidate, or none for the file): below the auto-apply floor, since the
+/// duration is one of the checks that tells versions apart. A perfect
+/// fingerprint match without one would otherwise land right on 0.90.
+const UNKNOWN_DURATION_CAP: f64 = 0.89;
 /// The ceiling when the mixes cannot be compared: below the auto-apply
 /// floor ([`crate::decide::AUTO_APPLY_FLOOR`]), so it is never applied
 /// unattended.
@@ -62,9 +71,11 @@ const NEUTRAL: f64 = 0.5;
 ///
 /// Design decision: a text-search candidate (no AcoustID score) is scored
 /// over the other three factors with their weights renormalised, and its
-/// total is capped at 0.90. Matching text and duration alone is not proof
-/// enough to change tags unattended, so such a candidate can reach review
-/// but never be auto-applied (auto-apply takes fingerprint matches only).
+/// total is capped at 0.89, under the auto-apply floor. Matching text and
+/// duration alone is not proof enough to change tags unattended, so such a
+/// candidate can reach review but never be auto-applied (auto-apply also
+/// takes fingerprint matches only). Likewise a candidate whose duration
+/// cannot be compared is capped at 0.89.
 ///
 /// The duration rejection takes precedence over the mix cap; a cap or
 /// rejection that changed the total is explained in `breakdown.rejected`.
@@ -103,7 +114,10 @@ pub fn score(existing: &ExistingTags, file_duration_secs: f64, candidate: Candid
         ));
     } else if acoustid.is_none() && total > TEXT_ONLY_CAP {
         total = TEXT_ONLY_CAP;
-        rejected = Some("text search only: capped at 0.90".to_owned());
+        rejected = Some("text search only: capped at 0.89".to_owned());
+    } else if duration_delta.is_none() && total > UNKNOWN_DURATION_CAP {
+        total = UNKNOWN_DURATION_CAP;
+        rejected = Some("duration unknown: capped at 0.89".to_owned());
     } else if agreement == MixAgreement::Unknown && total > UNKNOWN_MIX_CAP {
         total = UNKNOWN_MIX_CAP;
         rejected = Some(format!(
@@ -320,6 +334,21 @@ mod tests {
     }
 
     #[test]
+    fn a_perfect_fingerprint_match_without_a_duration_is_capped_below_auto_apply() {
+        // Everything else perfect: 0.45 + 0.20 * 0.5 + 0.25 + 0.10 would be
+        // exactly the floor.
+        for (file_secs, length) in [(FILE_SECS, None), (0.0, Some(300_000))] {
+            let s = score(&music(), file_secs, cand("m", "Armin van Buuren", "The Music (Extended Mix)", length, Some(1.0)));
+            assert!((s.score - 0.89).abs() < f64::EPSILON, "{s:?}");
+            assert!(s.score < crate::decide::AUTO_APPLY_FLOOR);
+            assert_eq!(s.breakdown.rejected.as_deref(), Some("duration unknown: capped at 0.89"));
+        }
+        // With the duration known it may reach auto-apply.
+        let s = score(&music(), FILE_SECS, cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(300_000), Some(1.0)));
+        assert!(s.score >= crate::decide::AUTO_APPLY_FLOOR, "{s:?}");
+    }
+
+    #[test]
     fn strong_fingerprint_match_reaches_auto_apply() {
         let s = score(
             &music(),
@@ -494,16 +523,17 @@ mod tests {
             FILE_SECS,
             cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(300_000), None),
         );
-        assert!((s.score - 0.90).abs() < f64::EPSILON, "{s:?}");
+        assert!((s.score - 0.89).abs() < f64::EPSILON, "{s:?}");
+        assert!(s.score < crate::decide::AUTO_APPLY_FLOOR, "{s:?}");
         assert!(s.breakdown.acoustid.is_none());
-        assert_eq!(s.breakdown.rejected.as_deref(), Some("text search only: capped at 0.90"));
+        assert_eq!(s.breakdown.rejected.as_deref(), Some("text search only: capped at 0.89"));
         // Below the cap nothing is noted.
         let weak = score(
             &music(),
             FILE_SECS,
             cand("m", "Armin van Buuren", "The Music (Extended Mix)", Some(306_000), None),
         );
-        assert!(weak.score < 0.90 && weak.score > 0.5, "{weak:?}");
+        assert!(weak.score < 0.89 && weak.score > 0.5, "{weak:?}");
         assert!(weak.breakdown.rejected.is_none());
     }
 
