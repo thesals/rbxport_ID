@@ -38,4 +38,22 @@ describe("localization", () => {
       for (const source of dynamic) expect(placeholders(catalog[source] ?? ""), `${locale}: ${source}`).toEqual(placeholders(source));
     }
   });
+
+  it("never translates a path, a file name or a service name", async () => {
+    // Whole paths and module names, file names with an extension, dotfiles,
+    // and the names of the services identification talks to.
+    const kept = (text: string) => [
+      ...(/^(?:@?\/|\.\/)\S+$/.test(text) ? [text] : []),
+      ...(text.match(/(?<![\w.])\.[a-z][\w.]*[a-z]|\b[\w-]+\.(?:db|xml|json|identify|lang|zip|jpg|pdb|edb|dat|ext)\b/gi) ?? []),
+      ...["AcoustID", "MusicBrainz", "Discogs", "Cover Art Archive"].filter((name) => text.includes(name)),
+    ];
+    const guarded = uiStrings.filter((text) => kept(text).length > 0);
+    for (const locale of LOCALES.filter((value) => value !== "en")) {
+      const catalog = (await import(`../../public/locales/${locale}.json`)).default as Catalog;
+      for (const source of guarded) {
+        const missing = kept(source).filter((token) => !(catalog[source] ?? source).includes(token));
+        expect(missing, `${locale}: ${source}`).toEqual([]);
+      }
+    }
+  });
 });

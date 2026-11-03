@@ -322,7 +322,7 @@
   "Update Manager": "Uppdateringshanterare",
   "@/views/report/ReportBug": "@/views/report/ReportBug",
   "@/views/update/UpdateManager": "@/views/update/UpdateManager",
-  "@/views/settings/Preferences": "@/vyer/inställningar/inställningar",
+  "@/views/settings/Preferences": "@/views/settings/Preferences",
   "@/views/sync/SyncManager": "@/views/sync/SyncManager",
   "@/views/tree/SmartPlaylistEditor": "@/views/tree/SmartPlaylistEditor",
   "shell-painted": "skalmålad",
