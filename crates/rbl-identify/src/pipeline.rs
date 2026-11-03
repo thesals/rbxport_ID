@@ -44,11 +44,20 @@ const MAX_FINGERPRINT_CANDIDATES: usize = 10;
 /// MusicBrainz lookup. Those beyond it are dropped, not offered unchecked.
 pub const MAX_FULL_LOOKUPS: usize = 4;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     /// Off by default, as the spec requires.
     pub auto_apply: bool,
     pub genre: GenrePolicy,
+    /// The score auto-apply needs; never below
+    /// [`decide::AUTO_APPLY_THRESHOLD`] ([`decide::decide`] raises it).
+    pub auto_apply_threshold: f64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { auto_apply: false, genre: GenrePolicy::default(), auto_apply_threshold: decide::AUTO_APPLY_THRESHOLD }
+    }
 }
 
 /// The services a run talks to. Discogs needs the user's personal token
@@ -192,7 +201,7 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
                     if accepted {
                         let proposal = fallback::propose(&info.snapshot, &found.enrichment);
                         // Review whatever the settings: never auto-applied.
-                        let decision = decide::decide(ranked.first(), false, false);
+                        let decision = decide::decide(ranked.first(), false, false, settings.auto_apply_threshold);
                         return Ok(TrackResult {
                             path: path.to_owned(),
                             existing,
@@ -246,7 +255,7 @@ pub fn identify(path: &Path, services: &Services<'_>, settings: Settings) -> Res
         propose(&existing, &info.snapshot, candidate, enrichment.as_ref(), art_ref, settings.genre)
     });
     let fills_only_empty = proposal.as_ref().is_some_and(Proposal::fills_only_empty);
-    let decision = decide::decide(ranked.first(), fills_only_empty, settings.auto_apply);
+    let decision = decide::decide(ranked.first(), fills_only_empty, settings.auto_apply, settings.auto_apply_threshold);
     Ok(TrackResult {
         path: path.to_owned(),
         existing,

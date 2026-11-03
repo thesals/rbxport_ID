@@ -524,6 +524,8 @@ pub fn run() {
             identify::identify_apply,
             identify::identify_undo,
             identify::identify_accept_above,
+            identify::identify_settings,
+            identify::identify_save_settings,
             commands::list_devices,
             commands::track_beats,
             // The decks. The audio device is not opened until one of these

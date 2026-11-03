@@ -76,7 +76,8 @@ impl Config {
 /// The value of `key` in dotenv-style text: `KEY=value`, optional quotes,
 /// `#` comment lines and blank lines ignored, and an unquoted value's
 /// trailing ` # comment` dropped (a quoted value keeps its `#`).
-fn file_value(text: &str, key: &str) -> Option<String> {
+#[must_use]
+pub fn file_value(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let line = line.trim();
         if line.starts_with('#') {

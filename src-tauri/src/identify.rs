@@ -19,8 +19,13 @@
 //!
 //! The store is this feature's own SQLite file under the app's data folder
 //! (`<data>/rbxport/identify/identify.db`): a local disk, never the library
-//! folder, never a USB volume. Keys come from `.env.identify` beside it and
-//! are never logged or returned.
+//! folder, never a USB volume. Keys come from `.env.identify` beside it (or
+//! the environment) and are never logged or returned; the settings commands
+//! ([`settings`]) say only where each comes from.
+
+mod settings;
+
+pub use settings::{GenrePolicyDto, IdentifySettingsDto, IdentifySettingsUpdateDto, KeySource, SecretUpdate};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -29,7 +34,6 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rbl_identify::acoustid::AcoustIdClient;
 use rbl_identify::clock::{Clock, SystemClock};
-use rbl_identify::config::Config;
 use rbl_identify::coverart::CoverArtClient;
 use rbl_identify::discogs::DiscogsClient;
 use rbl_identify::model::{Decision, Field, FieldChange, Proposal, Scored};
@@ -67,8 +71,9 @@ pub(crate) trait Identifier: Send + Sync {
     fn identify(&self, path: &Path) -> rbl_identify::Result<TrackResult>;
 }
 
-/// The live services, built once from the config and kept for the
-/// process. The clients hold reqwest blocking clients, so an engine is
+/// The live services, built from the keys and settings on first use and
+/// kept until the settings are saved (a running job keeps its own). The
+/// clients hold reqwest blocking clients, so an engine is
 /// only ever built or dropped on a plain thread, never on the async
 /// runtime (see [`off_runtime`] and `Drop for IdentifyState`).
 pub(crate) struct Engine {
@@ -80,7 +85,12 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    fn build(config: &Config, clock: &Arc<dyn Clock>, limiters: &Limiters) -> rbl_identify::Result<Self> {
+    fn build(
+        config: &rbl_identify::config::Config,
+        settings: Settings,
+        clock: &Arc<dyn Clock>,
+        limiters: &Limiters,
+    ) -> rbl_identify::Result<Self> {
         let transport: Arc<dyn Transport> = Arc::new(HttpTransport::new()?);
         let acoustid = AcoustIdClient::new(
             Arc::clone(&transport),
@@ -115,9 +125,13 @@ impl Engine {
                     None
                 }
             };
-        tracing::info!(discogs = discogs.is_some(), coverart = coverart.is_some(), "identify: services ready");
-        // TODO(phase 5): auto-apply and the genre policy from Settings.
-        Ok(Self { acoustid, musicbrainz, discogs, coverart, settings: Settings::default() })
+        tracing::info!(
+            discogs = discogs.is_some(),
+            coverart = coverart.is_some(),
+            auto_apply = settings.auto_apply,
+            "identify: services ready"
+        );
+        Ok(Self { acoustid, musicbrainz, discogs, coverart, settings })
     }
 }
 
@@ -150,6 +164,10 @@ struct RunningJob {
 /// Identification's state for the app: one per process, managed by Tauri.
 pub struct IdentifyState {
     root: PathBuf,
+    /// Where the keys and settings are read from.
+    sources: settings::Sources,
+    /// Serialises settings saves.
+    settings_lock: Mutex<()>,
     clock: Arc<dyn Clock>,
     /// One per process: the services count requests per client IP.
     limiters: Limiters,
@@ -179,11 +197,22 @@ impl Drop for IdentifyState {
 }
 
 impl IdentifyState {
-    /// State whose store and `.env.identify` live in `root`.
+    /// State whose store and `.env.identify` live in `root`, keys read from
+    /// the environment and (in a development build) the checkout's file.
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let dev_files = dev_files();
+        Self::with_sources(root, dev_files, Arc::new(|key: &str| std::env::var(key).ok()))
+    }
+
+    /// State reading keys from exactly these places: for tests, which must
+    /// never see the real environment or a developer's keys.
+    pub(crate) fn with_sources(root: PathBuf, dev_files: Vec<PathBuf>, env: settings::EnvLookup) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         Self {
-            root: root.into(),
+            sources: settings::Sources { root: root.clone(), dev_files, env },
+            settings_lock: Mutex::new(()),
+            root,
             limiters: Limiters::new(Arc::clone(&clock)),
             clock,
             engine: Mutex::new(None),
@@ -234,22 +263,44 @@ impl IdentifyState {
         }
     }
 
-    /// The live services, built on first use from `.env.identify`.
-    /// Blocking: call from a worker thread.
+    /// The live services, built on first use from the keys and settings
+    /// as they are then, and kept until the settings are saved. Blocking:
+    /// call from a worker thread.
     fn engine(&self) -> AppResult<Arc<Engine>> {
         let mut slot = self.engine.lock();
         if let Some(engine) = slot.as_ref() {
             return Ok(Arc::clone(engine));
         }
-        let config = load_config(&config_candidates(&self.root), |key| std::env::var(key).ok(), &self.root)?;
+        let config = self.sources.config()?;
+        let settings = self.sources.stored().pipeline();
         let (clock, limiters) = (&self.clock, &self.limiters);
-        let engine = off_runtime(|| Engine::build(&config, clock, limiters))?.map_err(|e| {
+        let engine = off_runtime(|| Engine::build(&config, settings, clock, limiters))?.map_err(|e| {
             AppError::new(ErrorKind::Internal, "The identification services could not be started.")
                 .with_detail(e.to_string())
         })?;
         let engine = Arc::new(engine);
         *slot = Some(Arc::clone(&engine));
         Ok(engine)
+    }
+
+    /// The settings as they are now. Blocking: call from a worker thread.
+    pub(crate) fn settings(&self) -> IdentifySettingsDto {
+        self.sources.dto()
+    }
+
+    /// Saves the settings, then drops the cached services so the next job
+    /// is built from them. A running job keeps the services it started
+    /// with. Blocking: call from a worker thread.
+    pub(crate) fn save_settings(&self, update: &IdentifySettingsUpdateDto) -> AppResult<IdentifySettingsDto> {
+        let _saving = self.settings_lock.lock();
+        self.sources.save(update)?;
+        let old = self.engine.lock().take();
+        // reqwest's blocking client must not be dropped on the async
+        // runtime; a running job's own Arc keeps it alive meanwhile.
+        if let Some(old) = old {
+            off_runtime(move || drop(old))?;
+        }
+        Ok(self.sources.dto())
     }
 
     fn is_running(&self) -> bool {
@@ -422,11 +473,12 @@ fn current_item(store: &Store, result: ResultId) -> AppResult<IdentifyQueueItemD
 
 // ---------------------------------------------------------------- config
 
-/// Where `.env.identify` is looked for: the identify data folder, then (in
-/// a development build only) the working directory and its parent, which
-/// is the repository when `tauri dev` runs from `src-tauri`.
-fn config_candidates(root: &Path) -> Vec<PathBuf> {
-    let mut candidates = vec![root.join(ENV_FILE)];
+/// In a development build only, the `.env.identify` of the working
+/// directory and its parent, which is the repository when `tauri dev` runs
+/// from `src-tauri`. Each key is looked for there after the environment and
+/// the data folder ([`settings::Sources::resolve`]).
+fn dev_files() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     if cfg!(debug_assertions) {
         if let Ok(cwd) = std::env::current_dir() {
             candidates.push(cwd.join(ENV_FILE));
@@ -436,29 +488,6 @@ fn config_candidates(root: &Path) -> Vec<PathBuf> {
         }
     }
     candidates
-}
-
-/// The first `.env.identify` among `candidates`, or the environment alone
-/// when there is none. The error names the missing key, never a value.
-fn load_config(candidates: &[PathBuf], env: impl Fn(&str) -> Option<String>, root: &Path) -> AppResult<Config> {
-    let env = |key: &str| env(key).filter(|v| !v.trim().is_empty());
-    let loaded = match candidates.iter().find(|p| p.is_file()) {
-        Some(path) => std::fs::read_to_string(path)
-            .map_err(|e| rbl_identify::IdentifyError::Config(format!("cannot read {}: {e}", path.display())))
-            .and_then(|text| Config::from_text(&text, env)),
-        None => Config::from_lookup(env),
-    };
-    loaded.map_err(|e| {
-        AppError::new(
-            ErrorKind::NotFound,
-            format!(
-                "Identification needs an AcoustID API key and a MusicBrainz user agent. \
-                 Add ACOUSTID_API_KEY and MB_USER_AGENT to {}.",
-                root.join(ENV_FILE).display()
-            ),
-        )
-        .with_detail(e.to_string())
-    })
 }
 
 // ---------------------------------------------------------------- the job
@@ -803,6 +832,25 @@ pub async fn identify_edit(
 ) -> AppResult<IdentifyQueueItemDto> {
     let identify = Arc::clone(&identify);
     blocking("identify_edit", move || identify.edit(result_id, &changes)).await
+}
+
+/// The identification settings: where each key comes from (never a key),
+/// the user agent, the genre policy and auto-apply.
+#[tauri::command]
+pub async fn identify_settings(identify: State<'_, Arc<IdentifyState>>) -> AppResult<IdentifySettingsDto> {
+    let identify = Arc::clone(&identify);
+    blocking("identify_settings", move || Ok(identify.settings())).await
+}
+
+/// Saves a settings change and answers with the settings as now saved. The
+/// next job runs with them; a running job keeps its own.
+#[tauri::command]
+pub async fn identify_save_settings(
+    identify: State<'_, Arc<IdentifyState>>,
+    update: IdentifySettingsUpdateDto,
+) -> AppResult<IdentifySettingsDto> {
+    let identify = Arc::clone(&identify);
+    blocking("identify_save_settings", move || identify.save_settings(&update)).await
 }
 
 // ---------------------------------------------------------------- writing
@@ -1654,24 +1702,66 @@ mod tests {
         assert!(state.queue(QueueFilter::All, 0, u32::MAX).unwrap().items.len() <= MAX_ROWS as usize);
     }
 
+    /// State in `root` that sees no environment and no developer's file.
+    fn isolated(root: &Path) -> IdentifyState {
+        IdentifyState::with_sources(root.to_owned(), Vec::new(), Arc::new(|_: &str| None))
+    }
+
     #[test]
     fn missing_keys_are_a_clear_error_that_never_shows_a_value() {
         let dir = tempfile::tempdir().unwrap();
+        let state = isolated(dir.path());
         let env_file = dir.path().join(ENV_FILE);
-        let none = |_: &str| None;
-        let error = load_config(std::slice::from_ref(&env_file), none, dir.path()).unwrap_err();
+        let error = state.sources.config().unwrap_err();
         assert_eq!(error.kind, ErrorKind::NotFound);
         assert!(error.message.contains("ACOUSTID_API_KEY"), "{}", error.message);
 
         std::fs::write(&env_file, "ACOUSTID_API_KEY=sekrit-key\n").unwrap();
-        let error = load_config(std::slice::from_ref(&env_file), none, dir.path()).unwrap_err();
+        let error = state.sources.config().unwrap_err();
         let shown = format!("{error:?}");
         assert!(shown.contains("MB_USER_AGENT") && !shown.contains("sekrit-key"), "{shown}");
 
         std::fs::write(&env_file, "ACOUSTID_API_KEY=sekrit-key\nMB_USER_AGENT=rbxport-test/1 ( a@b.c )\n").unwrap();
-        let config = load_config(std::slice::from_ref(&env_file), none, dir.path()).unwrap();
+        let config = state.sources.config().unwrap();
         assert_eq!(config.acoustid_key.expose(), "sekrit-key");
         assert!(config.discogs_token.is_none());
+    }
+
+    #[test]
+    fn saving_settings_rebuilds_the_services_for_the_next_job_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = isolated(dir.path());
+        assert_eq!(state.engine().err().map(|e| e.kind), Some(ErrorKind::NotFound), "no keys yet");
+        let keys: IdentifySettingsUpdateDto =
+            serde_json::from_str(r#"{"acoustidKey":"sekrit-key","mbUserAgent":"rbxport-test/1 ( a@b.c )"}"#).unwrap();
+        let saved = state.save_settings(&keys).unwrap();
+        assert_eq!(saved.acoustid_key, Some(KeySource::Settings));
+        assert!(!format!("{saved:?}").contains("sekrit-key"));
+
+        let first = state.engine().unwrap();
+        assert!(Arc::ptr_eq(&first, &state.engine().unwrap()), "kept between jobs");
+        assert_eq!(first.settings, Settings::default(), "auto-apply off by default");
+        assert!(first.discogs.is_none());
+
+        // A job holds `first`; the user turns auto-apply on, raises the
+        // threshold and adds a Discogs token.
+        let change: IdentifySettingsUpdateDto = serde_json::from_str(
+            r#"{"autoApply":true,"autoApplyThreshold":0.95,"genrePolicy":"replace","discogsToken":"tok"}"#,
+        )
+        .unwrap();
+        state.save_settings(&change).unwrap();
+        let next = state.engine().unwrap();
+        assert!(!Arc::ptr_eq(&first, &next), "the next job gets new services");
+        assert_eq!(
+            next.settings,
+            Settings { auto_apply: true, genre: rbl_identify::pipeline::GenrePolicy::Replace, auto_apply_threshold: 0.95 }
+        );
+        assert!(next.discogs.is_some());
+        assert_eq!(first.settings, Settings::default(), "the running job's are unchanged");
+        // A refused save keeps the services.
+        let bad: IdentifySettingsUpdateDto = serde_json::from_str(r#"{"autoApplyThreshold":0.5}"#).unwrap();
+        assert_eq!(state.save_settings(&bad).unwrap_err().kind, ErrorKind::Malformed);
+        assert!(Arc::ptr_eq(&next, &state.engine().unwrap()));
     }
 
     /// One second of silent 16-bit mono WAV.

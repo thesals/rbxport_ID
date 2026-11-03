@@ -215,7 +215,7 @@ fn an_unidentified_track_found_on_discogs_goes_to_review_even_with_auto_apply_on
     let discogs = DiscogsClient::new(transport.clone(), clock, limiters.discogs.clone(), Secret::new(TOKEN), UA.to_owned());
     let services = Services { acoustid: &acoustid, musicbrainz: &musicbrainz, discogs: Some(&discogs), coverart: None };
 
-    let result = pipeline::identify(&path, &services, Settings { auto_apply: true, genre: GenrePolicy::Replace }).unwrap();
+    let result = pipeline::identify(&path, &services, Settings { auto_apply: true, genre: GenrePolicy::Replace, ..Settings::default() }).unwrap();
     assert_eq!(result.decision, Decision::Review);
     let best = result.best().unwrap();
     assert_eq!(best.candidate.source, CandidateSource::DiscogsText);
