@@ -55,8 +55,10 @@
 //! temporary file in the same folder, so the same volume) and renames it
 //! over the original, so a crash leaves either the old file or the new one.
 //! On Windows the original creation time is kept; the modification time is
-//! the write's, as for any tag editor. A read-only file, and a file another
-//! program holds open, are refused with a clear message. The rename replaces
+//! the write's, as for any tag editor. A read-only file is refused with a
+//! clear message. A file another program holds open is not written now: the
+//! write is kept in the store as a waiting write ([`apply_result`]) and made
+//! once the file is free ([`retry_waiting`]). The rename replaces
 //! the file object, so alternate data streams (`Zone.Identifier`), hard
 //! links and explicit ACLs of the original are not carried over. A crash
 //! between staging and renaming can leave a `.rbxport-tags-*` file beside
@@ -83,7 +85,7 @@ use lofty::tag::Tag;
 use crate::error::{IdentifyError, Result};
 use crate::model::{ArtworkRef, Field, FieldChange, TagSnapshot};
 use crate::pipeline::current;
-use crate::store::{ApplicationId, ResultId, ReviewState, Store, TrackKey};
+use crate::store::{ApplicationId, ResultId, ReviewState, Store, TrackKey, WaitingWrite};
 use crate::tags;
 
 /// One planned change to a file.
@@ -118,6 +120,32 @@ fn refuse(message: impl Into<String>) -> IdentifyError {
     IdentifyError::Write(message.into())
 }
 
+fn changed(message: impl Into<String>) -> IdentifyError {
+    IdentifyError::Changed(message.into())
+}
+
+/// Why a write to a file another program holds open was refused.
+pub const OPEN_ELSEWHERE: &str = "The file is open in another program (a player, or rekordbox).";
+
+/// What a write kept to be made later answers, naming the file.
+fn deferred(path: &Path) -> IdentifyError {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    IdentifyError::Deferred(format!(
+        "{name} is open in another program. It will be written when it's free: when rbxport starts or closes, \
+         or when you retry."
+    ))
+}
+
+/// A failure to read or open the file while another program holds it open
+/// is that program's doing: [`IdentifyError::InUse`]. Everything else is as
+/// it was.
+fn in_use_or(path: &Path, e: IdentifyError) -> IdentifyError {
+    match e {
+        IdentifyError::Io(_) | IdentifyError::Audio(_) if held_open(path) => IdentifyError::InUse(OPEN_ELSEWHERE.to_owned()),
+        other => other,
+    }
+}
+
 /// The edits that carry out `changes` on a file whose tags are `now`.
 ///
 /// Refused when a field's value in the file is no longer the `current` the
@@ -132,14 +160,14 @@ pub fn plan(now: &TagSnapshot, changes: &[FieldChange]) -> Result<Vec<Edit>> {
         let field = change.field;
         if field == Field::Artwork {
             if now.has_artwork {
-                return Err(refuse("The file has artwork now; identify it again before adding any."));
+                return Err(changed("The file has artwork now; identify it again before adding any."));
             }
             edits.push(Edit::AddArtwork);
             continue;
         }
         let value = current(now, field);
         if value.trim() != change.current.trim() {
-            return Err(refuse(format!(
+            return Err(changed(format!(
                 "The file's {} has changed since it was identified. Identify it again.",
                 field.as_str()
             )));
@@ -433,7 +461,7 @@ const LOCK_VIOLATION: i32 = 33;
 /// elsewhere only when `held_open` (a probe that hit a sharing violation)
 /// says so; otherwise it is a read-only file or missing rights, said as such.
 fn replace_error(e: &std::io::Error, held_open: bool) -> IdentifyError {
-    let open_elsewhere = || refuse("The file is open in another program (a player, or rekordbox). Close it and try again.");
+    let open_elsewhere = || IdentifyError::InUse(OPEN_ELSEWHERE.to_owned());
     match e.raw_os_error() {
         Some(SHARING_VIOLATION | LOCK_VIOLATION) => open_elsewhere(),
         _ if e.kind() == std::io::ErrorKind::PermissionDenied && held_open => open_elsewhere(),
@@ -448,7 +476,7 @@ fn replace_error(e: &std::io::Error, held_open: bool) -> IdentifyError {
 /// Whether another program has `path` open: opening it with no sharing at
 /// all fails with a sharing violation exactly then. Windows only; elsewhere
 /// an open file never blocks the rename.
-fn held_open(path: &Path) -> bool {
+pub(crate) fn held_open(path: &Path) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -1036,6 +1064,13 @@ pub struct Applied {
 /// as it was (left open, for reconciliation, otherwise), and a result this
 /// call accepted goes back to `Pending`, so a later bulk apply cannot write
 /// fields the user did not tick.
+///
+/// A file another program holds open (it cannot be read, or the rename over
+/// it is refused) is not a failure: the write is kept as a waiting write
+/// ([`Store::defer_write`]: the result `Accepted`, these `fields`) and the
+/// call answers [`IdentifyError::Deferred`]. [`retry_waiting`] makes it once
+/// the file is free, through this same path and its checks. A write that
+/// lands ends the result's waiting write.
 pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result<Applied> {
     let (item, ..) = store.result(result)?.ok_or_else(|| refuse("That identification result is no longer in the store."))?;
     let accepted_here = match item.state {
@@ -1059,7 +1094,17 @@ pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result
         }
     }
     let path = Path::new(&item.path);
-    let info = tags::read(path)?;
+    let defer = |store: &Store| -> IdentifyError {
+        match store.defer_write(result, fields, OPEN_ELSEWHERE) {
+            Ok(_) => deferred(path),
+            Err(e) => e,
+        }
+    };
+    let info = match tags::read(path).map_err(|e| in_use_or(path, e)) {
+        Ok(info) => info,
+        Err(IdentifyError::InUse(_)) => return Err(defer(store)),
+        Err(e) => return Err(e),
+    };
     let edits = plan(&info.snapshot, &selected)?;
     if edits.is_empty() {
         return Err(refuse("The file already holds these changes."));
@@ -1104,11 +1149,17 @@ pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result
     let after = match write(path, &info.snapshot, &edits, image) {
         Ok(after) => after,
         Err(e) => {
+            let e = in_use_or(path, e);
             // Abandoned only when the file is exactly as it was: a write that
             // landed (or half did) stays open for reconciliation, never
             // recorded as "not written".
             if tags::read(path).is_ok_and(|now| now.snapshot == info.snapshot) {
                 if store.abandon_application(application, &format!("the write failed: {e}")).is_ok() {
+                    // Open elsewhere: kept, the result accepted, to be
+                    // written once the file is free.
+                    if matches!(e, IdentifyError::InUse(_)) {
+                        return Err(defer(store));
+                    }
                     back_to_pending(store);
                 }
                 return Err(e);
@@ -1122,6 +1173,46 @@ pub fn apply_result(store: &Store, result: ResultId, fields: &[Field]) -> Result
     let file_after = TrackKey { path: item.path.clone(), ..key };
     store.complete_application_with(application, &file_after, Some(&after), None)?;
     Ok(Applied { application, after })
+}
+
+/// How one try of a waiting write went ([`retry_waiting`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Retried {
+    /// Written: the result is applied (or auto-applied) and undoable.
+    Written(Applied),
+    /// Not tried or not written, and still waiting: the file is still open
+    /// in another program (or not there, or another write to it is being
+    /// settled). Says why.
+    StillWaiting(String),
+    /// Refused for good (the file's tags are no longer the ones the review
+    /// saw, or it cannot be written at all): the waiting write is dropped
+    /// and the result is back in review with the warning, which says why.
+    /// `returned` is whether the result's state changed.
+    Dropped { warning: String, returned: bool },
+}
+
+/// Tries a waiting write again, through exactly [`apply_result`]'s path and
+/// checks: the file must still hold, in every field to write, the value the
+/// review saw. A store failure is the only error; the waiting write is then
+/// kept.
+pub fn retry_waiting(store: &Store, waiting: &WaitingWrite) -> Result<Retried> {
+    let path = Path::new(&waiting.path);
+    if !path.exists() {
+        return Ok(Retried::StillWaiting("The file is not there now.".to_owned()));
+    }
+    if store.open_applications()?.iter().any(|a| a.path == waiting.path) {
+        return Ok(Retried::StillWaiting("An earlier write to this file is still being settled.".to_owned()));
+    }
+    match apply_result(store, waiting.result, &waiting.fields) {
+        Ok(applied) => Ok(Retried::Written(applied)),
+        Err(IdentifyError::Deferred(message)) => Ok(Retried::StillWaiting(message)),
+        Err(e @ IdentifyError::Store(_)) => Err(e),
+        Err(e) => {
+            let warning = format!("A write that was waiting for this file to be closed was not made: {e}");
+            let returned = store.drop_waiting(waiting.result, &warning)?;
+            Ok(Retried::Dropped { warning, returned })
+        }
+    }
 }
 
 /// What [`undo_result`] restored.
