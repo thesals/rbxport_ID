@@ -110,6 +110,9 @@ const inFilter = (filter: IdentifyFilter, { state, waiting }: IdentifyQueueItem)
   }
 };
 
+/** The store's refusal of a review change while a write waits for its file. */
+export const WAITING_READ_ONLY = "This result is waiting to be written once the file is closed in the other program. Cancel the waiting write to change its review.";
+
 /** What a write to a file in use answers: not a failure, a write for later. */
 export const DEFERRED_MESSAGE = "The file is open in another program. It will be written when the file is free.";
 
@@ -276,13 +279,18 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
           jobId, trackId, resultId: null, path, decision: outcome, score: null, error: null,
         };
         const held = current.get(path);
-        const heldState = held === undefined ? undefined : results.get(held)?.item.state;
+        const heldItem = held === undefined ? undefined : results.get(held)?.item;
+        const heldState = heldItem?.state;
         if (outcome === "failed") {
           result.error = "The file could not be found.";
         } else if (heldState === "applied" || heldState === "autoApplied") {
           result.decision = "failed";
           counted = "failed";
           result.error = "identify store: this track has an applied result; undo it before identifying again";
+        } else if (heldItem?.waiting) {
+          result.decision = "failed";
+          counted = "failed";
+          result.error = "identify store: this track has a write waiting for the file to be closed; cancel it before identifying again";
         } else {
           const id = save(trackId, path, artist, title, outcome, fills);
           result.resultId = id;
@@ -432,8 +440,10 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       const rows = [...current.values()]
         .map((id) => results.get(id)?.item)
         .filter((item): item is IdentifyQueueItem => item !== undefined && inFilter(filter, item))
-        .sort((a, b) =>
-          (a.score === null ? 1 : 0) - (b.score === null ? 1 : 0)
+        // Waiting writes newest first, as the store lists them; the rest by score.
+        .sort((a, b) => filter === "waiting"
+          ? (b.waiting?.sinceUnix ?? 0) - (a.waiting?.sinceUnix ?? 0) || b.resultId - a.resultId
+          : (a.score === null ? 1 : 0) - (b.score === null ? 1 : 0)
           || (b.score ?? 0) - (a.score ?? 0)
           || a.path.localeCompare(b.path)
           || a.resultId - b.resultId);
@@ -453,6 +463,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       if (detail.writeInProgress) {
         return fail("readOnly", "Tags are being written to this file. Its review cannot change until the write is finished.");
       }
+      if (detail.item.waiting) return fail("readOnly", WAITING_READ_ONLY);
       const to = TARGET[action];
       if (!changeable(resultId) || !ALLOWED[detail.item.state].includes(to)) {
         return fail("malformed", `A ${detail.item.state} result cannot become ${to}.`);
@@ -466,6 +477,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       if (detail.writeInProgress) {
         return fail("readOnly", "Tags are being written to this file. Its review cannot change until the write is finished.");
       }
+      if (detail.item.waiting) return fail("readOnly", WAITING_READ_ONLY);
       if (!changeable(resultId) || (detail.item.state !== "pending" && detail.item.state !== "accepted")) {
         return fail("malformed", "That change could not be made to this result.");
       }

@@ -7,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createMockBackend } from "./backend-mock";
-import { IDENTIFY_MAX_ROWS, createMockIdentify } from "./mock-identify";
+import { IDENTIFY_MAX_ROWS, WAITING_READ_ONLY, createMockIdentify } from "./mock-identify";
 import type { IdentifyBackend, IdentifyProgress, IdentifyResultEvent } from "./types";
 
 const TICK = 10;
@@ -241,6 +241,39 @@ describe("mock identify", () => {
     identify.setFileInUse(false, first!.path);
     expect((await identify.apply([{ resultId: second!.resultId, fields: ["label"] }]))).toHaveLength(1);
     expect((await identify.result(first!.resultId)).item).toMatchObject({ state: "applied", waiting: null });
+  });
+
+  it("holds a waiting result's review, refuses re-identifying it, and lists waiting writes newest first", async () => {
+    const identify = createMockIdentify(AUTO);
+    await identify.start(["1", "2", "3", "4"]);
+    await finish(4);
+    const [first, second] = (await identify.queue("needsReview", 0, 10)).items;
+    identify.setFileInUse(true);
+    await identify.apply([{ resultId: first!.resultId, fields: ["label"] }]);
+    await vi.advanceTimersByTimeAsync(2000);
+    await identify.apply([{ resultId: second!.resultId, fields: ["label"] }]);
+
+    // Newest first.
+    expect((await identify.queue("waiting", 0, 10)).items.map((i) => i.resultId)).toEqual([second!.resultId, first!.resultId]);
+
+    const readOnly = { kind: "readOnly", message: WAITING_READ_ONLY };
+    for (const action of ["accept", "reject", "pending"] as const) {
+      await expect(identify.setState(first!.resultId, action)).rejects.toMatchObject(readOnly);
+    }
+    await expect(identify.edit(first!.resultId, [{ field: "label", proposed: "X" }])).rejects.toMatchObject(readOnly);
+
+    // Re-identifying the track fails it and keeps the waiting write.
+    const { events } = record(identify);
+    await identify.start([first!.trackId]);
+    await finish(1);
+    const result = events.find(([kind]) => kind === "result")?.[1] as IdentifyResultEvent | undefined;
+    expect(result).toMatchObject({ decision: "failed", resultId: null });
+    expect(result?.error).toMatch(/write waiting for the file to be closed; cancel it before identifying again/);
+    expect((await identify.result(first!.resultId)).item.waiting).not.toBeNull();
+
+    // Once cancelled, its review can change again.
+    await identify.cancelWaiting(first!.resultId);
+    expect(await identify.setState(first!.resultId, "reject")).toMatchObject({ state: "rejected" });
   });
 
   it("appends the sub-genre to the comment and refuses what the store refuses", async () => {
