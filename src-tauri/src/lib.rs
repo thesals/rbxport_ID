@@ -419,10 +419,15 @@ pub fn run() {
             crate::scripting::install(app.handle());
             spawn_library_load(app.handle().clone());
             // Identification's store: writes an earlier run left open are
-            // found before anything else touches it.
+            // settled before anything else touches it, then the writes
+            // waiting for a file another program held open are tried.
             {
                 let identify = Arc::clone(app.state::<Arc<crate::identify::IdentifyState>>().inner());
-                tauri::async_runtime::spawn_blocking(move || identify.reconcile_on_startup());
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let changed = identify.settle_on_start();
+                    crate::identify::announce(&handle, changed);
+                });
             }
             // Join the network on start: a passive watcher that hears every
             // player and mixer and reports them, so the shell can offer LINK
@@ -524,6 +529,8 @@ pub fn run() {
             identify::identify_apply,
             identify::identify_undo,
             identify::identify_accept_above,
+            identify::identify_retry_waiting,
+            identify::identify_cancel_waiting,
             identify::identify_settings,
             identify::identify_save_settings,
             commands::list_devices,
@@ -683,6 +690,13 @@ pub fn run() {
                 if matches!(event, tauri::RunEvent::Exit) {
                     crate::screen_cache::save(handle);
                     crate::update::on_exit(handle);
+                    // Identify writes waiting for a file another program
+                    // held open, and open writes whose file was locked at
+                    // start: tried once more, for at most a few seconds.
+                    // What is left is tried at the next start.
+                    if let Some(identify) = handle.try_state::<Arc<crate::identify::IdentifyState>>() {
+                        identify.settle_on_exit(crate::identify::EXIT_BUDGET);
+                    }
                 }
             });
         }

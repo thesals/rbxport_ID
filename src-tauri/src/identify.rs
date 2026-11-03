@@ -17,6 +17,11 @@
 //! snapshotted in the store before it is touched), so `identify_undo` can
 //! put the file back. Nothing here goes near the USB export path.
 //!
+//! A write to a file another program holds open is not a failure: it is
+//! kept as a waiting write and tried again when the app starts (after
+//! reconciliation) and exits, before every job and every apply, and on
+//! `identify_retry_waiting` ([`IdentifyState::retry_waiting`]).
+//!
 //! The store is this feature's own SQLite file under the app's data folder
 //! (`<data>/rbxport/identify/identify.db`): a local disk, never the library
 //! folder, never a USB volume. Keys come from `.env.identify` beside it (or
@@ -30,6 +35,7 @@ pub use settings::{GenrePolicyDto, IdentifySettingsDto, IdentifySettingsUpdateDt
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rbl_identify::acoustid::AcoustIdClient;
@@ -43,6 +49,8 @@ use rbl_identify::ratelimit::Limiters;
 use rbl_identify::store::{
     Filter, LibraryTrack, QueueItem, Reconciliation, RekordboxRecord, ResultId, ReviewState, Store, TrackKey,
 };
+use rbl_identify::write::Retried;
+use rbl_identify::IdentifyError;
 use rbl_identify::transport::{HttpTransport, Transport};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -60,6 +68,9 @@ pub const PROGRESS_EVENT: &str = "identify:progress";
 pub const RESULT_EVENT: &str = "identify:result";
 /// Results changed by apply, undo or bulk accept: `{ resultIds }`.
 pub const CHANGED_EVENT: &str = "identify:changed";
+
+/// How long the exit pass may take, in all.
+pub const EXIT_BUDGET: Duration = Duration::from_secs(10);
 
 /// The folder the store and `.env.identify` live in.
 pub fn default_root() -> PathBuf {
@@ -179,6 +190,8 @@ pub struct IdentifyState {
     /// The running or last job's progress, for a view that mounts mid-job.
     progress: Mutex<Option<IdentifyProgressDto>>,
     next_job: AtomicU32,
+    /// Set once the exit pass has run.
+    exited: AtomicBool,
 }
 
 impl Default for IdentifyState {
@@ -220,6 +233,7 @@ impl IdentifyState {
             job: Mutex::new(None),
             progress: Mutex::new(None),
             next_job: AtomicU32::new(1),
+            exited: AtomicBool::new(false),
         }
     }
 
@@ -244,21 +258,89 @@ impl IdentifyState {
         }
     }
 
-    /// On startup: writes a crash left open are counted. Opens the store
-    /// only if it exists, so a user who never identifies gets no file.
-    pub fn reconcile_on_startup(&self) {
-        if !self.store_path().is_file() {
+    /// [`IdentifyState::with_store`], waiting for the store no later than
+    /// `deadline` (`None`: as long as it takes). `None` when the deadline
+    /// passed first, or when there is no store yet and `only_existing`.
+    fn with_store_until<T>(
+        &self,
+        deadline: Option<Instant>,
+        only_existing: bool,
+        f: impl FnOnce(&Store) -> AppResult<T>,
+    ) -> Option<AppResult<T>> {
+        let mut slot = match deadline {
+            Some(deadline) => self.store.try_lock_until(deadline)?,
+            None => self.store.lock(),
+        };
+        if slot.is_none() {
+            if only_existing && !self.store_path().is_file() {
+                return None;
+            }
+            if let Err(e) = std::fs::create_dir_all(&self.root) {
+                return Some(Err(AppError::new(ErrorKind::NotFound, "The identify data folder could not be created.")
+                    .with_detail(format!("{}: {e}", self.root.display()))));
+            }
+            match Store::open(&self.store_path()) {
+                Ok(store) => *slot = Some(store),
+                Err(e) => return Some(Err(store_error(e))),
+            }
+        }
+        slot.as_ref().map(f)
+    }
+
+    /// At startup: settles the writes an earlier run left open, then tries
+    /// every waiting write. Returns the results whose state changed.
+    pub fn settle_on_start(&self) -> Vec<ResultId> {
+        let mut changed = self.reconcile_until(None);
+        changed.extend(self.retry_waiting(None, &[]).1);
+        changed
+    }
+
+    /// At exit, once: settles open writes whose file is now free and tries
+    /// every waiting write, for no longer than `budget`. What is left is
+    /// tried at the next start.
+    pub fn settle_on_exit(&self, budget: Duration) {
+        if self.exited.swap(true, Ordering::SeqCst) {
             return;
         }
+        let deadline = Instant::now() + budget;
+        self.reconcile_until(Some(deadline));
+        let (outcomes, _) = self.retry_waiting(Some(deadline), &[]);
+        let written = outcomes.iter().filter(|o| o.ok).count();
+        if !outcomes.is_empty() {
+            tracing::info!(tried = outcomes.len(), written, "identify: waiting writes tried at exit");
+        }
+    }
+
+    /// Writes a crash left open are settled from their files. Opens the
+    /// store only if it exists, so a user who never identifies gets no
+    /// file. Returns the results whose state changed.
+    pub fn reconcile_on_startup(&self) -> Vec<ResultId> {
+        self.reconcile_until(None)
+    }
+
+    fn reconcile_until(&self, deadline: Option<Instant>) -> Vec<ResultId> {
         // A write whose file still holds its before-snapshot never happened
         // and is abandoned; one whose file holds exactly the written tags is
         // recorded as written; one that cannot be told is closed as unknown
         // and its result returned to review. A file that is not there, or
         // cannot be read now, stays open for the next start. No file is
         // written here.
-        match self.with_store(|store| store.reconcile_open_applications_from_files().map_err(store_error)) {
-            Ok(outcomes) if outcomes.is_empty() => {}
-            Ok(outcomes) => {
+        let reconciled = self.with_store_until(deadline, true, |store| {
+            let outcomes = store.reconcile_open_applications_from_files().map_err(store_error)?;
+            let mut changed = Vec::new();
+            for outcome in &outcomes {
+                if let Reconciliation::Completed { application } | Reconciliation::Unknown { application, .. } = outcome {
+                    if let Some(a) = store.application(*application).map_err(store_error)? {
+                        changed.push(a.result);
+                    }
+                }
+            }
+            Ok((outcomes, changed))
+        });
+        let Some(reconciled) = reconciled else { return Vec::new() };
+        match reconciled {
+            Ok((outcomes, _)) if outcomes.is_empty() => Vec::new(),
+            Ok((outcomes, changed)) => {
                 let count = |f: fn(&Reconciliation) -> bool| outcomes.iter().filter(|o| f(o)).count();
                 tracing::warn!(
                     abandoned = count(|o| matches!(o, Reconciliation::Abandoned { .. })),
@@ -267,9 +349,70 @@ impl IdentifyState {
                     open = count(|o| matches!(o, Reconciliation::NeedsUser { .. })),
                     "identify: tag writes left open by an earlier run"
                 );
+                changed
             }
-            Err(e) => tracing::warn!(error = %e, "identify: the store could not be checked on startup"),
+            Err(e) => {
+                tracing::warn!(error = %e, "identify: the store could not be checked for open writes");
+                Vec::new()
+            }
         }
+    }
+
+    /// Tries every waiting write except those of `skip`, oldest first,
+    /// through the same path and checks as an apply, stopping at `deadline`
+    /// (what is left keeps waiting). Returns one outcome per write tried,
+    /// and the results whose state changed (written, or back in review).
+    /// Creates no store.
+    pub(crate) fn retry_waiting(
+        &self,
+        deadline: Option<Instant>,
+        skip: &[ResultId],
+    ) -> (Vec<IdentifyWriteOutcomeDto>, Vec<ResultId>) {
+        let (mut outcomes, mut changed) = (Vec::new(), Vec::new());
+        let waiting = match self.with_store_until(deadline, true, |store| store.waiting_writes().map_err(store_error)) {
+            Some(Ok(waiting)) => waiting,
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "identify: the waiting writes could not be read");
+                return (outcomes, changed);
+            }
+            None => return (outcomes, changed),
+        };
+        for waiting in waiting.iter().filter(|w| !skip.contains(&w.result)) {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
+            let tried = self.with_store_until(deadline, true, |store| {
+                Ok(rbl_identify::write::retry_waiting(store, waiting).map_err(store_error))
+            });
+            let outcome = match tried {
+                None => break,
+                Some(Ok(Ok(Retried::Written(_)))) => {
+                    changed.push(waiting.result);
+                    IdentifyWriteOutcomeDto::written(waiting.result)
+                }
+                Some(Ok(Ok(Retried::StillWaiting(message)))) => IdentifyWriteOutcomeDto::deferred(waiting.result, message),
+                Some(Ok(Ok(Retried::Dropped { warning, returned }))) => {
+                    if returned {
+                        changed.push(waiting.result);
+                    }
+                    IdentifyWriteOutcomeDto::failed(waiting.result, warning)
+                }
+                Some(Ok(Err(e)) | Err(e)) => IdentifyWriteOutcomeDto::failed(waiting.result, message_of(&e)),
+            };
+            outcomes.push(outcome);
+        }
+        (outcomes, changed)
+    }
+
+    /// The user gives up a waiting write: the result goes back to review.
+    fn cancel_waiting(&self, result: ResultId) -> AppResult<IdentifyQueueItemDto> {
+        self.with_store(|store| {
+            store.result(result).map_err(store_error)?.ok_or_else(no_such_result)?;
+            store.cancel_waiting(result).map_err(|e| {
+                AppError::new(ErrorKind::Malformed, "This result has no write waiting.").with_detail(e.to_string())
+            })?;
+            current_item(store, result)
+        })
     }
 
     /// The live services, built on first use from the keys and settings
@@ -482,6 +625,13 @@ fn changeable(store: &Store, result: ResultId) -> AppResult<QueueItem> {
             "Tags are being written to this file. Its review cannot change until the write is finished.",
         ));
     }
+    if item.waiting.is_some() {
+        return Err(AppError::new(
+            ErrorKind::ReadOnly,
+            "This result is waiting to be written once the file is closed in the other program. \
+             Cancel the waiting write to change its review.",
+        ));
+    }
     Ok(item)
 }
 
@@ -553,8 +703,10 @@ pub(crate) fn run_job(
         progress.current_path = track.path.clone().unwrap_or_default();
         emit(JobEvent::Progress(progress.clone()));
 
-        let result = identify_track(state, identifier, job_id, track);
+        let (result, waiting) = identify_track(state, identifier, job_id, track);
         match result.decision {
+            // Waiting for its file to be closed: not written yet.
+            ResultDecision::AutoApply if waiting => progress.review += 1,
             ResultDecision::AutoApply => progress.identified += 1,
             ResultDecision::Review => progress.review += 1,
             ResultDecision::Unidentified => progress.unidentified += 1,
@@ -574,7 +726,13 @@ pub(crate) fn run_job(
 }
 
 /// Identifies and saves one track; every failure becomes a failed result.
-fn identify_track(state: &IdentifyState, identifier: &dyn Identifier, job_id: u32, track: &JobTrack) -> IdentifyResultDto {
+/// The flag is whether its auto-apply is waiting for the file to be closed.
+fn identify_track(
+    state: &IdentifyState,
+    identifier: &dyn Identifier,
+    job_id: u32,
+    track: &JobTrack,
+) -> (IdentifyResultDto, bool) {
     let mut dto = IdentifyResultDto {
         job_id,
         track_id: track.track_id.clone(),
@@ -584,23 +742,31 @@ fn identify_track(state: &IdentifyState, identifier: &dyn Identifier, job_id: u3
         score: None,
         error: None,
     };
+    let mut waiting = false;
     match identify_and_save(state, identifier, track) {
-        Ok((path, result_id, decision, score)) => {
-            dto.path = path;
-            dto.result_id = Some(result_id);
-            dto.decision = decision.into();
-            dto.score = score;
+        Ok(saved) => {
+            dto.path = saved.path;
+            dto.result_id = Some(saved.result);
+            dto.decision = saved.decision.into();
+            dto.score = saved.score;
+            waiting = saved.waiting;
         }
         Err(message) => dto.error = Some(message),
     }
-    dto
+    (dto, waiting)
 }
 
-fn identify_and_save(
-    state: &IdentifyState,
-    identifier: &dyn Identifier,
-    track: &JobTrack,
-) -> Result<(String, ResultId, Decision, Option<f64>), String> {
+/// One track identified and saved.
+struct Saved {
+    path: String,
+    result: ResultId,
+    decision: Decision,
+    score: Option<f64>,
+    /// Its auto-apply is waiting for the file to be closed.
+    waiting: bool,
+}
+
+fn identify_and_save(state: &IdentifyState, identifier: &dyn Identifier, track: &JobTrack) -> Result<Saved, String> {
     let raw = track.path.as_deref().filter(|p| !p.is_empty()).ok_or("The library holds no file for this track.")?;
     if !Path::new(raw).is_file() {
         return Err("The file could not be found, or is not a file.".to_owned());
@@ -612,6 +778,7 @@ fn identify_and_save(
     let mut result = identifier.identify(&path).map_err(|e| e.to_string())?;
     let score = result.best().map(|b| b.score);
     let mut decision = result.decision;
+    let mut waiting = false;
     // A refusal (a track whose result was applied, or has a write open) is
     // this track's failure, not an internal error to report.
     let result_id = state
@@ -623,16 +790,31 @@ fn identify_and_save(
             // at or above the threshold that fills empty fields): written now,
             // or left for review with the reason.
             if decision == Decision::AutoApply {
-                if let Err(reason) = auto_apply(store, id) {
-                    tracing::warn!(result = id, "identify: an auto-apply was not written; left for review");
-                    tracing::debug!(%reason, "identify: auto-apply refused");
-                    decision = Decision::Review;
+                match auto_apply(store, id) {
+                    Ok(AutoApplied::Written) => {}
+                    Ok(AutoApplied::Waiting) => {
+                        tracing::info!(result = id, "identify: an auto-apply waits for its file to be closed");
+                        waiting = true;
+                    }
+                    Err(reason) => {
+                        tracing::warn!(result = id, "identify: an auto-apply was not written; left for review");
+                        tracing::debug!(%reason, "identify: auto-apply refused");
+                        decision = Decision::Review;
+                    }
                 }
             }
             Ok(id)
         })
-        .map_err(|e| e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message)))?;
-    Ok((path_text, result_id, decision, score))
+        .map_err(|e| message_of(&e))?;
+    Ok(Saved { path: path_text, result: result_id, decision, score, waiting })
+}
+
+/// What became of an auto-apply that was not refused.
+enum AutoApplied {
+    Written,
+    /// The file is open in another program: kept as a waiting write, its
+    /// decision still auto-apply.
+    Waiting,
 }
 
 /// Writes an auto-apply result to its file, every field of its proposal,
@@ -640,14 +822,20 @@ fn identify_and_save(
 /// ([`rbl_identify::write::apply_result`]), so it ends `AutoApplied` and can
 /// be undone. The proposal must still only fill empty fields (never a
 /// sub-genre, never an overwrite; artwork only for a file without any).
-/// When it is not written the result becomes a pending review carrying the
-/// reason; the error is that reason.
-fn auto_apply(store: &Store, result: ResultId) -> Result<(), String> {
+/// A file open in another program keeps it as a waiting write (still
+/// accepted, still decided auto-apply), written once the file is free.
+/// When it is not written otherwise the result becomes a pending review
+/// carrying the reason; the error is that reason.
+fn auto_apply(store: &Store, result: ResultId) -> Result<AutoApplied, String> {
     let written = (|| {
         let (item, ..) = store.result(result).map_err(|e| e.to_string())?.ok_or("the result is not in the store")?;
         let proposal = item.proposal.as_ref().filter(|p| p.fills_only_empty()).ok_or("the proposal does not only fill empty fields")?;
         let fields: Vec<Field> = proposal.changes.iter().map(|c| c.field).collect();
-        rbl_identify::write::apply_result(store, result, &fields).map(|_| ()).map_err(|e| e.to_string())
+        match rbl_identify::write::apply_result(store, result, &fields) {
+            Ok(_) => Ok(AutoApplied::Written),
+            Err(IdentifyError::Deferred(_)) => Ok(AutoApplied::Waiting),
+            Err(e) => Err(e.to_string()),
+        }
     })();
     written.map_err(|e| {
         let reason = format!("Auto-apply did not write this file: {e}");
@@ -837,6 +1025,8 @@ pub async fn identify_start<R: tauri::Runtime>(
         // Opened now so a store that cannot open fails the start, not
         // every track.
         identify.with_store(|_| Ok(()))?;
+        // Writes waiting for their file to be closed go first.
+        announce(&app, identify.retry_waiting(None, &[]).1);
         // Read-only: the imported records lack an ISRC rather than the
         // job failing when the library cannot be read.
         // The shared reader is taken per batch, so other readers get a turn
@@ -937,17 +1127,25 @@ pub async fn identify_save_settings(
 
 impl IdentifyState {
     /// Writes one result's ticked fields to its file, snapshotted before so
-    /// the write can be undone. The file only: never the library.
-    fn apply_one(&self, item: &ApplyItemDto) -> Result<(), String> {
+    /// the write can be undone. The file only: never the library. A file
+    /// open in another program is kept as a waiting write (`deferred`).
+    fn apply_one(&self, item: &ApplyItemDto) -> IdentifyWriteOutcomeDto {
         let fields = item
             .fields
             .iter()
             .map(|name| parse_field(name).ok_or_else(|| format!("There is no tag field \"{name}\".")))
-            .collect::<Result<Vec<_>, _>>()?;
-        let outcome = self.with_store(|store| {
-            Ok(rbl_identify::write::apply_result(store, item.result_id, &fields).map(|_| ()).map_err(|e| e.to_string()))
-        });
-        flatten(outcome)
+            .collect::<Result<Vec<_>, _>>();
+        let fields = match fields {
+            Ok(fields) => fields,
+            Err(message) => return IdentifyWriteOutcomeDto::failed(item.result_id, message),
+        };
+        let outcome = self.with_store(|store| Ok(rbl_identify::write::apply_result(store, item.result_id, &fields)));
+        match outcome {
+            Ok(Ok(_)) => IdentifyWriteOutcomeDto::written(item.result_id),
+            Ok(Err(IdentifyError::Deferred(message))) => IdentifyWriteOutcomeDto::deferred(item.result_id, message),
+            Ok(Err(e)) => IdentifyWriteOutcomeDto::failed(item.result_id, e.to_string()),
+            Err(e) => IdentifyWriteOutcomeDto::failed(item.result_id, message_of(&e)),
+        }
     }
 
     /// Undoes one result's write: the file's exact tags. A library side an
@@ -961,7 +1159,17 @@ impl IdentifyState {
 
     /// Applies each item; returns each item's outcome.
     pub(crate) fn apply_items(&self, items: &[ApplyItemDto]) -> Vec<IdentifyWriteOutcomeDto> {
-        items.iter().map(|item| IdentifyWriteOutcomeDto::new(item.result_id, self.apply_one(item))).collect()
+        items.iter().map(|item| self.apply_one(item)).collect()
+    }
+
+    /// `identify_apply`: first every other waiting write, then each item.
+    /// Returns each item's outcome and every result whose state changed.
+    pub(crate) fn apply_with_retry(&self, items: &[ApplyItemDto]) -> (Vec<IdentifyWriteOutcomeDto>, Vec<ResultId>) {
+        let asked: Vec<ResultId> = items.iter().map(|i| i.result_id).collect();
+        let (_, mut changed) = self.retry_waiting(None, &asked);
+        let outcomes = self.apply_items(items);
+        changed.extend(outcomes.iter().filter(|o| o.ok || o.deferred).map(|o| o.result_id));
+        (outcomes, changed)
     }
 
     pub(crate) fn undo_item(&self, result: ResultId) -> IdentifyWriteOutcomeDto {
@@ -977,13 +1185,20 @@ impl IdentifyState {
 fn flatten(outcome: AppResult<Result<(), String>>) -> Result<(), String> {
     match outcome {
         Ok(result) => result,
-        Err(e) => Err(e.detail.map_or(e.message.clone(), |d| format!("{}: {d}", e.message))),
+        Err(e) => Err(message_of(&e)),
     }
+}
+
+/// An app error as one line: its message, and its detail when it has one.
+fn message_of(e: &AppError) -> String {
+    e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message))
 }
 
 /// Tells the window which results changed. Only `identify:changed`: the
 /// library is never written, so it never changes here.
-fn announce<R: tauri::Runtime>(app: &tauri::AppHandle<R>, result_ids: Vec<ResultId>) {
+pub(crate) fn announce<R: tauri::Runtime>(app: &tauri::AppHandle<R>, mut result_ids: Vec<ResultId>) {
+    result_ids.sort_unstable();
+    result_ids.dedup();
     if !result_ids.is_empty() {
         let _ = tauri::Emitter::emit(app, CHANGED_EVENT, IdentifyChangedDto { result_ids });
     }
@@ -999,9 +1214,35 @@ pub async fn identify_apply<R: tauri::Runtime>(
     items: Vec<ApplyItemDto>,
 ) -> AppResult<Vec<IdentifyWriteOutcomeDto>> {
     let identify = Arc::clone(&identify);
-    let outcomes = blocking("identify_apply", move || Ok(identify.apply_items(&items))).await?;
-    announce(&app, outcomes.iter().filter(|o| o.ok).map(|o| o.result_id).collect());
+    let (outcomes, changed) = blocking("identify_apply", move || Ok(identify.apply_with_retry(&items))).await?;
+    announce(&app, changed);
     Ok(outcomes)
+}
+
+/// Tries every waiting write now; one outcome per write tried (`deferred`
+/// when its file is still open in another program).
+#[tauri::command]
+pub async fn identify_retry_waiting<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    identify: State<'_, Arc<IdentifyState>>,
+) -> AppResult<Vec<IdentifyWriteOutcomeDto>> {
+    let identify = Arc::clone(&identify);
+    let (outcomes, changed) = blocking("identify_retry_waiting", move || Ok(identify.retry_waiting(None, &[]))).await?;
+    announce(&app, changed);
+    Ok(outcomes)
+}
+
+/// Gives up a result's waiting write; the result goes back to review.
+#[tauri::command]
+pub async fn identify_cancel_waiting<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    identify: State<'_, Arc<IdentifyState>>,
+    result_id: ResultId,
+) -> AppResult<IdentifyQueueItemDto> {
+    let identify = Arc::clone(&identify);
+    let item = blocking("identify_cancel_waiting", move || identify.cancel_waiting(result_id)).await?;
+    announce(&app, vec![result_id]);
+    Ok(item)
 }
 
 /// Puts back the file's tags as they were before the result's last write.
@@ -1042,21 +1283,36 @@ pub struct ApplyItemDto {
     pub fields: Vec<String>,
 }
 
-/// How one apply or undo went.
+/// How one apply, undo or retry went.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentifyWriteOutcomeDto {
     pub result_id: ResultId,
     pub ok: bool,
     pub error: Option<String>,
+    /// Not written because the file is open in another program: kept as a
+    /// waiting write (`ok` is false, `error` says when it will be written).
+    pub deferred: bool,
 }
 
 impl IdentifyWriteOutcomeDto {
     fn new(result_id: ResultId, result: Result<(), String>) -> Self {
         match result {
-            Ok(()) => Self { result_id, ok: true, error: None },
-            Err(error) => Self { result_id, ok: false, error: Some(error) },
+            Ok(()) => Self::written(result_id),
+            Err(error) => Self::failed(result_id, error),
         }
+    }
+
+    fn written(result_id: ResultId) -> Self {
+        Self { result_id, ok: true, error: None, deferred: false }
+    }
+
+    fn failed(result_id: ResultId, error: String) -> Self {
+        Self { result_id, ok: false, error: Some(error), deferred: false }
+    }
+
+    fn deferred(result_id: ResultId, error: String) -> Self {
+        Self { result_id, ok: false, error: Some(error), deferred: true }
     }
 }
 
@@ -1160,6 +1416,8 @@ pub enum QueueFilter {
     Unidentified,
     NeedsReview,
     Applied,
+    /// Results with a waiting write, newest first.
+    Waiting,
     All,
 }
 
@@ -1169,6 +1427,7 @@ impl From<QueueFilter> for Filter {
             QueueFilter::Unidentified => Self::Unidentified,
             QueueFilter::NeedsReview => Self::NeedsReview,
             QueueFilter::Applied => Self::Applied,
+            QueueFilter::Waiting => Self::Waiting,
             QueueFilter::All => Self::All,
         }
     }
@@ -1230,6 +1489,19 @@ pub struct IdentifyQueueItemDto {
     /// Where the proposed candidate came from: `fingerprint`, `textSearch`
     /// or `discogsText`; `None` without a proposal.
     pub source: Option<String>,
+    /// The write waiting for the file to be closed in another program;
+    /// `None` without one. The result is `accepted` meanwhile.
+    pub waiting: Option<IdentifyWaitingDto>,
+}
+
+/// A write kept until its file is free.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentifyWaitingDto {
+    pub since_unix: i64,
+    pub reason: String,
+    /// Frontend field names, as `identify_apply` takes them.
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1444,6 +1716,11 @@ fn queue_item_dto(item: &QueueItem) -> IdentifyQueueItemDto {
         updated_unix: item.updated_unix,
         undoable: item.state.is_applied(),
         source: item.source.as_ref().map(camel),
+        waiting: item.waiting.as_ref().map(|w| IdentifyWaitingDto {
+            since_unix: w.since_unix,
+            reason: w.reason.clone(),
+            fields: w.fields.iter().map(camel).collect(),
+        }),
     }
 }
 
@@ -2237,7 +2514,7 @@ mod tests {
     }
 
     /// A file another program holds exclusively at startup cannot be read:
-    /// its write stays open (never closed as unknown) and the next start,
+    /// its write stays open (never closed as unknown) and the exit pass,
     /// with the file free, records it as written.
     #[cfg(windows)]
     #[test]
@@ -2265,7 +2542,8 @@ mod tests {
         assert!(identify.detail(result).unwrap().write_in_progress);
         drop(held);
 
-        identify.reconcile_on_startup();
+        // Tried again at exit, with the file free: recorded as written.
+        identify.settle_on_exit(EXIT_BUDGET);
         assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
         let item = identify.detail(result).unwrap().item;
         assert_eq!((item.state.as_str(), item.undoable), ("applied", true));
@@ -2283,16 +2561,30 @@ mod tests {
     #[cfg(windows)]
     const FILE_SHARE_DELETE: u32 = 0x4;
 
-    /// A player holding the file open, sharing read only or read and delete:
-    /// Windows refuses the rename over it either way (an open handle blocks
-    /// replacing the file even when it shares delete), so apply answers with
-    /// the "open in another program" message, the file is unchanged, the
-    /// write is abandoned (the result back to review, no write left open)
-    /// and no staged file stays behind. Once closed, it goes through.
+    /// The files in `dir` named like a staged tag write.
+    fn staged_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".rbxport-tags-"))
+            .collect()
+    }
+
+    fn open_writes(identify: &IdentifyState) -> usize {
+        identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap().len()
+    }
+
+    /// A player holding the file open (exclusively, sharing read only, or
+    /// read and delete: Windows refuses the rename over it either way) is
+    /// not a failure: the apply answers `deferred` with the message, the
+    /// file is unchanged, the result stays accepted with a waiting write of
+    /// the ticked fields, no write is left open and no staged file stays
+    /// behind. A retry while it is held keeps it waiting; once closed, the
+    /// retry writes it, and it can be undone.
     #[cfg(windows)]
     #[test]
-    fn a_file_a_player_holds_open_is_refused_and_left_as_it_was() {
-        for share in [FILE_SHARE_READ, FILE_SHARE_READ | FILE_SHARE_DELETE] {
+    fn a_file_a_player_holds_open_is_written_once_it_is_closed() {
+        for share in [0, FILE_SHARE_READ, FILE_SHARE_READ | FILE_SHARE_DELETE] {
             let dir = tempfile::tempdir().unwrap();
             let audio = dir.path().join("track.wav");
             wav(&audio);
@@ -2303,21 +2595,218 @@ mod tests {
 
             let held = hold(&audio, share);
             let outcome = identify.apply_items(&ticked(result, &["title"])).remove(0);
-            assert!(!outcome.ok, "share {share:#x}");
+            assert!(!outcome.ok && outcome.deferred, "share {share:#x}: {outcome:?}");
             let error = outcome.error.unwrap_or_default();
-            assert!(error.contains("open in another program"), "share {share:#x}: {error}");
-            assert_eq!(std::fs::read(&audio).unwrap(), original, "share {share:#x}: byte for byte");
+            assert_eq!(
+                error,
+                "track.wav is open in another program. It will be written when it's free: when rbxport starts or \
+                 closes, or when you retry.",
+                "share {share:#x}"
+            );
+            let item = identify.detail(result).unwrap().item;
+            assert_eq!(item.state, "accepted", "share {share:#x}");
+            let waiting = item.waiting.clone().unwrap();
+            assert_eq!(waiting.fields, ["title"], "share {share:#x}");
+            assert!(waiting.reason.contains("open in another program") && waiting.since_unix > 0);
+            assert_eq!(open_writes(&identify), 0, "share {share:#x}");
+            assert_eq!(staged_files(dir.path()), Vec::<String>::new(), "share {share:#x}: no staged file left");
+            let listed = identify.queue(QueueFilter::Waiting, 0, 10).unwrap();
+            assert_eq!((listed.total, listed.items[0].result_id), (1, result));
+            assert_eq!(identify.queue(QueueFilter::NeedsReview, 0, 10).unwrap().total, 0);
+            let json = serde_json::to_value(&listed.items[0]).unwrap();
+            assert!(json["waiting"]["sinceUnix"].is_i64() && json["waiting"]["fields"][0] == "title", "{json}");
+
+            // Still held: still waiting, nothing written.
+            let (tried, changed) = identify.retry_waiting(None, &[]);
+            assert_eq!(tried.len(), 1);
+            assert!(tried[0].deferred && !tried[0].ok, "share {share:#x}: {tried:?}");
+            assert_eq!(changed, Vec::<ResultId>::new());
             drop(held);
-            assert_eq!(identify.detail(result).unwrap().item.state, "pending", "share {share:#x}");
-            assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
-            let names: Vec<String> = std::fs::read_dir(dir.path())
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            assert!(names.iter().all(|n| !n.starts_with(".rbxport-tags-")), "no staged file left: {names:?}");
-            let applied = identify.apply_items(&ticked(result, &["title"])).remove(0);
-            assert!(applied.ok, "share {share:#x}: {applied:?}");
+            assert_eq!(std::fs::read(&audio).unwrap(), original, "share {share:#x}: byte for byte");
+
+            // Free: written, by the user, and undoable.
+            let (tried, changed) = identify.retry_waiting(None, &[]);
+            assert!(tried[0].ok && !tried[0].deferred, "share {share:#x}: {tried:?}");
+            assert_eq!(changed, [result]);
+            let item = identify.detail(result).unwrap().item;
+            assert_eq!((item.state.as_str(), item.undoable, item.waiting), ("applied", true, None));
+            assert_eq!(rbl_identify::pipeline::current(&tags::read(&audio).unwrap().snapshot, Field::Title), "Mine");
+            assert_eq!(identify.retry_waiting(None, &[]).0, [], "nothing waits now");
+            assert!(identify.undo_item(result).ok);
+            assert_eq!(std::fs::read(&audio).unwrap(), original);
         }
+    }
+
+    /// A waiting write whose file was retagged meanwhile is not made: it is
+    /// dropped, and the result goes back to review saying why.
+    #[cfg(windows)]
+    #[test]
+    fn a_waiting_write_whose_file_changed_is_dropped_back_to_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let result = identified(&identify, &audio, "42", title);
+        let held = hold(&audio, FILE_SHARE_READ);
+        assert!(identify.apply_items(&ticked(result, &["title"]))[0].deferred);
+        drop(held);
+        // Someone retags the file before the retry.
+        let before = tags::read(&audio).unwrap().snapshot;
+        let by_hand = [FieldChange { field: Field::Title, current: String::new(), proposed: "By Hand".into() }];
+        rbl_identify::write::write(&audio, &before, &rbl_identify::write::plan(&before, &by_hand).unwrap(), None).unwrap();
+        let retagged = std::fs::read(&audio).unwrap();
+
+        let (tried, changed) = identify.retry_waiting(None, &[]);
+        assert!(!tried[0].ok && !tried[0].deferred, "{tried:?}");
+        assert_eq!(changed, [result]);
+        let detail = identify.detail(result).unwrap();
+        assert_eq!((detail.item.state.as_str(), detail.item.waiting.as_ref()), ("pending", None));
+        assert!(detail.warnings.iter().any(|w| w.contains("changed since")), "{:?}", detail.warnings);
+        assert_eq!(std::fs::read(&audio).unwrap(), retagged, "never written over");
+    }
+
+    /// While a result waits its review cannot change; cancelling the waiting
+    /// write puts it back to pending, and it can be reviewed again.
+    #[cfg(windows)]
+    #[test]
+    fn a_waiting_write_locks_the_review_until_it_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let result = identified(&identify, &audio, "42", title);
+        let held = hold(&audio, FILE_SHARE_READ);
+        assert!(identify.apply_items(&ticked(result, &["title"]))[0].deferred);
+        for action in [ReviewAction::Accept, ReviewAction::Reject, ReviewAction::Pending] {
+            let error = identify.set_review(result, action).unwrap_err();
+            assert_eq!(error.kind, ErrorKind::ReadOnly);
+            assert!(error.message.contains("Cancel the waiting write"), "{}", error.message);
+        }
+        let edit = [FieldEditDto { field: "title".into(), proposed: "Other".into() }];
+        assert_eq!(identify.edit(result, &edit).unwrap_err().kind, ErrorKind::ReadOnly);
+
+        let item = identify.cancel_waiting(result).unwrap();
+        assert_eq!((item.state.as_str(), item.waiting), ("pending", None));
+        assert_eq!(identify.cancel_waiting(result).unwrap_err().kind, ErrorKind::Malformed, "nothing waits");
+        drop(held);
+        assert_eq!(identify.retry_waiting(None, &[]).0, [], "a cancelled write is never made");
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        assert_eq!(identify.set_review(result, ReviewAction::Reject).unwrap().state, "rejected");
+    }
+
+    /// A job's auto-apply to a file a player holds becomes a waiting write:
+    /// still decided auto-apply, counted under review (it is not written
+    /// yet), accepted; once free it is written as the auto-apply's.
+    #[cfg(windows)]
+    #[test]
+    fn a_jobs_auto_apply_to_a_held_file_waits_and_is_written_once_free() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let state = IdentifyState::with_root(root.path());
+        let audio = files.path().join("auto.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let job = JobTrack { track_id: "1".into(), title: "auto".into(), path: Some(audio.to_string_lossy().into_owned()), rekordbox: None };
+        let held = hold(&audio, FILE_SHARE_READ);
+        let events = run(&state, &[job], &Fake::new(), &AtomicBool::new(false));
+        let JobEvent::Result(done) = &events[1] else { panic!("expected a result") };
+        assert_eq!((done.decision, done.error.as_deref()), (ResultDecision::AutoApply, None));
+        let Some(JobEvent::Progress(last)) = events.last() else { panic!("no final progress") };
+        assert_eq!((last.identified, last.review), (0, 1), "not written yet");
+        let item = state.queue(QueueFilter::Waiting, 0, 10).unwrap().items.remove(0);
+        assert_eq!((item.state.as_str(), item.decision.as_str()), ("accepted", "autoApply"));
+        assert_eq!(item.waiting.as_ref().map(|w| w.fields.clone()), Some(vec!["title".to_owned(), "catalogNumber".to_owned()]));
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        drop(held);
+
+        // The next start writes it.
+        let changed = state.settle_on_start();
+        assert_eq!(changed, [item.result_id]);
+        let item = state.detail(item.result_id).unwrap().item;
+        assert_eq!((item.state.as_str(), item.undoable), ("autoApplied", true));
+    }
+
+    /// An apply first tries every other waiting write.
+    #[cfg(windows)]
+    #[test]
+    fn an_apply_first_tries_the_other_waiting_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let (first, second) = (dir.path().join("first.wav"), dir.path().join("second.wav"));
+        wav(&first);
+        wav(&second);
+        let waiting = identified(&identify, &first, "1", title.clone());
+        let asked = identified(&identify, &second, "2", title);
+        let held = hold(&first, FILE_SHARE_READ);
+        assert!(identify.apply_items(&ticked(waiting, &["title"]))[0].deferred);
+        drop(held);
+        let (outcomes, mut changed) = identify.apply_with_retry(&ticked(asked, &["title"]));
+        assert!(outcomes.len() == 1 && outcomes[0].ok, "{outcomes:?}");
+        changed.sort_unstable();
+        assert_eq!(changed, [waiting, asked]);
+        assert_eq!(identify.detail(waiting).unwrap().item.state, "applied");
+    }
+
+    /// The exit pass is bounded: with no time left nothing is tried and the
+    /// write keeps waiting for the next start; with time it is written. It
+    /// runs once.
+    #[cfg(windows)]
+    #[test]
+    fn the_exit_pass_is_bounded_and_runs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let result = identified(&identify, &audio, "42", title);
+        let held = hold(&audio, FILE_SHARE_READ);
+        assert!(identify.apply_items(&ticked(result, &["title"]))[0].deferred);
+        drop(held);
+        identify.settle_on_exit(Duration::ZERO);
+        assert!(identify.detail(result).unwrap().item.waiting.is_some(), "skipped, left for the next start");
+        identify.settle_on_exit(EXIT_BUDGET);
+        assert!(identify.detail(result).unwrap().item.waiting.is_some(), "only once per run");
+
+        let next_run = IdentifyState::with_root(dir.path().join("identify"));
+        next_run.settle_on_exit(EXIT_BUDGET);
+        let item = next_run.detail(result).unwrap().item;
+        assert_eq!((item.state.as_str(), item.waiting), ("applied", None));
+    }
+
+    /// Without a store nothing is created at start or exit.
+    #[test]
+    fn settling_creates_no_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        assert_eq!(identify.settle_on_start(), Vec::<ResultId>::new());
+        identify.settle_on_exit(EXIT_BUDGET);
+        assert!(!dir.path().join("identify").join(STORE_FILE).exists());
+    }
+
+    /// Undo of a file a player holds stays a plain failure: never deferred.
+    #[cfg(windows)]
+    #[test]
+    fn an_undo_of_a_held_file_fails_and_is_not_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let result = identified(&identify, &audio, "42", title);
+        assert!(identify.apply_items(&ticked(result, &["title"]))[0].ok);
+        let written = std::fs::read(&audio).unwrap();
+        let held = hold(&audio, FILE_SHARE_READ);
+        let undone = identify.undo_item(result);
+        drop(held);
+        assert!(!undone.ok && !undone.deferred, "{undone:?}");
+        assert!(undone.error.unwrap_or_default().contains("open in another program"));
+        assert_eq!(std::fs::read(&audio).unwrap(), written);
+        let item = identify.detail(result).unwrap().item;
+        assert_eq!((item.state.as_str(), item.waiting), ("applied", None));
     }
 
     #[test]
