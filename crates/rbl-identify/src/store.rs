@@ -495,13 +495,14 @@ pub struct Application {
     pub changes: Vec<FieldChange>,
     pub artwork: Option<ArtworkRef>,
     /// The library side of the change (rekordbox content ID and previous
-    /// values), JSON the store keeps without reading.
+    /// values), JSON the store keeps without reading. Only an older build,
+    /// which also wrote the library, recorded one; undo ignores it.
     pub library_snapshot: Option<String>,
     pub begun_unix: i64,
     /// `None` while the application is open.
     pub outcome: Option<Outcome>,
     /// The library values the write left, JSON the store keeps without
-    /// reading; `None` unless written and recorded with them.
+    /// reading; recorded only by an older build, and ignored.
     pub library_after: Option<String>,
     /// When the write was undone; `None` if it has not been.
     pub undone_unix: Option<i64>,

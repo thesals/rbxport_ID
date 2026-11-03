@@ -2,9 +2,11 @@
 //! AcoustID and MusicBrainz who it is, score what comes back against the
 //! file's own tags, and decide whether a change may be proposed.
 //!
-//! Nothing here writes tags or touches a library. The crate reads audio,
-//! talks to free metadata services under enforced rate limits, and returns
-//! decisions; applying them belongs to the app's edit path. See
+//! The crate reads audio, talks to free metadata services under enforced
+//! rate limits and returns decisions; [`write`] writes accepted changes to
+//! the audio file's tags only, on the user's request. Nothing here ever
+//! writes to a rekordbox library: identification is one-way (the app reads
+//! the library into [`store`], never back). See
 //! `docs/identify/IDENTIFY_SPEC.md` for the rules this follows.
 
 pub mod acoustid;

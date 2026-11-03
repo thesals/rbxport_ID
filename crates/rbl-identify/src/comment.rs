@@ -68,8 +68,8 @@ pub fn append(current: &str, addition: &str) -> String {
 }
 
 /// The segments of `proposed` that `current` does not hold: what an append
-/// adds. Used to carry the same addition to another copy of the comment
-/// (the library record's) without copying the file's other text there.
+/// adds, so the same addition can be made to the comment as the file holds
+/// it at write time without copying any other text into it.
 #[must_use]
 pub fn added(current: &str, proposed: &str) -> Vec<String> {
     segments(proposed)
