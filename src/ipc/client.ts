@@ -15,7 +15,7 @@ import type {
   TreeNode, ViewHandle,
   TrackDetails, TrackLookups,
   IdentifyChangedEvent, IdentifyDetail, IdentifyProgress, IdentifyQueue, IdentifyQueueItem, IdentifyResultEvent,
-  IdentifyWriteOutcome,
+  IdentifySettings, IdentifyWriteOutcome,
 } from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -574,6 +574,8 @@ async function realBackend(): Promise<Backend> {
       undo: (resultId) => invoke<IdentifyWriteOutcome>("identify_undo", { resultId }),
       acceptAbove: (threshold) => invoke<number>("identify_accept_above", { threshold }),
       onChanged: (listener) => subscribe<IdentifyChangedEvent>("identify:changed", listener),
+      settings: () => invoke<IdentifySettings>("identify_settings"),
+      saveSettings: (update) => invoke<IdentifySettings>("identify_save_settings", { update: { ...update } }),
     },
     filterValues: (spec) => invoke<FilterValues>("filter_values", { spec }),
     trackDetails: (trackId) => invoke<TrackDetails>("track_details", { track: trackId }),

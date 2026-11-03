@@ -228,8 +228,10 @@ export interface Backend {
 
   /**
    * Track identification (fork-only; `docs/identify/IDENTIFY_SPEC.md`): the
-   * background job and the review queue. Review changes touch only the
-   * identify store; nothing is written to a file from here yet.
+   * background job, the review queue and its settings. One way: it reads
+   * (imports) each track's rekordbox record into its own identify store and
+   * writes only the audio file's tags, never the rekordbox library. rekordbox
+   * shows a written change after its own Reload Tag on those tracks.
    */
   identify: IdentifyBackend;
 
@@ -1800,6 +1802,8 @@ export interface IdentifyQueueItem {
   updatedUnix: number;
   /** Applied, with the original tags snapshotted, so `identify.undo` can restore them. */
   undoable: boolean;
+  /** Where the top candidate came from; null with no candidate. */
+  source: IdentifyCandidate["source"] | null;
 }
 
 /** A window of the queue and the filter's total. */
@@ -1839,6 +1843,25 @@ export interface IdentifyCandidate {
   rejected: string | null;
 }
 
+/**
+ * A track's rekordbox record as the identify store imported it when the
+ * track was identified: read from rekordbox, never written back. An empty
+ * string is a field rekordbox has no value for.
+ */
+export interface IdentifyRekordboxRecord {
+  trackId: string;
+  /** When it was read, RFC 3339. */
+  importedAt: string;
+  title: string;
+  artist: string;
+  album: string;
+  label: string;
+  genre: string;
+  year: string;
+  comment: string;
+  isrc: string;
+}
+
 export interface IdentifyDetail {
   item: IdentifyQueueItem;
   existing: {
@@ -1870,6 +1893,8 @@ export interface IdentifyDetail {
   warnings: string[];
   /** A write to the file is open; review changes are refused until it ends. */
   writeInProgress: boolean;
+  /** The track's rekordbox record as imported at identify time; null when none was read. */
+  rekordbox: IdentifyRekordboxRecord | null;
 }
 
 export type IdentifyReviewAction = "accept" | "reject" | "pending";
@@ -1918,13 +1943,57 @@ export interface IdentifyBackend {
   /** Replaces proposed values; only fields the proposal lists, never artwork. */
   edit(resultId: number, changes: readonly IdentifyFieldEdit[]): Promise<IdentifyQueueItem>;
   /**
-   * Writes the ticked fields of each result to its file and the library,
-   * snapshotting the originals first. Each item answers for itself.
+   * Writes the ticked fields of each result to its file's tags, snapshotting
+   * the originals first. The rekordbox library is never written: rekordbox
+   * shows the change after its own Reload Tag. Each item answers for itself.
    */
   apply(items: readonly IdentifyApplyItem[]): Promise<IdentifyWriteOutcome[]>;
-  /** Puts an applied result's original tags back. */
+  /** Puts an applied result's original tags back in the file; the library is not touched. */
   undo(resultId: number): Promise<IdentifyWriteOutcome>;
   /** Marks every pending result scoring at least `threshold` accepted; resolves to how many. */
   acceptAbove(threshold: number): Promise<number>;
   onChanged(listener: (event: IdentifyChangedEvent) => void): () => void;
+  /** Keys are reported by where they come from, never by value. */
+  settings(): Promise<IdentifySettings>;
+  /**
+   * Saves the members given and resolves to the settings after the save.
+   * Refused (`malformed`) for a threshold outside 0.92–1.
+   */
+  saveSettings(update: IdentifySettingsUpdate): Promise<IdentifySettings>;
+}
+
+/** Where a key or setting comes from; null when it is not set. */
+export type IdentifyKeySource = "settings" | "devFile" | "environment" | null;
+
+/** How Discogs styles are proposed for Genre. The styles always go to Comment for review. */
+export type IdentifyGenrePolicy = "fillEmpty" | "replace" | "never";
+
+export interface IdentifySettings {
+  /** Where the AcoustID key comes from; never the key itself. */
+  acoustidKey: IdentifyKeySource;
+  discogsToken: IdentifyKeySource;
+  /** "" when unset. */
+  mbUserAgent: string;
+  mbUserAgentSource: IdentifyKeySource;
+  genrePolicy: IdentifyGenrePolicy;
+  /** Off by default. */
+  autoApply: boolean;
+  /** 0.92–1.0; 0.92 by default. */
+  autoApplyThreshold: number;
+  /** The settings file, shown to the user. */
+  settingsFile: string;
+}
+
+/**
+ * A change to the settings: an absent member is kept. For a key, null clears
+ * the stored value and a string replaces it.
+ */
+export interface IdentifySettingsUpdate {
+  acoustidKey?: string | null;
+  discogsToken?: string | null;
+  mbUserAgent?: string;
+  genrePolicy?: IdentifyGenrePolicy;
+  autoApply?: boolean;
+  /** Outside 0.92–1 is refused. */
+  autoApplyThreshold?: number;
 }

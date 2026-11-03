@@ -193,4 +193,19 @@ describe("mock identify", () => {
     await vi.advanceTimersByTimeAsync(400 * 3);
     expect(events[0]?.[1]).toMatchObject({ currentTitle: row!.title });
   });
+
+  it("keeps, replaces and clears settings as the store does, and never returns a key", async () => {
+    const identify = createMockIdentify({ settings: { acoustidKey: null, discogsToken: "environment" } });
+    expect(await identify.settings()).toMatchObject({ acoustidKey: null, discogsToken: "environment", autoApply: false, autoApplyThreshold: 0.92 });
+    const saved = await identify.saveSettings({ acoustidKey: "secret-key", genrePolicy: "never" });
+    expect(saved).toMatchObject({ acoustidKey: "settings", discogsToken: "environment", genrePolicy: "never" });
+    expect(JSON.stringify(saved)).not.toContain("secret-key");
+    // Clearing the stored token leaves the environment's in place.
+    expect(await identify.saveSettings({ discogsToken: "token" })).toMatchObject({ discogsToken: "settings" });
+    expect(await identify.saveSettings({ discogsToken: null })).toMatchObject({ discogsToken: "environment" });
+    expect(await identify.saveSettings({ acoustidKey: null })).toMatchObject({ acoustidKey: null });
+    await expect(identify.saveSettings({ autoApplyThreshold: 0.91 })).rejects.toMatchObject({ kind: "malformed" });
+    await expect(identify.saveSettings({ autoApplyThreshold: 1.01 })).rejects.toMatchObject({ kind: "malformed" });
+    expect(await identify.saveSettings({ autoApply: true, autoApplyThreshold: 0.95 })).toMatchObject({ autoApply: true, autoApplyThreshold: 0.95 });
+  });
 });

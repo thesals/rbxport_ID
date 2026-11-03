@@ -15,7 +15,7 @@
 import type {
   AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyChangedEvent, IdentifyDecision, IdentifyDetail, IdentifyFieldChange,
   IdentifyFilter, IdentifyProgress, IdentifyQueueItem, IdentifyResultEvent, IdentifyReviewAction, IdentifyReviewState,
-  IdentifyWriteOutcome,
+  IdentifySettings, IdentifyWriteOutcome,
 } from "./types";
 
 /** The most rows one queue call answers, as `MAX_ROWS` is in Rust. */
@@ -26,7 +26,12 @@ export interface MockIdentifyOptions {
   tickMs?: number;
   /** The library's title and artist for a track id, when it has one. */
   describe?: (trackId: string) => { title: string; artist: string } | undefined;
+  /** Where each key comes from at first; the settings file holds the rest. */
+  settings?: Partial<IdentifySettings>;
 }
+
+/** Keys found in the environment or the development file, which this window cannot clear. */
+type KeyOrigin = "devFile" | "environment" | null;
 
 type Outcome = IdentifyDecision | "failed";
 /** What the tracks of a job come out as, in turn. */
@@ -103,6 +108,19 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   let nextJob = 1;
   let running: { jobId: number; cancelled: boolean } | null = null;
   let last: IdentifyProgress | null = null;
+  // Settings: a stored key is only ever known by where it came from.
+  let settings: IdentifySettings = {
+    acoustidKey: "settings", discogsToken: "environment",
+    mbUserAgent: "rbxport/1.2.0 ( dj@example.com )", mbUserAgentSource: "settings",
+    genrePolicy: "fillEmpty", autoApply: false, autoApplyThreshold: 0.92,
+    settingsFile: "C:\\Users\\dj\\AppData\\Roaming\\rbxport\\identify\\settings.json",
+    ...options.settings,
+  };
+  /** What a key falls back to once its stored value is cleared. */
+  const origins: Record<"acoustidKey" | "discogsToken", KeyOrigin> = {
+    acoustidKey: settings.acoustidKey === "settings" ? null : settings.acoustidKey,
+    discogsToken: settings.discogsToken === "settings" ? null : settings.discogsToken,
+  };
 
   const tellProgress = (progress: IdentifyProgress) => {
     // A final progress frees the slot first, as it does in Rust.
@@ -136,24 +154,32 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
               { field: "subGenre", current: COMMENT, proposed: `${COMMENT}; Tech House` },
               { field: "artwork", current: "none", proposed: "JPEG from Cover Art Archive" },
             ];
+    const candidates = decision === "unidentified" ? [] : [candidate(artist, `${title} (Extended Mix)`, score)];
     const state: IdentifyReviewState =
       decision === "unidentified" ? "unidentified" : decision === "autoApply" ? "accepted" : "pending";
     results.set(id, {
       item: {
         resultId: id, trackId, path, state, decision, score: decision === "unidentified" ? null : score,
         artist, title, changes, updatedUnix: Math.floor(Date.now() / 1000), undoable: false,
+        source: candidates[0]?.source ?? null,
       },
       existing: {
         artist, title, album: "", label: decision === "review" ? "Old Label" : "", year: null, isrc: "", genre: "",
         catalogNumber: "", comment: decision === "review" ? COMMENT : "", hasArtwork: decision !== "review",
       },
-      candidates: decision === "unidentified" ? [] : [candidate(artist, `${title} (Extended Mix)`, score)],
+      candidates,
       enrichment: null,
       artwork: decision === "review"
         ? { source: "coverArtArchive", url: "https://coverartarchive.org/release/c3132648-11c5-4476-b152-979253d9241a/front-500", sha256: "0".repeat(64), mime: "image/jpeg", bytes: 48_213 }
         : null,
       warnings: decision === "unidentified" ? ["AcoustID: no match"] : [],
       writeInProgress: false,
+      // As imported from rekordbox: its record of a reviewed track lags the
+      // file, with an older label and no comment.
+      rekordbox: {
+        trackId, importedAt: new Date().toISOString(), title, artist, album: "",
+        label: decision === "review" ? "Older Label" : "", genre: "", year: "", comment: "", isrc: "",
+      },
     });
     current.set(path, id);
     return id;
@@ -378,6 +404,28 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
     onChanged: (listener) => {
       changedListeners.add(listener);
       return () => { changedListeners.delete(listener); };
+    },
+    settings: () => Promise.resolve({ ...settings }),
+    saveSettings: (update) => {
+      const threshold = update.autoApplyThreshold;
+      if (threshold !== undefined && !(Number.isFinite(threshold) && threshold >= 0.92 && threshold <= 1)) {
+        return fail("malformed", "The auto-apply threshold must be between 0.92 and 1.");
+      }
+      const next = { ...settings };
+      for (const key of ["acoustidKey", "discogsToken"] as const) {
+        const value = update[key];
+        if (value === undefined) continue;
+        next[key] = value === null || value.trim() === "" ? origins[key] : "settings";
+      }
+      if (update.mbUserAgent !== undefined) {
+        next.mbUserAgent = update.mbUserAgent.trim();
+        next.mbUserAgentSource = next.mbUserAgent === "" ? null : "settings";
+      }
+      if (update.genrePolicy !== undefined) next.genrePolicy = update.genrePolicy;
+      if (update.autoApply !== undefined) next.autoApply = update.autoApply;
+      if (threshold !== undefined) next.autoApplyThreshold = threshold;
+      settings = next;
+      return Promise.resolve({ ...settings });
     },
   };
 }
