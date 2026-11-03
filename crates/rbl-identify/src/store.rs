@@ -1493,8 +1493,9 @@ impl Store {
                 Ok(info) => info.snapshot,
                 // Held open (a sharing or lock violation): later.
                 Err(e) if crate::write::held_open(path) => return FileNow::Locked(e.to_string()),
-                // It opens and reads, but its tags do not parse.
-                Err(e) if opens(path) => return FileNow::Unparseable(e.to_string()),
+                // It opens and reads, but its tags do not parse. An I/O
+                // error part way through is not that: it stays open.
+                Err(e @ IdentifyError::Tags(_)) if opens(path) => return FileNow::Unparseable(e.to_string()),
                 Err(e) => return FileNow::Unreadable(e.to_string()),
             };
             match TrackKey::for_file(path) {
@@ -3381,6 +3382,27 @@ mod tests {
         assert_eq!(item.state, ReviewState::Pending);
         assert_eq!(warnings, [RECONCILED_UNPARSEABLE_WARNING]);
         assert_eq!(store.application_snapshot(garbled).unwrap(), Some(snapshot("T")), "the before-tags are kept");
+    }
+
+    #[test]
+    fn a_tag_that_does_not_parse_and_a_read_that_fails_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let garbled = dir.path().join("garbled.flac");
+        std::fs::write(&garbled, b"fLaC but nothing a reader can parse").unwrap();
+        assert!(matches!(crate::tags::read(&garbled), Err(IdentifyError::Tags(_))));
+        // A folder cannot be read as a file: an I/O error, not a parse.
+        let folder = dir.path().join("folder.mp3");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(matches!(crate::tags::read(&folder), Err(IdentifyError::Io(_))));
+    }
+
+    #[test]
+    fn an_io_error_while_reading_keeps_the_write_open() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, app) = interrupted(&store, "a.mp3", &snapshot("T"));
+        let outcomes = store.reconcile_open_applications(|_| FileNow::Unreadable("the device is not ready".into())).unwrap();
+        assert!(matches!(&outcomes[..], [Reconciliation::NeedsUser { application, .. }] if application.id == app));
+        assert_eq!(store.open_applications().unwrap().len(), 1);
     }
 
     #[test]

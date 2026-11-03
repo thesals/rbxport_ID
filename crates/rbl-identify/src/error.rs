@@ -42,6 +42,10 @@ pub enum IdentifyError {
     /// made when the file is free. Says so, in the user's terms.
     #[error("{0}")]
     Deferred(String),
+    /// A file whose tags (or format) cannot be parsed, as opposed to one
+    /// that cannot be read ([`IdentifyError::Io`]).
+    #[error("{0}")]
+    Tags(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

@@ -125,7 +125,18 @@ fn is_id3_frame_id(name: &str) -> bool {
 pub fn read(path: &Path) -> Result<FileInfo> {
     let tagged = Probe::open(path)
         .and_then(Probe::read)
-        .map_err(|e| IdentifyError::Io(std::io::Error::other(format!("{}: {e}", path.display()))))?;
+        .map_err(|e| {
+            let message = format!("{}: {e}", path.display());
+            match e.kind() {
+                // The file ends before its own structure says it does: it
+                // was read, and does not parse.
+                lofty::error::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => IdentifyError::Tags(message),
+                // Reading failed: the file may be fine.
+                lofty::error::ErrorKind::Io(io) => IdentifyError::Io(std::io::Error::new(io.kind(), message)),
+                // It was read, and is not a format or tag that parses.
+                _ => IdentifyError::Tags(message),
+            }
+        })?;
     let duration_secs = tagged.properties().duration().as_secs_f64();
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return Ok(FileInfo { tags: ExistingTags::default(), snapshot: TagSnapshot::default(), duration_secs });
@@ -420,7 +431,7 @@ fn read_raw_id3(path: &Path) -> Result<RawBlocks> {
         let footer = if header[3] == 4 && header[5] & 0x10 != 0 { 10 } else { 0 };
         let total = 10 + size + footer;
         if total > len {
-            return Err(IdentifyError::Io(std::io::Error::other(format!("{}: ID3v2 size beyond the file", path.display()))));
+            return Err(IdentifyError::Tags(format!("{}: ID3v2 size beyond the file", path.display())));
         }
         let mut block = vec![0_u8; usize::try_from(total).unwrap_or(usize::MAX)];
         file.seek(SeekFrom::Start(0))?;
