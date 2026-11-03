@@ -18,8 +18,8 @@
 //!   (`%APPDATA%\rbxport\identify` on Windows), so the app shows the
 //!   results.
 //! - `--report <csv>`: the per-track CSV, in the dry run's format (its
-//!   `ground_truth_match` judged against the imported rekordbox artist and
-//!   title); `target/identify/import_report.csv` by default. The summary is
+//!   `ground_truth_match` judged against the file's own artist and title
+//!   tags, else the imported rekordbox record's); `target/identify/import_report.csv` by default. The summary is
 //!   written beside it (`.summary.txt`) and to stderr.
 //!
 //! The passphrase comes from rekordbox's agent settings
@@ -319,11 +319,22 @@ fn clock(d: Duration) -> String {
     format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// The rekordbox record's artist and title, as the report's ground truth.
-fn truth_of(record: Option<&RekordboxRecord>) -> Option<GroundTruth> {
-    record
-        .filter(|r| !r.artist.trim().is_empty() && !r.title.trim().is_empty())
-        .map(|r| GroundTruth { artist: r.artist.clone(), title: r.title.clone(), ..GroundTruth::default() })
+/// The report's ground truth: the file's own artist and title tags, which
+/// identification starts from, or else the rekordbox record's. rekordbox
+/// often holds a title taken from the file name (`7413777_Signs_Original_Mix`)
+/// that no service returns, so its record is only the fallback.
+fn truth_of(result: Option<&TrackResult>, record: Option<&RekordboxRecord>) -> Option<GroundTruth> {
+    let usable = |artist: &str, title: &str| !artist.trim().is_empty() && !title.trim().is_empty();
+    let truth = |artist: &str, title: &str| GroundTruth {
+        artist: artist.to_owned(),
+        title: title.to_owned(),
+        ..GroundTruth::default()
+    };
+    result
+        .map(|r| &r.existing)
+        .filter(|tags| usable(&tags.artist, &tags.title))
+        .map(|tags| truth(&tags.artist, &tags.title))
+        .or_else(|| record.filter(|r| usable(&r.artist, &r.title)).map(|r| truth(&r.artist, &r.title)))
 }
 
 /// The CSV (the dry run's format) and the summary, beside each other; the
@@ -342,8 +353,8 @@ fn write_report(
     let mut failures = Vec::new();
     for done in finished {
         let record = tracks.iter().find(|t| t.track_id == done.track_id).and_then(|t| t.rekordbox.as_ref());
-        let truth = truth_of(record);
         let result = results.iter().find(|(path, _)| path.as_os_str() == done.path.as_str()).map(|(_, r)| r);
+        let truth = truth_of(result, record);
         match (done.error.as_ref(), result) {
             (None, Some(result)) => {
                 let verdict = report::judge(result, truth.as_ref());
