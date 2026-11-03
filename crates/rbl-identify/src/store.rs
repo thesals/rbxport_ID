@@ -653,6 +653,11 @@ pub const RECONCILED_UNCHANGED: &str = "reconciled at startup: the file still he
 pub const RECONCILED_UNKNOWN: &str = "unknown: reconciled at startup, the file held neither its tags from before the write nor \
      exactly the written ones";
 
+/// The warning a result carries when an interrupted write is found not to
+/// have changed its file.
+pub const RECONCILED_UNCHANGED_WARNING: &str =
+    "A write to this file was interrupted before it changed anything. Review the result again.";
+
 /// The warning a result closed as unknown at startup carries.
 pub const RECONCILED_UNKNOWN_WARNING: &str =
     "A write to this file was interrupted and what it left could not be told. Check the file's tags.";
@@ -1446,7 +1451,7 @@ impl Store {
                     continue;
                 }
                 FileNow::Read { tags, .. } if tags == before => {
-                    self.abandon_application(id, RECONCILED_UNCHANGED)?;
+                    self.abandon_reconciled(&application)?;
                     outcomes.push(Reconciliation::Abandoned { application: id });
                     continue;
                 }
@@ -1462,6 +1467,25 @@ impl Store {
             outcomes.push(Reconciliation::Unknown { application: id, reason: unknown });
         }
         Ok(outcomes)
+    }
+
+    /// Abandons an open application whose file still holds its tags from
+    /// before the write. Its result, if it is current and accepted with no
+    /// write waiting, goes back to review with a warning: it was accepted
+    /// for that write, and should not be planned again unseen.
+    fn abandon_reconciled(&self, application: &Application) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        open_application(&tx, application.id)?;
+        tx.execute(
+            "INSERT INTO application_outcomes (application_id, outcome, reason, completed_unix)
+             VALUES (?1, 'abandoned', ?2, ?3)",
+            params![application.id, RECONCILED_UNCHANGED, now_unix()],
+        )
+        .map_err(|e| sql("record the outcome", &e))?;
+        if open_waiting(&tx, application.result)?.is_none() {
+            return_to_review(&tx, application.result, Some(RECONCILED_UNCHANGED_WARNING))?;
+        }
+        tx.commit().map_err(|e| sql("commit the outcome", &e))
     }
 
     /// Closes an open application as unknown and returns its result to
@@ -3318,7 +3342,11 @@ mod tests {
         // Unchanged: abandoned, the result free again.
         let abandoned = store.application(untouched).unwrap().unwrap();
         assert!(matches!(abandoned.outcome, Some(Outcome::Abandoned { ref reason, .. }) if reason == RECONCILED_UNCHANGED));
-        store.set_state(untouched_result, ReviewState::Pending).unwrap();
+        // Its result is back in review, saying why, so it is not planned
+        // again unseen.
+        let (item, _, _, warnings) = store.result(untouched_result).unwrap().unwrap();
+        assert_eq!(item.state, ReviewState::Pending);
+        assert_eq!(warnings, [RECONCILED_UNCHANGED_WARNING]);
         // Landed: recorded as written with its after-state, undoable.
         assert_eq!(store.result(written_result).unwrap().unwrap().0.state, ReviewState::Applied);
         assert_eq!(store.application_after_snapshot(written).unwrap(), Some(written_over(&snapshot("T"))));
@@ -3382,6 +3410,23 @@ mod tests {
         assert_eq!(item.state, ReviewState::Pending);
         assert_eq!(warnings, [RECONCILED_UNPARSEABLE_WARNING]);
         assert_eq!(store.application_snapshot(garbled).unwrap(), Some(snapshot("T")), "the before-tags are kept");
+    }
+
+    #[test]
+    fn an_abandoned_write_keeps_a_result_that_still_has_a_waiting_write_accepted() {
+        let store = Store::open_in_memory().unwrap();
+        let (result, _) = interrupted(&store, "a.mp3", &snapshot("T"));
+        // A retry that crashed: a waiting write and an open application.
+        store.conn.execute(
+            "INSERT INTO waiting_writes (result_id, fields_json, reason, since_unix) VALUES (?1, '[\"Label\"]', 'open', 1)",
+            [result],
+        )
+        .unwrap();
+        let outcomes = store.reconcile_open_applications(|_| read(snapshot("T"))).unwrap();
+        assert!(matches!(outcomes[..], [Reconciliation::Abandoned { .. }]), "{outcomes:?}");
+        let (item, ..) = store.result(result).unwrap().unwrap();
+        assert_eq!(item.state, ReviewState::Accepted, "still waiting to be written");
+        assert!(item.waiting.is_some());
     }
 
     #[test]

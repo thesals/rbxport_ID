@@ -329,7 +329,10 @@ impl IdentifyState {
             let outcomes = store.reconcile_open_applications_from_files().map_err(store_error)?;
             let mut changed = Vec::new();
             for outcome in &outcomes {
-                if let Reconciliation::Completed { application } | Reconciliation::Unknown { application, .. } = outcome {
+                if let Reconciliation::Completed { application }
+                | Reconciliation::Abandoned { application }
+                | Reconciliation::Unknown { application, .. } = outcome
+                {
                     if let Some(a) = store.application(*application).map_err(store_error)? {
                         changed.push(a.result);
                     }
