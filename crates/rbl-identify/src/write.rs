@@ -229,6 +229,34 @@ fn verify(after: &TagSnapshot, edits: &[Edit]) -> Result<()> {
     Ok(())
 }
 
+/// Whether `now` is exactly what writing `changes` (as an application
+/// records them) over `before` leaves: every changed field holds its new
+/// value (as [`write`] checks it), and every other field, and the artwork's
+/// presence, is as it was. What startup reconciliation uses to recognise a
+/// write that landed before its outcome was recorded.
+#[must_use]
+pub fn holds_exactly(before: &TagSnapshot, now: &TagSnapshot, changes: &[FieldChange]) -> bool {
+    let is_changed = |field: Field| changes.iter().any(|c| c.field == field);
+    let landed = changes.iter().all(|change| {
+        let proposed = change.proposed.trim();
+        match change.field {
+            Field::Artwork => now.has_artwork,
+            Field::Year => {
+                let now = current(now, Field::Year);
+                if proposed.is_empty() { now.is_empty() } else { now.get(..4) == proposed.get(..4) }
+            }
+            field => current(now, field) == proposed,
+        }
+    });
+    let rest_kept = before
+        .values
+        .keys()
+        .chain(now.values.keys())
+        .filter(|field| !is_changed(**field))
+        .all(|&field| current(now, field) == current(before, field));
+    landed && rest_kept && (is_changed(Field::Artwork) || now.has_artwork == before.has_artwork)
+}
+
 /// Puts the file's tags back to `before`, undoing a write whose result was
 /// `after`. Refused when the file's tags are no longer `after`: the user
 /// or another program changed them since, and restoring would lose that.

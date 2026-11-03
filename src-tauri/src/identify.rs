@@ -251,13 +251,21 @@ impl IdentifyState {
             return;
         }
         // A write whose file still holds its before-snapshot never happened
-        // and is abandoned; any other stays open for the user (the review
-        // UI, Phase 4) and its track refuses review changes meanwhile.
+        // and is abandoned; one whose file holds exactly the written tags is
+        // recorded as written; one that cannot be told is closed as unknown
+        // and its result returned to review. Only a file that is not there
+        // stays open, for the next start. No file is written here.
         match self.with_store(|store| store.reconcile_open_applications_from_files().map_err(store_error)) {
             Ok(outcomes) if outcomes.is_empty() => {}
             Ok(outcomes) => {
-                let open = outcomes.iter().filter(|o| matches!(o, Reconciliation::NeedsUser { .. })).count();
-                tracing::warn!(abandoned = outcomes.len() - open, open, "identify: tag writes left open by an earlier run");
+                let count = |f: fn(&Reconciliation) -> bool| outcomes.iter().filter(|o| f(o)).count();
+                tracing::warn!(
+                    abandoned = count(|o| matches!(o, Reconciliation::Abandoned { .. })),
+                    completed = count(|o| matches!(o, Reconciliation::Completed { .. })),
+                    unknown = count(|o| matches!(o, Reconciliation::Unknown { .. })),
+                    open = count(|o| matches!(o, Reconciliation::NeedsUser { .. })),
+                    "identify: tag writes left open by an earlier run"
+                );
             }
             Err(e) => tracing::warn!(error = %e, "identify: the store could not be checked on startup"),
         }
@@ -2098,6 +2106,49 @@ mod tests {
         assert_eq!(std::fs::read(&audio).unwrap(), original);
         // The file was untouched, so the write was abandoned, as before.
         assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
+    }
+
+    #[test]
+    fn startup_records_a_write_that_landed_and_frees_one_it_cannot_tell() {
+        let dir = tempfile::tempdir().unwrap();
+        let identify = IdentifyState::with_root(dir.path().join("identify"));
+        let title = vec![FieldChange { field: Field::Title, current: String::new(), proposed: "Mine".into() }];
+        let begin = |audio: &Path, result: ResultId| {
+            identify
+                .with_store(|store| {
+                    store.set_state(result, ReviewState::Accepted).map_err(store_error)?;
+                    let before = tags::read(audio).map_err(store_error)?.snapshot;
+                    store.begin_application(result, &title, None, &before, None).map_err(store_error)
+                })
+                .unwrap()
+        };
+        // Crash after the rename: the file holds exactly the write.
+        let landed = dir.path().join("landed.wav");
+        wav(&landed);
+        let original = std::fs::read(&landed).unwrap();
+        let landed_result = identified(&identify, &landed, "1", title.clone());
+        begin(&landed, landed_result);
+        let before = tags::read(&landed).unwrap().snapshot;
+        rbl_identify::write::write(&landed, &before, &rbl_identify::write::plan(&before, &title).unwrap(), None).unwrap();
+        // Crash, then someone else retagged the file: cannot be told.
+        let other = dir.path().join("other.wav");
+        wav(&other);
+        let other_result = identified(&identify, &other, "2", title.clone());
+        begin(&other, other_result);
+        let before = tags::read(&other).unwrap().snapshot;
+        let by_hand = [FieldChange { field: Field::Title, current: String::new(), proposed: "By Hand".into() }];
+        rbl_identify::write::write(&other, &before, &rbl_identify::write::plan(&before, &by_hand).unwrap(), None).unwrap();
+        let other_bytes = std::fs::read(&other).unwrap();
+
+        identify.reconcile_on_startup();
+        assert_eq!(identify.with_store(|s| s.open_applications().map_err(store_error)).unwrap(), []);
+        let landed_item = identify.detail(landed_result).unwrap().item;
+        assert_eq!((landed_item.state.as_str(), landed_item.undoable), ("applied", true));
+        assert!(identify.undo_item(landed_result).ok);
+        assert_eq!(std::fs::read(&landed).unwrap(), original);
+        let other_detail = identify.detail(other_result).unwrap();
+        assert_eq!((other_detail.item.state.as_str(), other_detail.write_in_progress), ("pending", false));
+        assert_eq!(std::fs::read(&other).unwrap(), other_bytes, "never rewritten by reconcile");
     }
 
     /// Holds `path` open the way a player does, with `share` (`FILE_SHARE_*`).
