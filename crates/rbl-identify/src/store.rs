@@ -640,7 +640,8 @@ pub enum Reconciliation {
     /// Left open, because it can be told later: the file is not there (a
     /// volume that is not mounted), it could not be read (held open by a
     /// player, rekordbox or a virus scanner, or a passing I/O error), or no
-    /// snapshot was recorded.
+    /// snapshot was recorded. A file that opens but whose tags cannot be
+    /// parsed is not left open: it is [`Reconciliation::Unknown`].
     NeedsUser { application: Box<Application>, reason: String },
 }
 
@@ -656,6 +657,11 @@ pub const RECONCILED_UNKNOWN: &str = "unknown: reconciled at startup, the file h
 pub const RECONCILED_UNKNOWN_WARNING: &str =
     "A write to this file was interrupted and what it left could not be told. Check the file's tags.";
 
+/// The warning a result carries when an interrupted write's file could
+/// not have its tags parsed at startup.
+pub const RECONCILED_UNPARSEABLE_WARNING: &str =
+    "A write to this file was interrupted, and the file's tags cannot be read now. Check the file's tags.";
+
 /// Why a review change is refused while a write is waiting.
 const WAITING_REFUSAL: &str = "A write to this file is waiting for the file to be closed in the other program. \
      Cancel the waiting write first.";
@@ -667,7 +673,11 @@ pub enum FileNow {
     Read { tags: TagSnapshot, key: TrackKey },
     /// It is not there.
     Missing,
-    /// It is there but could not be read.
+    /// Another program holds it open, so it cannot be read now.
+    Locked(String),
+    /// It opens, but its tags cannot be parsed.
+    Unparseable(String),
+    /// It is there but could not be read (a passing I/O error).
     Unreadable(String),
 }
 
@@ -1410,6 +1420,23 @@ impl Store {
                     });
                     continue;
                 }
+                // Held by a player now: tried again at exit and next start.
+                FileNow::Locked(e) => {
+                    outcomes.push(Reconciliation::NeedsUser {
+                        application: Box::new(application),
+                        reason: format!("the file is open in another program: {e}"),
+                    });
+                    continue;
+                }
+                // The file is readable but its tags are not: what the write
+                // left can never be told, so it is closed now, its
+                // before-snapshot kept.
+                FileNow::Unparseable(e) => {
+                    let why = format!("the file's tags could not be parsed: {e}");
+                    self.close_unknown(&application, &why, RECONCILED_UNPARSEABLE_WARNING)?;
+                    outcomes.push(Reconciliation::Unknown { application: id, reason: why });
+                    continue;
+                }
                 // Not knowing is not "neither": a later start may read it.
                 FileNow::Unreadable(e) => {
                     outcomes.push(Reconciliation::NeedsUser {
@@ -1462,9 +1489,16 @@ impl Store {
                 return FileNow::Missing;
             }
             crate::write::remove_stale_temps(path);
-            let read = crate::tags::read(path).and_then(|info| Ok((info.snapshot, TrackKey::for_file(path)?)));
-            match read {
-                Ok((tags, key)) => FileNow::Read { tags, key },
+            let tags = match crate::tags::read(path) {
+                Ok(info) => info.snapshot,
+                // Held open (a sharing or lock violation): later.
+                Err(e) if crate::write::held_open(path) => return FileNow::Locked(e.to_string()),
+                // It opens and reads, but its tags do not parse.
+                Err(e) if opens(path) => return FileNow::Unparseable(e.to_string()),
+                Err(e) => return FileNow::Unreadable(e.to_string()),
+            };
+            match TrackKey::for_file(path) {
+                Ok(key) => FileNow::Read { tags, key },
                 Err(e) => FileNow::Unreadable(e.to_string()),
             }
         })
@@ -1828,6 +1862,13 @@ impl Store {
     }
 }
 
+
+/// Whether the file opens and gives up its first byte: it is not held,
+/// missing or unreadable.
+fn opens(path: &Path) -> bool {
+    let mut byte = [0_u8; 1];
+    std::fs::File::open(path).and_then(|mut f| std::io::Read::read(&mut f, &mut byte)).is_ok()
+}
 
 /// [`Store::upsert_track`] on a connection or transaction.
 fn upsert_track(
@@ -3320,6 +3361,40 @@ mod tests {
         let outcomes = store.reconcile_open_applications_from_files().unwrap();
         assert!(matches!(&outcomes[..], [Reconciliation::NeedsUser { application, .. }] if application.id == app));
         assert_eq!(store.open_applications().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_locked_file_stays_open_and_unparseable_tags_close_as_unknown() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, locked) = interrupted(&store, "locked.mp3", &snapshot("T"));
+        let (garbled_result, garbled) = interrupted(&store, "garbled.mp3", &snapshot("T"));
+        let outcomes = store
+            .reconcile_open_applications(|app| match app.path.as_str() {
+                "locked.mp3" => FileNow::Locked("sharing violation".into()),
+                _ => FileNow::Unparseable("no frames".into()),
+            })
+            .unwrap();
+        assert!(matches!(&outcomes[0], Reconciliation::NeedsUser { application, .. } if application.id == locked));
+        assert!(matches!(&outcomes[1], Reconciliation::Unknown { application, .. } if *application == garbled));
+        assert_eq!(store.open_applications().unwrap().iter().map(|a| a.id).collect::<Vec<_>>(), [locked]);
+        let (item, _, _, warnings) = store.result(garbled_result).unwrap().unwrap();
+        assert_eq!(item.state, ReviewState::Pending);
+        assert_eq!(warnings, [RECONCILED_UNPARSEABLE_WARNING]);
+        assert_eq!(store.application_snapshot(garbled).unwrap(), Some(snapshot("T")), "the before-tags are kept");
+    }
+
+    #[test]
+    fn reconciling_from_files_closes_a_file_whose_tags_do_not_parse() {
+        let store = Store::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let garbled = dir.path().join("garbled.flac");
+        std::fs::write(&garbled, b"fLaC but nothing a reader can parse").unwrap();
+        let (result, app) = interrupted(&store, garbled.to_str().unwrap(), &snapshot("T"));
+        let outcomes = store.reconcile_open_applications_from_files().unwrap();
+        assert!(matches!(&outcomes[..], [Reconciliation::Unknown { application, .. }] if *application == app), "{outcomes:?}");
+        assert_eq!(store.open_applications().unwrap(), []);
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Pending);
+        assert_eq!(std::fs::read(&garbled).unwrap(), b"fLaC but nothing a reader can parse", "never written");
     }
 
     #[test]
