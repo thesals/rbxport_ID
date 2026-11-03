@@ -128,14 +128,17 @@ test("the Identify settings pane reports keys by source and saves a change", asy
   const auto = dialog.getByRole("region", { name: "Auto-apply" });
   await expect(auto.getByRole("switch")).not.toBeChecked();
   await auto.getByRole("switch").check();
-  const threshold = auto.getByRole("spinbutton", { name: "Minimum score" });
-  await threshold.fill("0.5");
+  await expect(auto).toContainText("Write automatically at 90% confidence or higher.");
+  const threshold = auto.getByRole("spinbutton", { name: "Minimum confidence" });
+  await expect(threshold).toHaveValue("90");
+  await threshold.fill("50");
   await threshold.press("Enter");
-  await expect(auto.getByRole("alert")).toHaveText("Choose a threshold from 0.92 to 1.00.");
-  await threshold.fill("0.95");
+  await expect(auto.getByRole("alert")).toHaveText("Choose a threshold from 90% to 100%.");
+  await threshold.fill("95");
   await threshold.press("Enter");
   await expect(auto.getByRole("alert")).toHaveCount(0);
-  await expect(threshold).toHaveValue("0.95");
+  await expect(threshold).toHaveValue("95");
+  await expect(auto).toContainText("Write automatically at 95% confidence or higher.");
 });
 
 test("with auto-apply on, the job writes a qualifying match and files it under Applied, undoably", async ({ page }) => {

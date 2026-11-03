@@ -142,7 +142,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   let settings: IdentifySettings = {
     acoustidKey: "settings", discogsToken: "environment",
     mbUserAgent: "rbxport/1.2.0 ( dj@example.com )", mbUserAgentSource: "settings",
-    genrePolicy: "fillEmpty", autoApply: false, autoApplyThreshold: 0.92,
+    genrePolicy: "fillEmpty", autoApply: false, autoApplyThreshold: 0.9,
     // The file a save writes: the data folder's `.env.identify`.
     settingsFile: "C:\\Users\\dj\\AppData\\Roaming\\rbxport\\identify\\.env.identify",
     ...options.settings,
@@ -467,8 +467,8 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
     settings: () => Promise.resolve({ ...settings }),
     saveSettings: (update) => {
       const threshold = update.autoApplyThreshold;
-      if (threshold !== undefined && !(Number.isFinite(threshold) && threshold >= 0.92 && threshold <= 1)) {
-        return fail("malformed", "The auto-apply threshold must be between 0.92 and 1.");
+      if (threshold !== undefined && !(Number.isFinite(threshold) && threshold >= 0.9 && threshold <= 1)) {
+        return fail("malformed", "The auto-apply threshold must be between 0.90 and 1.");
       }
       const next = { ...settings };
       // A save writes the data folder's file; an environment variable still wins.

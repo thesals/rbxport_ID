@@ -1961,7 +1961,7 @@ export interface IdentifyBackend {
   settings(): Promise<IdentifySettings>;
   /**
    * Saves the members given and resolves to the settings after the save.
-   * Refused (`malformed`) for a threshold outside 0.92–1.
+   * Refused (`malformed`) for a threshold outside 0.90–1.
    */
   saveSettings(update: IdentifySettingsUpdate): Promise<IdentifySettings>;
 }
@@ -1982,7 +1982,7 @@ export interface IdentifySettings {
   genrePolicy: IdentifyGenrePolicy;
   /** Off by default. */
   autoApply: boolean;
-  /** 0.92–1.0; 0.92 by default. */
+  /** 0.90–1.0, in steps of 0.01; 0.90 by default. */
   autoApplyThreshold: number;
   /** The settings file, shown to the user. */
   settingsFile: string;
@@ -1998,6 +1998,6 @@ export interface IdentifySettingsUpdate {
   mbUserAgent?: string;
   genrePolicy?: IdentifyGenrePolicy;
   autoApply?: boolean;
-  /** Outside 0.92–1 is refused. */
+  /** Outside 0.90–1 is refused. */
   autoApplyThreshold?: number;
 }

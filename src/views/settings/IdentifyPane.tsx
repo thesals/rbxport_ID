@@ -32,8 +32,11 @@ import styles from "./IdentifyPane.module.css";
 type Translate = ReturnType<typeof useTranslation>;
 
 /** The auto-apply threshold's bounds, as the backend enforces them. */
-export const THRESHOLD_MIN = 0.92;
+export const THRESHOLD_MIN = 0.9;
 export const THRESHOLD_MAX = 1;
+
+/** A threshold as the pane shows it: a whole percentage. */
+const percent = (value: number) => String(Math.round(value * 100));
 
 /** Which part of the pane a save came from, so its error shows beside it. */
 type Area = "acoustidKey" | "discogsToken" | "mbUserAgent" | "genrePolicy" | "autoApply";
@@ -168,7 +171,7 @@ export function IdentifyPane() {
       if (!live) return;
       setSettings(found);
       setAgent(found.mbUserAgent);
-      setThreshold(found.autoApplyThreshold.toFixed(2));
+      setThreshold(percent(found.autoApplyThreshold));
     }).catch((e: unknown) => { if (live) setLoadError(errorMessage(e)); });
     return () => { live = false; };
   }, []);
@@ -181,7 +184,7 @@ export function IdentifyPane() {
       const saved = await (await getBackend()).identify.saveSettings(update);
       setSettings(saved);
       if (area === "mbUserAgent") setAgent(saved.mbUserAgent);
-      if (area === "autoApply") setThreshold(saved.autoApplyThreshold.toFixed(2));
+      if (area === "autoApply") setThreshold(percent(saved.autoApplyThreshold));
       return true;
     } catch (e) {
       setError(area, errorMessage(e));
@@ -201,14 +204,15 @@ export function IdentifyPane() {
     );
   }
 
+  /** The box holds a percentage; the store keeps a fraction, in steps of 0.01. */
   const commitThreshold = () => {
-    const value = Number(threshold);
+    const value = Number(threshold) / 100;
     if (threshold.trim() === "" || !Number.isFinite(value) || value < THRESHOLD_MIN || value > THRESHOLD_MAX) {
-      setError("autoApply", t("Choose a threshold from {min} to {max}.", { min: THRESHOLD_MIN.toFixed(2), max: THRESHOLD_MAX.toFixed(2) }));
+      setError("autoApply", t("Choose a threshold from {min}% to {max}%.", { min: percent(THRESHOLD_MIN), max: percent(THRESHOLD_MAX) }));
       return;
     }
     const rounded = Math.round(value * 100) / 100;
-    setThreshold(rounded.toFixed(2));
+    setThreshold(percent(rounded));
     if (rounded === settings.autoApplyThreshold) {
       setError("autoApply", null);
       return;
@@ -332,22 +336,27 @@ export function IdentifyPane() {
           })}
         </p>
         <div className={styles.actions}>
-          <label htmlFor={`${id}-threshold`}>{t("Minimum score")}</label>
+          <label htmlFor={`${id}-threshold`}>{t("Minimum confidence")}</label>
           <input
             id={`${id}-threshold`}
             type="number"
             className={`${styles.input} ${styles.number}`}
-            min={THRESHOLD_MIN}
-            max={THRESHOLD_MAX}
-            step={0.01}
+            min={THRESHOLD_MIN * 100}
+            max={THRESHOLD_MAX * 100}
+            step={1}
             value={threshold}
+            aria-describedby={`${id}-threshold-help`}
             disabled={busy || !settings.autoApply}
             onChange={(event) => setThreshold(event.target.value)}
             onBlur={commitThreshold}
             onKeyDown={(event) => { if (event.key === "Enter") commitThreshold(); }}
           />
-          <span className={layout.help}>{`${THRESHOLD_MIN.toFixed(2)}–${THRESHOLD_MAX.toFixed(2)}`}</span>
+          <span>%</span>
         </div>
+        <p id={`${id}-threshold-help`} className={layout.help}>
+          {t("Write automatically at {percent}% confidence or higher.", { percent: percent(settings.autoApplyThreshold) })}
+          {" "}{t("From {min}% to {max}%.", { min: percent(THRESHOLD_MIN), max: percent(THRESHOLD_MAX) })}
+        </p>
         {errors.autoApply !== undefined ? <p className={styles.error} role="alert">{errors.autoApply}</p> : null}
       </section>
 

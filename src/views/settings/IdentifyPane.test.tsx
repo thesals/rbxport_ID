@@ -2,7 +2,7 @@
 /**
  * The Identify settings pane against the mock identify store: keys are never
  * shown or kept, each save sends only what changed (absent keeps, null
- * clears), the auto-apply threshold stays within 0.92–1, and a key from the
+ * clears), the auto-apply threshold stays within 90–100%, and a key from the
  * environment cannot be cleared here.
  */
 import { act } from "react";
@@ -102,31 +102,36 @@ describe("IdentifyPane", () => {
     expect(save.mock.calls.some(([update]) => "discogsToken" in update)).toBe(false);
   });
 
-  it("keeps the auto-apply threshold between 0.92 and 1", async () => {
+  it("keeps the auto-apply threshold between 90% and 100%, shown as a percentage", async () => {
     await render();
     const auto = card("Auto-apply");
     const threshold = auto.querySelector<HTMLInputElement>('input[type="number"]')!;
     const toggle = auto.querySelector<HTMLInputElement>('input[role="switch"]')!;
     expect(toggle.checked).toBe(false);
     expect(threshold.disabled).toBe(true);
-    expect(threshold.value).toBe("0.92");
+    expect(threshold.value).toBe("90");
+    expect(threshold.min).toBe("90");
+    expect(threshold.max).toBe("100");
+    expect(auto.textContent).toContain("Write automatically at 90% confidence or higher.");
     await click(toggle);
     expect(save).toHaveBeenLastCalledWith({ autoApply: true });
     expect(threshold.disabled).toBe(false);
 
-    for (const outside of ["0.91", "1.01", ""]) {
+    for (const outside of ["89", "101", "0.95", ""]) {
       save.mockClear();
       type(threshold, outside);
       act(() => { threshold.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); });
       await flush();
       expect(save).not.toHaveBeenCalled();
-      expect(auto.querySelector('[role="alert"]')?.textContent).toBe("Choose a threshold from 0.92 to 1.00.");
+      expect(auto.querySelector('[role="alert"]')?.textContent).toBe("Choose a threshold from 90% to 100%.");
     }
-    type(threshold, "0.97");
+    type(threshold, "97");
     act(() => { threshold.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); });
     await flush();
     expect(save).toHaveBeenLastCalledWith({ autoApplyThreshold: 0.97 });
     expect(auto.querySelector('[role="alert"]')).toBeNull();
+    expect(threshold.value).toBe("97");
+    expect(auto.textContent).toContain("Write automatically at 97% confidence or higher.");
   });
 
   it("leaves a key from the environment alone, and lets a development-file key be replaced but not cleared", async () => {
