@@ -191,6 +191,57 @@ describe("mock identify", () => {
     expect((await identify.result(second!.resultId)).item.state).toBe("accepted");
   });
 
+  it("defers a write to a file in use, retries it once the file is free, and can cancel it", async () => {
+    const identify = createMockIdentify(AUTO);
+    const changed: number[][] = [];
+    identify.onChanged((event) => changed.push(event.resultIds));
+    await identify.start(["1", "2", "3", "4"]);
+    await finish(4);
+    const [first, second] = (await identify.queue("needsReview", 0, 10)).items;
+    expect(first?.waiting).toBeNull();
+
+    identify.setFileInUse(true, first!.path);
+    const [deferred] = await identify.apply([{ resultId: first!.resultId, fields: ["title", "label"] }]);
+    expect(deferred).toMatchObject({ resultId: first!.resultId, ok: false, deferred: true });
+    expect(deferred?.error).toMatch(/when the file is free/);
+    expect(changed.at(-1)).toEqual([first!.resultId]);
+    const waiting = (await identify.queue("waiting", 0, 10)).items;
+    expect(waiting.map((i) => i.resultId)).toEqual([first!.resultId]);
+    expect(waiting[0]).toMatchObject({ state: "accepted", waiting: { fields: ["title", "label"] } });
+    expect((await identify.result(first!.resultId)).existing.label).toBe("Old Label");
+
+    // Still in use: deferred again, nothing written.
+    expect(await identify.retryWaiting()).toEqual([expect.objectContaining({ resultId: first!.resultId, deferred: true })]);
+    identify.setFileInUse(false, first!.path);
+    expect(await identify.retryWaiting()).toEqual([{ resultId: first!.resultId, ok: true, error: null, deferred: false }]);
+    expect(changed.at(-1)).toEqual([first!.resultId]);
+    const written = await identify.result(first!.resultId);
+    expect(written.item).toMatchObject({ state: "applied", undoable: true, waiting: null });
+    expect(written.existing.label).toBe("Mock Records");
+    expect((await identify.queue("waiting", 0, 10)).total).toBe(0);
+
+    // Every file in use; cancelling drops the write and keeps the result accepted.
+    identify.setFileInUse(true);
+    expect((await identify.apply([{ resultId: second!.resultId, fields: ["label"] }]))[0]?.deferred).toBe(true);
+    expect(await identify.cancelWaiting(second!.resultId)).toMatchObject({ state: "accepted", waiting: null });
+    await expect(identify.cancelWaiting(second!.resultId)).rejects.toMatchObject({ kind: "malformed" });
+    identify.setFileInUse(false);
+    expect(await identify.retryWaiting()).toEqual([]);
+    expect((await identify.result(second!.resultId)).existing.label).toBe("Old Label");
+  });
+
+  it("retries waiting writes when another apply or a job starts", async () => {
+    const identify = createMockIdentify(AUTO);
+    await identify.start(["1", "2", "3", "4"]);
+    await finish(4);
+    const [first, second] = (await identify.queue("needsReview", 0, 10)).items;
+    identify.setFileInUse(true, first!.path);
+    await identify.apply([{ resultId: first!.resultId, fields: ["label"] }]);
+    identify.setFileInUse(false, first!.path);
+    expect((await identify.apply([{ resultId: second!.resultId, fields: ["label"] }]))).toHaveLength(1);
+    expect((await identify.result(first!.resultId)).item).toMatchObject({ state: "applied", waiting: null });
+  });
+
   it("appends the sub-genre to the comment and refuses what the store refuses", async () => {
     const identify = createMockIdentify(AUTO);
     await identify.start(["1", "2", "3"]);

@@ -1763,7 +1763,22 @@ export interface IdentifyResultEvent {
   error: string | null;
 }
 
-export type IdentifyFilter = "unidentified" | "needsReview" | "applied" | "all";
+/** `waiting`: results with a write deferred because the file was in use (`IdentifyQueueItem.waiting`). */
+export type IdentifyFilter = "unidentified" | "needsReview" | "waiting" | "applied" | "all";
+
+/**
+ * A write deferred because the file was open in another program (a player,
+ * say). The backend retries it at app start and exit, at each job and apply,
+ * and on `identify.retryWaiting`; it writes nothing if the file changed
+ * meanwhile.
+ */
+export interface IdentifyWaiting {
+  sinceUnix: number;
+  /** Why the write could not happen then. */
+  reason: string;
+  /** The ticked fields that will be written. */
+  fields: IdentifyField[];
+}
 
 export type IdentifyReviewState =
   | "unidentified" | "pending" | "accepted" | "rejected" | "applied" | "autoApplied" | "undone";
@@ -1808,6 +1823,8 @@ export interface IdentifyQueueItem {
   undoable: boolean;
   /** Where the top candidate came from; null with no candidate. */
   source: IdentifyCandidate["source"] | null;
+  /** A write waiting for the file to be free; null when none is. */
+  waiting: IdentifyWaiting | null;
 }
 
 /** A window of the queue and the filter's total. */
@@ -1914,11 +1931,16 @@ export interface IdentifyApplyItem {
   fields: IdentifyField[];
 }
 
-/** How one apply or undo went; `error` says why when `ok` is false. */
+/**
+ * How one apply or undo went; `error` says why when `ok` is false. A
+ * `deferred` write (the file was in use) is not a failure: `ok` is false and
+ * `error` says it will be written when the file is free.
+ */
 export interface IdentifyWriteOutcome {
   resultId: number;
   ok: boolean;
   error: string | null;
+  deferred: boolean;
 }
 
 /** `identify:changed`: results whose state or values changed. */
@@ -1956,6 +1978,10 @@ export interface IdentifyBackend {
   undo(resultId: number): Promise<IdentifyWriteOutcome>;
   /** Marks every pending result scoring at least `threshold` accepted; resolves to how many. */
   acceptAbove(threshold: number): Promise<number>;
+  /** Tries every waiting write now; one outcome each, `deferred` again for a file still in use. */
+  retryWaiting(): Promise<IdentifyWriteOutcome[]>;
+  /** Drops a result's waiting write without writing anything. */
+  cancelWaiting(resultId: number): Promise<IdentifyQueueItem>;
   onChanged(listener: (event: IdentifyChangedEvent) => void): () => void;
   /** Keys are reported by where they come from, never by value. */
   settings(): Promise<IdentifySettings>;

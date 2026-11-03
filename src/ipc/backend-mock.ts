@@ -24,7 +24,7 @@ import { applyEditFrom, validateEdit, isDynamicFrom, tempoX100, type EditableBea
 import { toCamelot } from "@/lib/camelot";
 import { COLOR_NAMES, wholeBpm } from "@/lib/trackFilter";
 import { referenceDeviceSettings } from "./mock-device-settings";
-import { createMockIdentify } from "./mock-identify";
+import { createMockIdentify, type MockIdentifyBackend } from "./mock-identify";
 
 const ARTISTS = [
   "MORTEN", "ARTBAT", "Meduza", "Vintage Culture", "Tujamo", "UMEK", "Kryder", "Joel Corry",
@@ -2639,13 +2639,26 @@ export function createMockBackend(options: MockOptions = {}): Backend {
           { name: "Components", tags: [{ id: "t-synth", name: "Synth" }, { id: "t-vocal", name: "Vocal" }] },
         ],
       }),
-    identify: createMockIdentify({
+    identify: exposeIdentify(createMockIdentify({
       describe: (trackId) => {
         const row = all[indexOfId.get(trackId) ?? -1];
         return row ? { title: row.title, artist: row.artist } : undefined;
       },
-    }),
+    })),
   };
+}
+
+/**
+ * Lets an end-to-end test hold a file open, as a player would:
+ * `window.__identifyFileInUse(true)` marks every file in use (or one, given
+ * its path), so an identify write to it is deferred until it is released.
+ */
+function exposeIdentify(identify: MockIdentifyBackend): MockIdentifyBackend {
+  if (typeof window !== "undefined") {
+    (window as unknown as { __identifyFileInUse?: MockIdentifyBackend["setFileInUse"] }).__identifyFileInUse =
+      (inUse, path) => identify.setFileInUse(inUse, path);
+  }
+  return identify;
 }
 
 /** A bare `?name` flag in the URL. */

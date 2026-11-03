@@ -32,6 +32,15 @@ export interface MockIdentifyOptions {
   refuseAutoWrite?: boolean;
 }
 
+/** The mock store, with a hand on which files another program holds open. */
+export interface MockIdentifyBackend extends IdentifyBackend {
+  /**
+   * Marks a file in use (a player holding it), or every file when no path is
+   * given; a write to it is then deferred until it is released and retried.
+   */
+  setFileInUse(inUse: boolean, path?: string): void;
+}
+
 /**
  * Where a value can be found, by layer. The backend resolves environment
  * first, then the data folder's `.env.identify` (what a save writes), then
@@ -91,14 +100,18 @@ const TARGET: Record<IdentifyReviewAction, IdentifyReviewState> = {
   pending: "pending",
 };
 
-const inFilter = (filter: IdentifyFilter, state: IdentifyReviewState): boolean => {
+const inFilter = (filter: IdentifyFilter, { state, waiting }: IdentifyQueueItem): boolean => {
   switch (filter) {
     case "unidentified": return state === "unidentified";
     case "needsReview": return state === "pending";
+    case "waiting": return waiting !== null;
     case "applied": return state === "applied" || state === "autoApplied";
     case "all": return true;
   }
 };
+
+/** What a write to a file in use answers: not a failure, a write for later. */
+export const DEFERRED_MESSAGE = "The file is open in another program. It will be written when the file is free.";
 
 const candidate = (artist: string, title: string, score: number): IdentifyCandidate => ({
   recordingMbid: "41f4b491-cc31-40f1-8d81-cc58b7d8f761",
@@ -122,8 +135,14 @@ const candidate = (artist: string, title: string, score: number): IdentifyCandid
   rejected: null,
 });
 
-export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyBackend {
+export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdentifyBackend {
   const tickMs = options.tickMs ?? 400;
+  /** Files another program holds open; `allInUse` holds every one. */
+  const inUse = new Set<string>();
+  let allInUse = false;
+  const busy = (path: string) => allInUse || inUse.has(path);
+  /** Waiting writes that were the job's own, so a retry records them as autoApplied. */
+  const waitingAuto = new Set<number>();
   const progressListeners = new Set<(progress: IdentifyProgress) => void>();
   const resultListeners = new Set<(result: IdentifyResultEvent) => void>();
   const changedListeners = new Set<(event: IdentifyChangedEvent) => void>();
@@ -198,7 +217,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       item: {
         resultId: id, trackId, path, state, decision, score: decision === "unidentified" ? null : score,
         artist, title, changes, updatedUnix: Math.floor(Date.now() / 1000), undoable: false,
-        source: candidates[0]?.source ?? null,
+        source: candidates[0]?.source ?? null, waiting: null,
       },
       existing: {
         artist, title, album: "", label: overwrites ? "Old Label" : "", year: null, isrc: "", genre: "",
@@ -272,10 +291,12 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
             // Written straight away; a refused write leaves it for review.
             const detail = results.get(id);
             const fields = detail ? detail.item.changes.map((c) => c.field) : [];
-            const written = options.refuseAutoWrite
-              ? { resultId: id, ok: false, error: "The file is open in another program." }
+            const written: IdentifyWriteOutcome = options.refuseAutoWrite
+              ? { resultId: id, ok: false, error: "The file is open in another program.", deferred: false }
               : write(id, fields, true);
-            if (!written.ok && detail) {
+            // A deferred write stays accepted, waiting for the file; it is not written yet.
+            if (written.deferred) counted = "review";
+            else if (!written.ok && detail) {
               detail.item.state = "pending";
               counted = "review";
             }
@@ -294,11 +315,13 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
   /**
    * Writes a result's fields as the store does, snapshotting what they
    * replace. `auto` is the job's own write of an auto-apply decision, which
-   * the store records as autoApplied; a person's is applied.
+   * the store records as autoApplied; a person's is applied. A file in use
+   * defers the write: the result is accepted and waits, with its fields,
+   * for a retry.
    */
   function write(resultId: number, fields: readonly IdentifyField[], auto: boolean): IdentifyWriteOutcome {
     const detail = changeable(resultId);
-    const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error });
+    const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error, deferred: false });
     if (!detail) return refuse("That identification result is no longer in the store.");
     if (detail.item.state !== "pending" && detail.item.state !== "accepted") {
       return refuse(`A ${detail.item.state} result cannot be applied.`);
@@ -306,6 +329,20 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
     if (fields.length === 0) return refuse("Choose at least one field to write.");
     const picked = detail.item.changes.filter((c) => fields.includes(c.field));
     if (picked.length !== new Set(fields).size) return refuse("That change could not be made to this result.");
+    if (busy(detail.item.path)) {
+      detail.item.state = "accepted";
+      detail.item.waiting = {
+        sinceUnix: detail.item.waiting?.sinceUnix ?? Math.floor(Date.now() / 1000),
+        reason: "The file is open in another program.",
+        fields: [...new Set(fields)],
+      };
+      if (auto) waitingAuto.add(resultId);
+      else waitingAuto.delete(resultId);
+      touch(detail);
+      return { resultId, ok: false, error: DEFERRED_MESSAGE, deferred: true };
+    }
+    detail.item.waiting = null;
+    waitingAuto.delete(resultId);
     snapshots.set(resultId, detail.item.changes.map((c) => ({ ...c })));
     detail.item.changes = detail.item.changes.map((c) => fields.includes(c.field) ? { ...c, current: c.proposed } : c);
     for (const change of picked) {
@@ -319,16 +356,44 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
     detail.item.state = auto ? "autoApplied" : "applied";
     detail.item.undoable = true;
     touch(detail);
-    return { resultId, ok: true, error: null };
+    return { resultId, ok: true, error: null, deferred: false };
   }
+
+  /**
+   * Tries every waiting write, as the backend does at start and exit, at
+   * each job and apply, and when asked. A file still in use stays waiting.
+   * Results that changed are told on `changed`.
+   */
+  const retryAll = (skip: ReadonlySet<number> = new Set()): IdentifyWriteOutcome[] => {
+    const outcomes: IdentifyWriteOutcome[] = [];
+    const changed: number[] = [];
+    for (const id of current.values()) {
+      if (skip.has(id)) continue;
+      const waiting = results.get(id)?.item.waiting;
+      if (!waiting) continue;
+      const outcome = write(id, waiting.fields, waitingAuto.has(id));
+      outcomes.push(outcome);
+      if (outcome.deferred) continue;
+      // Written, or refused for good: either way it waits no longer.
+      const item = results.get(id)?.item;
+      if (item) item.waiting = null;
+      waitingAuto.delete(id);
+      changed.push(id);
+    }
+    tellChanged(changed);
+    return outcomes;
+  };
 
   /** A current result with no write open, or the store's refusal. */
   const changeable = (resultId: number): IdentifyDetail | null => {
     const detail = results.get(resultId);
     return detail && current.get(detail.item.path) === resultId ? detail : null;
   };
-  const touchless = (detail: IdentifyDetail): IdentifyQueueItem =>
-    ({ ...detail.item, changes: detail.item.changes.map((c) => ({ ...c })) });
+  const touchless = (detail: IdentifyDetail): IdentifyQueueItem => ({
+    ...detail.item,
+    changes: detail.item.changes.map((c) => ({ ...c })),
+    waiting: detail.item.waiting ? { ...detail.item.waiting, fields: [...detail.item.waiting.fields] } : null,
+  });
   const touch = (detail: IdentifyDetail): IdentifyQueueItem => {
     detail.item.updatedUnix = Math.floor(Date.now() / 1000);
     return touchless(detail);
@@ -340,6 +405,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       if (running) return fail("readOnly", "Identification is already running. Wait for it to finish or cancel it.");
       const jobId = nextJob++;
       running = { jobId, cancelled: false };
+      retryAll();
       const ids = [...new Set(trackIds)];
       last = {
         jobId, state: "running", done: 0, total: ids.length, currentTitle: "", currentPath: "",
@@ -365,7 +431,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
     queue: (filter, offset, limit) => {
       const rows = [...current.values()]
         .map((id) => results.get(id)?.item)
-        .filter((item): item is IdentifyQueueItem => item !== undefined && inFilter(filter, item.state))
+        .filter((item): item is IdentifyQueueItem => item !== undefined && inFilter(filter, item))
         .sort((a, b) =>
           (a.score === null ? 1 : 0) - (b.score === null ? 1 : 0)
           || (b.score ?? 0) - (a.score ?? 0)
@@ -416,15 +482,17 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       return Promise.resolve(item);
     },
     apply: (items) => {
+      // Waiting writes are tried first, except those this apply replaces.
+      retryAll(new Set(items.map((item) => item.resultId)));
       const outcomes = items.map(({ resultId, fields }) => write(resultId, fields, false));
-      tellChanged(outcomes.filter((o) => o.ok).map((o) => o.resultId));
+      tellChanged(outcomes.filter((o) => o.ok || o.deferred).map((o) => o.resultId));
       return Promise.resolve(outcomes);
     },
     undo: (resultId) => {
       const detail = changeable(resultId);
       const snapshot = snapshots.get(resultId);
       if (!detail || !detail.item.undoable || !snapshot) {
-        return Promise.resolve({ resultId, ok: false, error: "There is nothing to undo for this result." });
+        return Promise.resolve({ resultId, ok: false, error: "There is nothing to undo for this result.", deferred: false });
       }
       for (const original of snapshot) {
         const now = detail.item.changes.find((c) => c.field === original.field);
@@ -444,7 +512,18 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       detail.item.undoable = false;
       touch(detail);
       tellChanged([resultId]);
-      return Promise.resolve({ resultId, ok: true, error: null });
+      return Promise.resolve({ resultId, ok: true, error: null, deferred: false });
+    },
+    retryWaiting: () => Promise.resolve(retryAll()),
+    cancelWaiting: (resultId) => {
+      const detail = changeable(resultId);
+      if (!detail) return fail("notFound", "That identification result is no longer in the store.");
+      if (!detail.item.waiting) return fail("malformed", "This result has no write waiting.");
+      detail.item.waiting = null;
+      waitingAuto.delete(resultId);
+      const item = touch(detail);
+      tellChanged([resultId]);
+      return Promise.resolve(item);
     },
     acceptAbove: (threshold) => {
       if (!Number.isFinite(threshold)) return fail("malformed", "That change could not be made to this result.");
@@ -490,6 +569,16 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): IdentifyB
       if (threshold !== undefined) next.autoApplyThreshold = threshold;
       settings = next;
       return Promise.resolve({ ...settings });
+    },
+    setFileInUse: (held, path) => {
+      if (path === undefined) {
+        allInUse = held;
+        if (!held) inUse.clear();
+      } else if (held) {
+        inUse.add(path);
+      } else {
+        inUse.delete(path);
+      }
     },
   };
 }

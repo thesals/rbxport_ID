@@ -103,6 +103,7 @@ export function filterLabel(filter: IdentifyFilter, t: Translate): string {
   switch (filter) {
     case "needsReview": return t("Needs review");
     case "unidentified": return t("Unidentified");
+    case "waiting": return t("Waiting for file");
     case "applied": return t("Applied (undoable)");
     case "all": return t("All");
   }

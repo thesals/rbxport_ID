@@ -573,6 +573,8 @@ async function realBackend(): Promise<Backend> {
       }),
       undo: (resultId) => invoke<IdentifyWriteOutcome>("identify_undo", { resultId }),
       acceptAbove: (threshold) => invoke<number>("identify_accept_above", { threshold }),
+      retryWaiting: () => invoke<IdentifyWriteOutcome[]>("identify_retry_waiting"),
+      cancelWaiting: (resultId) => invoke<IdentifyQueueItem>("identify_cancel_waiting", { resultId }),
       onChanged: (listener) => subscribe<IdentifyChangedEvent>("identify:changed", listener),
       settings: () => invoke<IdentifySettings>("identify_settings"),
       saveSettings: (update) => invoke<IdentifySettings>("identify_save_settings", { update: { ...update } }),
