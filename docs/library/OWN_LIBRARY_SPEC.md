@@ -1,6 +1,6 @@
 # Own library — specification
 
-Status: Phase 0 complete; waiting for approval to start Phase 1. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
+Status: Phase 1 complete; waiting for approval to start Phase 2. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
 
 ## Goal
 
