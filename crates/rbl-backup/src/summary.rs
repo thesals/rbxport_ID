@@ -181,7 +181,8 @@ pub fn from_archive(path: &Path, passphrase: &str, scratch: &Path) -> Result<Sum
                 master_db: master_db.clone(),
                 share_root: unpacked.path().join("share"),
                 passphrase: passphrase.to_owned(),
-                is_real_install: false,
+                is_user_library: false,
+        is_rekordbox_install: false,
             };
             let db = rbl_db::Library::open(location, rbl_db::OpenMode::ReadOnly)?;
             Ok(count(db.connection())?)

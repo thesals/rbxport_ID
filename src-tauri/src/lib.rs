@@ -84,7 +84,7 @@ fn schema_key(db_version: Option<i64>) -> u32 {
 pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         let started = std::time::Instant::now();
-        if let Ok(location) = rbl_db::detect() {
+        if let Ok(location) = rbl_db::own_location() {
             if let Err(e) = backups::recover(app.state::<Arc<state::AppState>>().backup_dir(), &location) {
                 report_problem(&app, dto::LibraryProblemDto::Failed { message: e.to_string() });
                 return;
@@ -95,7 +95,7 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
             std::thread::Builder::new().name("startup-snapshot".into())
                 .spawn(move || rbl_index::cache::prepare(&path)).ok()
         });
-        match rbl_db::Library::open_installed_read_only() {
+        match rbl_db::own_location().and_then(|location| rbl_db::Library::open(location, rbl_db::OpenMode::ReadOnly)) {
             Ok(db) => {
                 if let Err(e) = file_journal::recover(app.state::<Arc<state::AppState>>().backup_dir(), db.location()) {
                     tracing::error!(error = %e, "analysis recovery failed");
@@ -122,7 +122,7 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
                         let load_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         tracing::debug!(tracks = library.len(), load_ms, "library from cache");
-                        let read_only = rbl_db::is_rekordbox_running();
+                        let read_only = location.is_rekordbox_install && rbl_db::is_rekordbox_running();
                         app.state::<Arc<AppState>>().set_library(
                             library, read_only, db_version, load_ms, location,
                         );
@@ -143,9 +143,9 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
                             load_ms,
                             "library loaded"
                         );
-                        // Writes are gated on rekordbox not running, which we
-                        // re-check per transaction; the banner reflects it now.
-                        let read_only = rbl_db::is_rekordbox_running();
+                        // rbxport's own library is never held by rekordbox;
+                        // only rekordbox's own would be, and it is never opened here.
+                        let read_only = location.is_rekordbox_install && rbl_db::is_rekordbox_running();
                         app.state::<Arc<AppState>>()
                             .set_library(library, read_only, db_version, load_ms, location);
                         let _ = tauri::Emitter::emit(&app, "library:ready", ());

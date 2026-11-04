@@ -420,7 +420,7 @@ fn create_with_progress(state: &AppState, progress: &mut dyn FnMut(&str, u64, u6
 fn validate_database(path: &Path, location: &rbl_db::LibraryLocation) -> AppResult<()> {
     let mut copy = location.clone();
     copy.master_db = path.to_path_buf();
-    copy.is_real_install = false;
+    copy.is_user_library = false;
     let db = rbl_db::Library::open(copy, rbl_db::OpenMode::ReadOnly).map_err(error)?;
     let check: String = db
         .connection()

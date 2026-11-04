@@ -2,11 +2,11 @@
 
 [Crate index](../README.md) · [Architecture](../../docs/development/architecture.md)
 
-Opens the rekordbox SQLCipher master library, probes its schema, and provides library reads, edits, imports, and temporary fixture creation.
+Opens rbxport's own library (a SQLCipher `master.db` in rekordbox's layout, kept in rbxport's folder) and, read-only, rekordbox's. Probes the schema and provides library reads, edits, imports, and temporary fixture creation.
 
 ## Start here
 
-Follow `LibraryLocation`, `OpenMode`, and `Library::open` in [`src/lib.rs`](src/lib.rs), then the operation-specific module. `rbl-index` loads its browse snapshot from this crate.
+Follow `LibraryLocation`, `own_location`, `OpenMode`, and `Library::open` in [`src/lib.rs`](src/lib.rs), then the operation-specific module. `rbl-index` loads its browse snapshot from this crate.
 
 Read [`tests/writes.rs`](tests/writes.rs) for existing cases and expected behavior.
 The [manifest](Cargo.toml) lists dependencies and feature flags.
@@ -21,14 +21,14 @@ The [manifest](Cargo.toml) lists dependencies and feature flags.
 | [`fixture.rs`](src/fixture.rs) | Temporary test library. |
 | [`details.rs`](src/details.rs) | Track detail queries. |
 | [`import.rs`](src/import.rs) | Import operations. |
-| [`new_library.rs`](src/new_library.rs) | New library creation. |
+| [`new_library.rs`](src/new_library.rs) | New library creation, in rbxport's folder. |
 | [`xml.rs`](src/xml.rs) | Rekordbox XML. |
 | [`itunes.rs`](src/itunes.rs) | Music-library input. |
 | [`export_info.rs`](src/export_info.rs) | Export bookkeeping. |
 
 ## Contracts and safety
 
-Opening an installed library is real data access. Never use it for write tests: set `RB_LITE_TEST=1` and use `fixture::build` in a temporary directory. Read-write access is explicit and normally refused while rekordbox is running. Do not bypass those guards or document key material.
+Opening the user's library is real data access. Never use it for write tests: set `RB_LITE_TEST=1` and use `fixture::build` in a temporary directory. Read-write access is explicit. `write_refusal_reason` always refuses rekordbox's library, both when a location is marked `is_rekordbox_install` and when its database is inside a folder rekordbox keeps its library in; under test mode it also refuses rbxport's own (`is_user_library`). Do not bypass those guards or document key material.
 
 ## Run focused checks
 

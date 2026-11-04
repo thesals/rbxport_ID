@@ -1,10 +1,8 @@
-//! A new, empty library, for a machine with no rekordbox library on it.
+//! A new, empty library in rbxport's own folder.
 //!
-//! Made where rekordbox itself would make one — `master.db` and `share/`
-//! under rekordbox's own folder, and the agent's `options.json` naming it —
-//! so the detector finds it on every later start exactly as it finds an
-//! installed library, and nothing else in the application has to know the
-//! library was made here.
+//! Made where [`crate::own_library_dir`] says: `master.db` and `share/`,
+//! nothing else, and never inside one of rekordbox's folders. rekordbox's
+//! `options.json` is not read or written: the library is rbxport's.
 //!
 //! The schema is every table and index of rekordbox's own database,
 //! verbatim, and the passphrase is the one rekordbox uses: the `dp` in the
@@ -110,49 +108,47 @@ const CUE_ANALYSIS_PLAYLIST: (&str, &str) = ("200000", "CUE Analysis Playlist");
 pub struct Plan {
     /// The database to make. Never an existing file.
     pub master_db: PathBuf,
-    /// The agent's options file, to write when there is none. `None` when
-    /// one already names `master_db`, which is then left as it is.
-    pub options_json: Option<PathBuf>,
-    passphrase: String,
 }
 
-/// Whether there is no library here and one can be made.
+/// The passphrase rbxport's libraries are encrypted with: rekordbox's own,
+/// so the file keeps rekordbox's layout in every respect. It is no secret:
+/// every rekordbox install carries it.
+pub(crate) fn passphrase() -> Result<String> {
+    crate::key::derive_password(REKORDBOX_DP)
+}
+
+/// Whether rbxport has no library yet and one can be made.
 ///
-/// `Some` when no `master.db` is where rekordbox's `options.json` says, or,
-/// with no `options.json`, where rekordbox keeps it. `None` when there is a
-/// database — one that would not open is a different problem, and replacing
-/// it is never the answer — or an `options.json` that cannot be read, which
-/// is a broken install rather than an absent one.
+/// `Some` when there is no `master.db` in [`crate::own_library_dir`]. `None`
+/// when there is one: one that would not open is a different problem, and
+/// replacing it is never the answer.
 pub fn plan() -> Result<Option<Plan>> {
-    plan_at(&crate::options_location()?, &crate::default_library_dir()?)
+    plan_at(&crate::own_library_dir()?)
 }
 
-/// [`plan`] for a given options file and default library folder.
-pub fn plan_at(options_json: &Path, default_dir: &Path) -> Result<Option<Plan>> {
-    if options_json.exists() {
-        let Ok(found) = crate::detect_from(options_json) else { return Ok(None) };
-        return Ok((!found.master_db.exists()).then_some(Plan {
-            master_db: found.master_db,
-            options_json: None,
-            passphrase: found.passphrase,
-        }));
-    }
-    let master_db = default_dir.join("master.db");
-    Ok((!master_db.exists()).then(|| Plan {
-        master_db,
-        options_json: Some(options_json.to_path_buf()),
-        passphrase: String::new(),
-    }))
+/// [`plan`] for a given library folder.
+pub fn plan_at(dir: &Path) -> Result<Option<Plan>> {
+    let master_db = dir.join("master.db");
+    Ok((!master_db.exists()).then_some(Plan { master_db }))
 }
 
-/// Makes the library the plan describes: the folders, an empty `master.db`,
-/// and the `options.json` naming it.
+/// Makes the library the plan describes: the folders and an empty
+/// `master.db`.
 ///
-/// The database is built beside its final name and moved into place only
-/// when complete, and the move refuses to replace a file, so a library that
-/// appeared meanwhile is never overwritten and a failure part-way leaves no
-/// half-made `master.db` for the next start to find.
+/// Refused inside a folder rekordbox keeps its library in. The database is
+/// built beside its final name and moved into place only when complete, and
+/// the move refuses to replace a file, so a library that appeared meanwhile
+/// is never overwritten and a failure part-way leaves no half-made
+/// `master.db` for the next start to find.
 pub fn create(plan: &Plan) -> Result<LibraryLocation> {
+    create_outside(plan, &crate::rekordbox_library_dirs())
+}
+
+/// [`create`], refusing inside any of `rekordbox_dirs`.
+fn create_outside(plan: &Plan, rekordbox_dirs: &[PathBuf]) -> Result<LibraryLocation> {
+    if crate::is_within_any(&plan.master_db, rekordbox_dirs) {
+        return Err(DbError::WriteRefused(crate::REKORDBOX_REFUSAL.to_owned()));
+    }
     let dir = plan
         .master_db
         .parent()
@@ -162,12 +158,7 @@ pub fn create(plan: &Plan) -> Result<LibraryLocation> {
         std::fs::create_dir_all(share_root.join(folder))?;
     }
 
-    let passphrase = if plan.options_json.is_some() {
-        crate::key::derive_password(REKORDBOX_DP)?
-    } else {
-        plan.passphrase.clone()
-    };
-
+    let passphrase = passphrase()?;
     let staging = tempfile::Builder::new().prefix(".master.db-").tempdir_in(dir)?;
     let built = staging.path().join("master.db");
     build(&built, &passphrase, &share_root)?;
@@ -182,15 +173,12 @@ pub fn create(plan: &Plan) -> Result<LibraryLocation> {
         })?;
     drop(staging);
 
-    if let Some(options) = &plan.options_json {
-        write_options(options, &plan.master_db, &share_root)?;
-    }
-
     Ok(LibraryLocation {
         master_db: plan.master_db.clone(),
         share_root,
         passphrase,
-        is_real_install: true,
+        is_user_library: true,
+        is_rekordbox_install: false,
     })
 }
 
@@ -322,63 +310,43 @@ fn unused_id(conn: &Connection, table: &str, rng: &mut rbl_core::ids::Rng) -> Re
     }
 }
 
-/// The agent's `options.json`, with the entries this application reads and
-/// the analysis root rekordbox writes beside them.
-fn write_options(to: &Path, master_db: &Path, share_root: &Path) -> Result<()> {
-    let json = serde_json::json!({
-        "options": [
-            ["db-path", master_db.to_string_lossy()],
-            ["dp", REKORDBOX_DP],
-            ["analysis-data-root-path", share_root.to_string_lossy()],
-        ]
-    });
-    let bytes = serde_json::to_vec_pretty(&json).map_err(|e| DbError::Open(e.to_string()))?;
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    // Written whole and then renamed, so a crash cannot leave a truncated
-    // file that reads as a broken install on the next start.
-    let mut staged = tempfile::NamedTempFile::new_in(to.parent().unwrap_or_else(|| Path::new(".")))?;
-    std::io::Write::write_all(&mut staged, &bytes)?;
-    staged.as_file().sync_all()?;
-    staged.persist(to).map_err(|e| DbError::Io(e.error))?;
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{detect_from, Library, OpenMode, SchemaSupport};
+    use crate::{Library, OpenMode, SchemaSupport};
 
-    fn fresh() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let root = tempfile::tempdir().unwrap();
-        let options = root.path().join("agent/storage/options.json");
-        let library = root.path().join("Pioneer/rekordbox");
-        (root, options, library)
+    /// A made library, opened as a fixture: a temp folder is not the user's
+    /// library, which the test gate would refuse to write.
+    fn made(dir: &Path) -> LibraryLocation {
+        let mut location = create(&plan_at(dir).unwrap().unwrap()).unwrap();
+        location.is_user_library = false;
+        location
     }
 
     #[test]
     fn the_stored_dp_unwraps_to_rekordbox_s_passphrase() {
-        let key = crate::key::derive_password(REKORDBOX_DP).unwrap();
+        let key = passphrase().unwrap();
         assert_eq!(key.len(), 64);
         assert!(key.starts_with("402fd"), "the published rekordbox 6/7 key starts 402fd");
     }
 
     #[test]
-    fn nothing_there_plans_a_library_and_its_options_file() {
-        let (_root, options, library) = fresh();
-        let plan = plan_at(&options, &library).unwrap().expect("a plan");
+    fn nothing_there_plans_a_library_in_the_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("rbxport/library");
+        let plan = plan_at(&library).unwrap().expect("a plan");
         assert_eq!(plan.master_db, library.join("master.db"));
-        assert_eq!(plan.options_json, Some(options));
     }
 
     #[test]
-    fn a_made_library_is_found_opened_and_writable_like_an_installed_one() {
-        let (_root, options, library) = fresh();
-        let plan = plan_at(&options, &library).unwrap().unwrap();
-        let made = create(&plan).unwrap();
+    fn a_made_library_is_opened_and_writable_and_nothing_else_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("rbxport/library");
+        let location = made(&library);
 
+        assert_eq!(location.master_db, library.join("master.db"));
+        assert_eq!(location.share_root, library.join("share"));
         assert!(library.join("share/PIONEER/Artwork").is_dir());
         assert!(library.join("share/PIONEER/USBANLZ").is_dir());
         let leftovers: Vec<_> = std::fs::read_dir(&library)
@@ -387,14 +355,12 @@ mod tests {
             .filter(|name| name != "master.db" && name != "share")
             .collect();
         assert!(leftovers.is_empty(), "nothing else is left beside it: {leftovers:?}");
+        let outside: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(outside, ["rbxport"], "no options.json or anything else is written elsewhere");
 
-        let found = detect_from(&options).unwrap();
-        assert_eq!(found.master_db, made.master_db);
-        assert_eq!(found.share_root, library.join("share"));
-        assert_eq!(found.passphrase, made.passphrase);
-
-        let mut location = found;
-        location.is_real_install = false;
         let db = Library::open(location.clone(), OpenMode::ReadOnly).unwrap();
         assert_eq!(db.schema().db_version, Some(6000));
         assert_eq!(db.schema().support, SchemaSupport::Full);
@@ -402,6 +368,8 @@ mod tests {
         let journal: String = db.connection().query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
         assert_eq!(journal, "wal");
         drop(db);
+        let reopened = crate::own_location_in(&library).unwrap();
+        assert_eq!(reopened.passphrase, location.passphrase, "the folder alone is enough to open it again");
 
         let backups = tempfile::tempdir().unwrap();
         let mut writer = crate::write::Writer::open(location, backups.path()).unwrap();
@@ -419,17 +387,15 @@ mod tests {
             + 1;
         assert!(usn > seeded, "the writer counts on from the seeded rows: {usn} after {seeded}");
 
-        assert_eq!(plan_at(&options, &library).unwrap(), None, "made once, it is not offered again");
+        assert_eq!(plan_at(&library).unwrap(), None, "made once, it is not offered again");
     }
 
     /// What rekordbox 7.2.14 wrote into a library it made itself, table by
     /// table, less the rows naming the machine and the account.
     #[test]
     fn a_made_library_starts_with_what_rekordbox_starts_one_with() {
-        let (_root, options, library) = fresh();
-        let mut location = create(&plan_at(&options, &library).unwrap().unwrap()).unwrap();
-        location.is_real_install = false;
-        let db = Library::open(location, OpenMode::ReadOnly).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let db = Library::open(made(root.path()), OpenMode::ReadOnly).unwrap();
         let count = |sql: &str| -> i64 { db.connection().query_row(sql, [], |r| r.get(0)).unwrap() };
         for (table, rows) in [
             ("djmdColor", 8), ("djmdMenuItems", 27), ("djmdCategory", 22), ("djmdSort", 17),
@@ -458,47 +424,24 @@ mod tests {
 
     #[test]
     fn an_existing_database_is_never_replaced() {
-        let (_root, options, library) = fresh();
-        let plan = plan_at(&options, &library).unwrap().unwrap();
-        std::fs::create_dir_all(&library).unwrap();
-        std::fs::write(library.join("master.db"), b"someone else's").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plan = plan_at(root.path()).unwrap().unwrap();
+        std::fs::write(root.path().join("master.db"), b"someone else's").unwrap();
 
         assert!(create(&plan).is_err());
-        assert_eq!(std::fs::read(library.join("master.db")).unwrap(), b"someone else's");
-        assert!(!options.exists(), "no options file points at a library this did not make");
+        assert_eq!(std::fs::read(root.path().join("master.db")).unwrap(), b"someone else's");
+        assert_eq!(plan_at(root.path()).unwrap(), None, "a database that is there is not offered");
     }
 
     #[test]
-    fn an_options_file_naming_a_missing_database_is_kept_and_its_key_used() {
-        let (root, options, library) = fresh();
-        let elsewhere = root.path().join("elsewhere/master.db");
-        std::fs::create_dir_all(options.parent().unwrap()).unwrap();
-        crate::fixture::write_options_json(&options, &elsewhere.to_string_lossy(), "their-own-key").unwrap();
-        let before = std::fs::read(&options).unwrap();
-
-        let plan = plan_at(&options, &library).unwrap().unwrap();
-        assert_eq!(plan.master_db, elsewhere);
-        assert_eq!(plan.options_json, None);
-        let made = create(&plan).unwrap();
-
-        assert_eq!(std::fs::read(&options).unwrap(), before);
-        assert_eq!(made.passphrase, "their-own-key");
-        Library::open(detect_from(&options).unwrap(), OpenMode::ReadOnly).unwrap();
-    }
-
-    #[test]
-    fn an_unreadable_options_file_is_not_an_absent_library() {
-        let (_root, options, library) = fresh();
-        std::fs::create_dir_all(options.parent().unwrap()).unwrap();
-        std::fs::write(&options, b"{ not json").unwrap();
-        assert_eq!(plan_at(&options, &library).unwrap(), None);
-    }
-
-    #[test]
-    fn a_default_database_without_an_options_file_is_not_offered() {
-        let (_root, options, library) = fresh();
-        std::fs::create_dir_all(&library).unwrap();
-        std::fs::write(library.join("master.db"), b"x").unwrap();
-        assert_eq!(plan_at(&options, &library).unwrap(), None);
+    fn a_library_is_never_made_in_rekordbox_s_folder() {
+        // A stand-in for rekordbox's folder: the real one is never a target.
+        let root = tempfile::tempdir().unwrap();
+        let rekordbox = root.path().join("Pioneer/rekordbox");
+        std::fs::create_dir_all(&rekordbox).unwrap();
+        let inside = rekordbox.join("library");
+        let plan = Plan { master_db: inside.join("master.db") };
+        assert!(matches!(create_outside(&plan, std::slice::from_ref(&rekordbox)), Err(DbError::WriteRefused(_))));
+        assert!(!inside.exists(), "not even its folder is made");
     }
 }

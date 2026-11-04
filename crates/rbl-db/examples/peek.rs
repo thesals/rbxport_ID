@@ -8,7 +8,8 @@ fn main() {
         master_db: path.clone().into(),
         share_root: std::path::Path::new(&path).with_file_name("share"),
         passphrase: rbl_db::fixture::FIXTURE_PASSPHRASE.to_owned(),
-        is_real_install: false,
+        is_user_library: false,
+        is_rekordbox_install: false,
     };
     let lib = rbl_db::Library::open(location, rbl_db::OpenMode::ReadOnly).expect("open");
     let conn = lib.connection();

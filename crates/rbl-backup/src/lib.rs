@@ -102,13 +102,9 @@ pub fn default_destination(state_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| state_dir.to_path_buf())
 }
 
-/// Refuses to change the installed library while rekordbox runs.
+/// Refuses to change rekordbox's library, and the user's own under test mode.
 pub fn writable(location: &rbl_db::LibraryLocation) -> Result<()> {
-    match rbl_db::write_refusal_reason(
-        location.is_real_install,
-        rbl_db::test_mode(),
-        rbl_db::is_rekordbox_running(),
-    ) {
+    match rbl_db::write_refusal_reason(location, rbl_db::test_mode()) {
         Some(reason) => Err(refused(reason)),
         None => Ok(()),
     }

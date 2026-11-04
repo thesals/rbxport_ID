@@ -1,5 +1,5 @@
-//! Starting with no rekordbox library: what the window asks at startup, and
-//! making the library when it is told to.
+//! Starting with no rbxport library yet: what the window asks at startup,
+//! and making the library, in rbxport's own folder, when it is told to.
 
 use std::sync::Arc;
 
@@ -17,12 +17,11 @@ pub fn library_problem(state: State<'_, Arc<AppState>>) -> Option<LibraryProblem
     state.library_problem()
 }
 
-/// Makes a new, empty library where rekordbox keeps one, then loads it as
-/// startup would. `library:ready` follows when it is up.
+/// Makes a new, empty library in rbxport's folder, then loads it as startup
+/// would. `library:ready` follows when it is up.
 ///
 /// Planned again here rather than trusted from startup: a library that has
-/// appeared since — rekordbox installed while the question was open — is
-/// loaded, never replaced.
+/// appeared since is loaded, never replaced.
 #[tauri::command]
 pub async fn create_library(app: tauri::AppHandle) -> AppResult<()> {
     let handle = app.clone();

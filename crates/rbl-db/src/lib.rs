@@ -1,15 +1,18 @@
-//! Read access to rekordbox's `master.db`.
+//! Access to rbxport's own library, a `master.db` in rekordbox's layout kept
+//! in rbxport's folder, and read access to rekordbox's for importing it.
 //!
-//! # Safety around the user's library
+//! # Safety around the user's libraries
 //!
-//! This crate opens the real database. Two rules are enforced here rather than
-//! left to callers:
+//! Three rules are enforced here rather than left to callers:
 //!
 //! - Opening is **read-only** unless [`OpenMode::ReadWrite`] is asked for
-//!   explicitly, and read-write is refused while rekordbox is running.
-//! - With `RBXPORT_TEST=1` set, read-write against the *detected* (i.e. real)
-//!   database path is refused outright, so a test can never write to the
-//!   user's library even by mistake.
+//!   explicitly.
+//! - **rekordbox's library is never written.** Read-write is refused for
+//!   rekordbox's installed library and for any file inside a folder rekordbox
+//!   keeps its library in, whatever the location says about itself
+//!   ([`write_refusal_reason`]).
+//! - With `RBXPORT_TEST=1` set, read-write against the user's own library is
+//!   refused outright, so a test can never write to it even by mistake.
 
 pub mod details;
 pub mod export_info;
@@ -80,7 +83,7 @@ pub enum DbError {
 
 pub type Result<T> = std::result::Result<T, DbError>;
 
-/// Where rekordbox keeps its database and how to unlock it.
+/// Where a library's database is and how to unlock it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryLocation {
     pub master_db: PathBuf,
@@ -89,8 +92,13 @@ pub struct LibraryLocation {
     /// Decrypted `SQLCipher` passphrase.
     #[serde(skip)]
     pub passphrase: String,
-    /// True when this points at the user's real install rather than a fixture.
-    pub is_real_install: bool,
+    /// True for the library the user's real data lives in: rbxport's own.
+    /// Test mode refuses to write it.
+    #[serde(alias = "is_real_install")]
+    pub is_user_library: bool,
+    /// True for rekordbox's own installed library, which is never written.
+    #[serde(default)]
+    pub is_rekordbox_install: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +110,13 @@ pub enum OpenMode {
 /// Names an `options.json` to use instead of the installed agent's.
 ///
 /// What points the compiled app at a fixture library on a test machine —
-/// see `scripts/e2e-win/`. Unset in ordinary use.
+/// see `scripts/e2e-win/`. When set, [`own_location`] opens the library it
+/// names as the user's library. Unset in ordinary use.
 pub const OPTIONS_ENV: &str = "RBXPORT_OPTIONS";
+
+/// Names the folder rbxport keeps its own library in, instead of
+/// [`own_library_dir`]'s default.
+pub const LIBRARY_DIR_ENV: &str = "RBXPORT_LIBRARY_DIR";
 
 /// The agent's options file, which holds the db path and the wrapped passphrase.
 fn options_path() -> Result<PathBuf> {
@@ -123,6 +136,11 @@ pub(crate) fn options_location() -> Result<PathBuf> {
     if let Some(chosen) = std::env::var_os(OPTIONS_ENV) {
         return Ok(PathBuf::from(chosen));
     }
+    agent_options_location()
+}
+
+/// The installed agent's options file, whatever [`OPTIONS_ENV`] says.
+fn agent_options_location() -> Result<PathBuf> {
     let base = if cfg!(target_os = "windows") {
         dirs::config_dir().map(|p| p.join("Pioneer"))
     } else {
@@ -145,7 +163,50 @@ pub(crate) fn default_library_dir() -> Result<PathBuf> {
         .ok_or_else(|| DbError::NotInstalled("no home directory".into()))
 }
 
-/// Finds the installed library and unwraps its passphrase.
+/// The folder rbxport keeps its own library in: `master.db` and `share/`.
+///
+/// `%APPDATA%\rbxport\library` on Windows,
+/// `~/Library/Application Support/rbxport/library` on macOS, or what
+/// [`LIBRARY_DIR_ENV`] names.
+pub fn own_library_dir() -> Result<PathBuf> {
+    if let Some(chosen) = std::env::var_os(LIBRARY_DIR_ENV) {
+        return Ok(PathBuf::from(chosen));
+    }
+    dirs::data_dir()
+        .map(|p| p.join("rbxport").join("library"))
+        .ok_or_else(|| DbError::NotInstalled("no data directory".into()))
+}
+
+/// rbxport's own library, which the application opens at startup.
+///
+/// The database need not exist yet: opening it then fails, and
+/// [`new_library::plan`] offers to make it. With [`OPTIONS_ENV`] set, the
+/// library that options file names is used instead, as a test machine's
+/// fixture.
+pub fn own_location() -> Result<LibraryLocation> {
+    if std::env::var_os(OPTIONS_ENV).is_some() {
+        let mut found = detect_from(&options_path()?)?;
+        found.is_user_library = true;
+        found.is_rekordbox_install = false;
+        return Ok(found);
+    }
+    own_location_in(&own_library_dir()?)
+}
+
+/// rbxport's library kept in `dir`.
+pub fn own_location_in(dir: &Path) -> Result<LibraryLocation> {
+    Ok(LibraryLocation {
+        master_db: dir.join("master.db"),
+        share_root: dir.join("share"),
+        passphrase: new_library::passphrase()?,
+        is_user_library: true,
+        is_rekordbox_install: false,
+    })
+}
+
+/// Finds rekordbox's installed library and unwraps its passphrase, for
+/// reading it: importing it, or studying rekordbox's behaviour. It is never
+/// opened for writing.
 pub fn detect() -> Result<LibraryLocation> {
     detect_from(&options_path()?)
 }
@@ -186,7 +247,63 @@ pub fn detect_from(options_json: &Path) -> Result<LibraryLocation> {
         .parent()
         .map_or_else(|| PathBuf::from("share"), |p| p.join("share"));
 
-    Ok(LibraryLocation { master_db, share_root, passphrase, is_real_install: true })
+    Ok(LibraryLocation { master_db, share_root, passphrase, is_user_library: false, is_rekordbox_install: true })
+}
+
+/// The folders rekordbox keeps its library in on this machine: its default
+/// folder, and the folder of the database its agent's `options.json` names.
+///
+/// Read from the installed agent, never from [`OPTIONS_ENV`], so a fixture
+/// named that way is not mistaken for rekordbox's library.
+#[must_use]
+pub fn rekordbox_library_dirs() -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = default_library_dir().into_iter().collect();
+    let named = agent_options_location()
+        .ok()
+        .and_then(|options| detect_from(&options).ok())
+        .and_then(|location| location.master_db.parent().map(Path::to_path_buf));
+    found.extend(named);
+    found
+}
+
+/// Whether `path` is one of `roots` or inside one: compared after resolving
+/// links and `..`, and without regard to case on Windows and macOS, whose
+/// file systems ignore it by default. Parts of `path` that do not exist yet
+/// are compared as written.
+#[must_use]
+pub fn is_within_any(path: &Path, roots: &[PathBuf]) -> bool {
+    let target = comparable(path);
+    roots.iter().any(|root| target.starts_with(comparable(root)))
+}
+
+fn comparable(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let mut existing = absolute.as_path();
+    let mut rest = Vec::new();
+    let resolved = loop {
+        if let Ok(found) = existing.canonicalize() {
+            break rest.iter().rev().fold(found, |mut at, part| {
+                at.push(part);
+                at
+            });
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => break absolute.clone(),
+        }
+    };
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        PathBuf::from(resolved.to_string_lossy().to_lowercase())
+    } else {
+        resolved
+    }
 }
 
 /// True when rekordbox (or its agent) is running, in which case we must not write.
@@ -203,28 +320,31 @@ pub fn is_rekordbox_running() -> bool {
     })
 }
 
-/// Why a read-write open must be refused, if it must.
+/// What rbxport says when asked to change rekordbox's library.
+pub const REKORDBOX_REFUSAL: &str =
+    "This is rekordbox's library. rbxport never changes it; import it into rbxport's library instead.";
+
+/// Why writing the library at `location` must be refused, if it must.
 ///
-/// Separated from [`Library::open`] so the rule can be tested without mutating
-/// process-global state.
+/// rekordbox's library is refused by what the location says and, so that a
+/// mislabelled location cannot slip through, by where its database is.
 #[must_use]
-pub fn write_refusal_reason(
-    is_real_install: bool,
-    test_mode: bool,
-    rekordbox_running: bool,
-) -> Option<&'static str> {
-    // Both rules protect the *installed* library. A fixture in a temp directory
-    // is a different file that rekordbox has never heard of, so refusing to
-    // write it while rekordbox runs protects nothing and makes the write tests
-    // impossible to run on a machine where rekordbox is open.
-    if !is_real_install {
-        return None;
+pub fn write_refusal_reason(location: &LibraryLocation, test_mode: bool) -> Option<&'static str> {
+    let rekordbox = location.is_rekordbox_install
+        || is_within_any(&location.master_db, &rekordbox_library_dirs());
+    refusal(rekordbox, location.is_user_library, test_mode)
+}
+
+/// [`write_refusal_reason`]'s rule apart from the file system, so it can be
+/// tested without mutating process-global state.
+fn refusal(rekordbox: bool, user_library: bool, test_mode: bool) -> Option<&'static str> {
+    if rekordbox {
+        return Some(REKORDBOX_REFUSAL);
     }
-    if test_mode {
-        return Some("RBXPORT_TEST is set and this is the real library; tests must copy a fixture first");
-    }
-    if rekordbox_running && !unsafe_writes_enabled() {
-        return Some("rekordbox is running. Quit it before making changes.");
+    // A fixture in a temp directory is neither: writing it is what the write
+    // tests do.
+    if user_library && test_mode {
+        return Some("RBXPORT_TEST is set and this is the user's library; tests must use a fixture");
     }
     None
 }
@@ -242,11 +362,7 @@ impl Library {
     /// Opens the library. See the module docs for the write rules.
     pub fn open(location: LibraryLocation, mode: OpenMode) -> Result<Self> {
         if mode == OpenMode::ReadWrite {
-            if let Some(reason) = write_refusal_reason(
-                location.is_real_install,
-                test_mode(),
-                is_rekordbox_running(),
-            ) {
+            if let Some(reason) = write_refusal_reason(&location, test_mode()) {
                 return Err(DbError::WriteRefused(reason.into()));
             }
         }
@@ -288,7 +404,8 @@ impl Library {
         Ok(Self { conn, mode, location, schema })
     }
 
-    /// Convenience: detect and open the installed library read-only.
+    /// Convenience: detect and open rekordbox's installed library read-only,
+    /// for the development tools that study it.
     pub fn open_installed_read_only() -> Result<Self> {
         Self::open(detect()?, OpenMode::ReadOnly)
     }
@@ -397,20 +514,98 @@ mod tests {
     }
 
     #[test]
-    fn read_write_against_the_real_library_is_refused_in_test_mode() {
-        // Guards the rule that a test can never write to the user's library.
-        // Expressed against the pure predicate so the test needs no global env
-        // mutation (which is `unsafe` in edition 2024 and racy across threads).
-        // The real library, protected by both rules.
-        assert!(write_refusal_reason(true, true, false).is_some());
-        assert!(write_refusal_reason(true, false, true).is_some());
-        assert!(write_refusal_reason(true, true, true).is_some());
-        assert!(write_refusal_reason(true, false, false).is_none());
-        // A fixture is a different file: neither rule applies to it, including
-        // while rekordbox is running, which is how the write tests can run at
-        // all on a machine with rekordbox open.
-        assert!(write_refusal_reason(false, true, false).is_none());
-        assert!(write_refusal_reason(false, false, true).is_none());
-        assert!(write_refusal_reason(false, true, true).is_none());
+    fn rekordbox_s_library_is_always_refused_and_the_user_s_only_in_test_mode() {
+        // Against the pure rule, so the test needs no global env mutation
+        // (which is `unsafe` in edition 2024 and racy across threads).
+        assert_eq!(refusal(true, false, false), Some(REKORDBOX_REFUSAL));
+        assert_eq!(refusal(true, true, false), Some(REKORDBOX_REFUSAL));
+        assert_eq!(refusal(true, false, true), Some(REKORDBOX_REFUSAL));
+        // The user's own library: writable, except by a test.
+        assert!(refusal(false, true, false).is_none());
+        assert!(refusal(false, true, true).is_some());
+        // A fixture is neither.
+        assert!(refusal(false, false, false).is_none());
+        assert!(refusal(false, false, true).is_none());
+    }
+
+    fn location_at(master_db: PathBuf, rekordbox: bool) -> LibraryLocation {
+        LibraryLocation {
+            master_db,
+            share_root: PathBuf::new(),
+            passphrase: String::new(),
+            is_user_library: false,
+            is_rekordbox_install: rekordbox,
+        }
+    }
+
+    #[test]
+    fn a_location_marked_as_rekordbox_s_is_refused_wherever_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(write_refusal_reason(&location_at(dir.path().join("master.db"), true), false), Some(REKORDBOX_REFUSAL));
+        assert!(write_refusal_reason(&location_at(dir.path().join("master.db"), false), false).is_none());
+    }
+
+    #[test]
+    fn a_file_inside_rekordbox_s_folder_counts_as_rekordbox_s() {
+        let root = tempfile::tempdir().unwrap();
+        let rekordbox = root.path().join("Pioneer").join("rekordbox");
+        std::fs::create_dir_all(rekordbox.join("share")).unwrap();
+        std::fs::create_dir_all(root.path().join("rbxport")).unwrap();
+        let roots = [rekordbox.clone()];
+        assert!(is_within_any(&rekordbox.join("master.db"), &roots));
+        assert!(is_within_any(&rekordbox.join("share").join("x.db"), &roots), "nested, existing folder");
+        assert!(is_within_any(&rekordbox.join("not-yet").join("master.db"), &roots), "nested, missing folder");
+        assert!(is_within_any(&rekordbox, &roots), "the folder itself");
+        let dotted = root.path().join("rbxport").join("..").join("Pioneer").join("rekordbox").join("master.db");
+        assert!(is_within_any(&dotted, &roots), "through ..");
+        assert!(!is_within_any(&root.path().join("rbxport").join("library").join("master.db"), &roots));
+        assert!(
+            !is_within_any(&root.path().join("Pioneer").join("rekordbox-other").join("master.db"), &roots),
+            "a sibling whose name starts the same is not inside"
+        );
+        if cfg!(windows) {
+            let shouted = PathBuf::from(rekordbox.to_string_lossy().to_uppercase()).join("MASTER.DB");
+            assert!(is_within_any(&shouted, &roots), "case does not matter on Windows");
+        }
+    }
+
+    #[test]
+    fn the_own_library_is_kept_in_the_folder_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let location = own_location_in(dir.path()).unwrap();
+        assert_eq!(location.master_db, dir.path().join("master.db"));
+        assert_eq!(location.share_root, dir.path().join("share"));
+        assert!(location.is_user_library);
+        assert!(!location.is_rekordbox_install);
+        assert_eq!(location.passphrase.len(), 64);
+    }
+
+    #[test]
+    fn the_default_own_library_folder_is_rbxport_s_not_rekordbox_s() {
+        if std::env::var_os(LIBRARY_DIR_ENV).is_some() {
+            return;
+        }
+        let dir = own_library_dir().unwrap();
+        assert!(dir.ends_with(Path::new("rbxport").join("library")));
+        assert!(!is_within_any(&dir, &rekordbox_library_dirs()));
+    }
+
+    #[test]
+    fn a_detected_install_is_rekordbox_s_and_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = dir.path().join("options.json");
+        fixture::write_options_json(&options, &dir.path().join("master.db").to_string_lossy(), "k").unwrap();
+        let found = detect_from(&options).unwrap();
+        assert!(found.is_rekordbox_install);
+        assert!(!found.is_user_library);
+        assert_eq!(write_refusal_reason(&found, false), Some(REKORDBOX_REFUSAL));
+    }
+
+    #[test]
+    fn a_location_saved_before_the_split_still_reads() {
+        let old = r#"{"master_db":"m","share_root":"s","is_real_install":true}"#;
+        let location: LibraryLocation = serde_json::from_str(old).unwrap();
+        assert!(location.is_user_library);
+        assert!(!location.is_rekordbox_install);
     }
 }

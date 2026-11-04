@@ -649,8 +649,8 @@ export function createMockBackend(options: MockOptions = {}): Backend {
    * called, so that race can be driven deliberately.
    */
   /**
-   * `?nolibrary` is a machine with no rekordbox library at all: nothing loads
-   * until `createLibrary`, and `libraryProblem` says so.
+   * `?nolibrary` is a first start, before rbxport has a library: nothing
+   * loads until `createLibrary`, and `libraryProblem` says so.
    */
   let missing = readFlagFromUrl("nolibrary");
   let ready =
@@ -2318,7 +2318,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     onLibraryProblem: () => () => undefined,
     libraryProblem: () =>
       wait<LibraryProblem | null>(
-        missing ? { kind: "missing", masterDb: "/Users/you/Library/Pioneer/rekordbox/master.db" } : null,
+        missing ? { kind: "missing", masterDb: "/Users/you/Library/Application Support/rbxport/library/master.db" } : null,
       ),
     createLibrary: async () => {
       await wait(undefined);

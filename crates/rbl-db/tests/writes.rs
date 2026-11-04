@@ -2194,7 +2194,7 @@ fn writable_connections_require_durable_commits() {
 fn crash_writer_child() {
     let Some(root) = std::env::var_os("RBL_CRASH_TEST_ROOT") else { return; };
     let root = std::path::PathBuf::from(root);
-    let location = rbl_db::LibraryLocation { master_db: root.join("master.db"), share_root: root.join("share"), passphrase: fixture::FIXTURE_PASSPHRASE.into(), is_real_install: false };
+    let location = rbl_db::LibraryLocation { master_db: root.join("master.db"), share_root: root.join("share"), passphrase: fixture::FIXTURE_PASSPHRASE.into(), is_user_library: false, is_rekordbox_install: false };
     let mut db = Library::open(location, OpenMode::ReadWrite).unwrap();
     db.connection().pragma_update(None, "cache_size", 1).unwrap();
     let tx = db.connection_mut().transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();

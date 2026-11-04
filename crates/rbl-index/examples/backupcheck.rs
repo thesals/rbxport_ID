@@ -60,7 +60,8 @@ fn main() {
         master_db: copy.clone(),
         // Not the install any more — it is a file in a temporary directory,
         // and the read-only gate keys off that.
-        is_real_install: false,
+        is_user_library: false,
+        is_rekordbox_install: false,
         ..location
     };
     let opened = Instant::now();

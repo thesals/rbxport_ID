@@ -4,7 +4,7 @@
 
 use rbl_db::new_library::{create, plan_at};
 use rbl_db::write::{AnalysisRegistration, Writer};
-use rbl_db::{detect_from, Library, OpenMode};
+use rbl_db::{Library, OpenMode};
 
 /// One second of silence as a 16-bit mono WAV.
 fn write_wav(path: &std::path::Path) {
@@ -30,13 +30,10 @@ fn write_wav(path: &std::path::Path) {
 #[test]
 fn a_new_library_takes_a_track_its_analysis_and_a_playlist() {
     let root = tempfile::tempdir().unwrap();
-    let options = root.path().join("rekordboxAgent/storage/options.json");
-    let plan = plan_at(&options, &root.path().join("rekordbox")).unwrap().unwrap();
-    create(&plan).unwrap();
-
-    let mut location = detect_from(&options).unwrap();
-    // A temp directory is not the user's install; the test gate allows it.
-    location.is_real_install = false;
+    let plan = plan_at(&root.path().join("rbxport/library")).unwrap().unwrap();
+    let mut location = create(&plan).unwrap();
+    // A temp directory is not the user's library; the test gate allows it.
+    location.is_user_library = false;
     let backups = tempfile::tempdir().unwrap();
     let mut writer = Writer::open(location.clone(), backups.path()).unwrap();
 

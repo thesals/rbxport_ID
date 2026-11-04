@@ -334,8 +334,7 @@ fn save_grid_offset(state: &AppState, track: &str, offset_ms: i16) -> crate::err
     let _edit_guard = state.edit_gate.lock();
     let _files = state.analysis_write.lock();
     let location = state.location()?;
-    if let Some(reason) = rbl_db::write_refusal_reason(location.is_real_install,
-        rbl_db::test_mode(), rbl_db::is_rekordbox_running()) {
+    if let Some(reason) = rbl_db::write_refusal_reason(&location, rbl_db::test_mode()) {
         return Err(AppError::new(ErrorKind::ReadOnly, reason));
     }
     crate::file_journal::recover(state.backup_dir(), &location)?;

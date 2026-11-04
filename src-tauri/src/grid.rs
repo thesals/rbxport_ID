@@ -379,11 +379,7 @@ fn apply_options(editor: &GridEditor, library: &Library, location: &rbl_db::Libr
     // The writer's own rule, applied to the files as well as the row: a
     // fixture in a tempdir is not the installed library, so its tests run
     // whether or not rekordbox is open.
-    if let Some(reason) = rbl_db::write_refusal_reason(
-        location.is_real_install,
-        rbl_db::test_mode(),
-        rbl_db::is_rekordbox_running(),
-    ) {
+    if let Some(reason) = rbl_db::write_refusal_reason(location, rbl_db::test_mode()) {
         return Err(AppError::new(ErrorKind::ReadOnly, reason));
     }
     let _editing = editor.editing.lock();
@@ -478,8 +474,7 @@ fn set_tempo_inner(state: &AppState, track: &str, value: &str) -> AppResult<()> 
     let bpm_x100 = (bpm * 100.0).round() as u16;
     let _files = state.analysis_write.lock();
     let location = state.location()?;
-    if let Some(reason) = rbl_db::write_refusal_reason(location.is_real_install,
-        rbl_db::test_mode(), rbl_db::is_rekordbox_running()) {
+    if let Some(reason) = rbl_db::write_refusal_reason(&location, rbl_db::test_mode()) {
         return Err(AppError::new(ErrorKind::ReadOnly, reason));
     }
     if database_locked(&location, track)? { return Err(AppError::new(ErrorKind::ReadOnly, "The beat grid is locked.")); }

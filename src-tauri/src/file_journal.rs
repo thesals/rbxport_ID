@@ -139,7 +139,7 @@ pub fn recover(root: &Path, location: &rbl_db::LibraryLocation) -> AppResult<()>
         };
         let manifest: Manifest = serde_json::from_slice(&bytes).map_err(error)?;
         if manifest.library != location.master_db { continue; }
-        if location.is_real_install && rbl_db::is_rekordbox_running() {
+        if location.is_rekordbox_install && rbl_db::is_rekordbox_running() {
             return Err(error("Quit rekordbox so an interrupted analysis edit can be recovered."));
         }
         let journal = FileJournal { dir, manifest };

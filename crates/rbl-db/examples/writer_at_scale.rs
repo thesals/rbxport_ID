@@ -40,7 +40,8 @@ fn main() {
         share_root: path.parent().map(|p| p.join("share")).unwrap_or_default(),
         passphrase,
         // A copy, so the write guards let it through.
-        is_real_install: false,
+        is_user_library: false,
+        is_rekordbox_install: false,
     };
 
     let backups = path.parent().map(|p| p.join("backups")).unwrap_or_default();
@@ -137,7 +138,8 @@ fn main() {
             master_db: backup.clone(),
             share_root: PathBuf::new(),
             passphrase: rbl_db::detect().expect("install").passphrase,
-            is_real_install: false,
+            is_user_library: false,
+        is_rekordbox_install: false,
         },
         rbl_db::OpenMode::ReadOnly,
     )

@@ -2498,7 +2498,7 @@ impl Writer {
     fn prepare(&mut self) -> Result<()> {
         // Only the installed library needs this: rekordbox holds that file's
         // WAL, and nothing else's.
-        if self.library.location().is_real_install && is_rekordbox_running() {
+        if self.library.location().is_rekordbox_install && is_rekordbox_running() {
             return Err(DbError::WriteRefused(
                 "rekordbox is running. Quit it before making changes.".to_owned(),
             ));
@@ -2986,8 +2986,7 @@ pub fn backups_in(dir: &Path) -> Vec<PathBuf> {
 /// one of this app's backups. The caller reopens every handle it holds:
 /// one on the old inode would answer with the old rows for ever.
 pub fn restore_backup(location: &crate::LibraryLocation, backup: &Path) -> Result<()> {
-    if let Some(reason) = crate::write_refusal_reason(location.is_real_install,
-        crate::test_mode(), is_rekordbox_running()) {
+    if let Some(reason) = crate::write_refusal_reason(location, crate::test_mode()) {
         return Err(DbError::WriteRefused(reason.into()));
     }
     let is_ours = backup
@@ -3006,7 +3005,7 @@ pub fn restore_backup(location: &crate::LibraryLocation, backup: &Path) -> Resul
     if wal.exists() { std::fs::copy(wal, with_suffix(&staged, "-wal"))?; }
     let mut staged_location = location.clone();
     staged_location.master_db.clone_from(&staged);
-    staged_location.is_real_install = false;
+    staged_location.is_user_library = false;
     {
         let db = Library::open(staged_location, OpenMode::ReadWrite)?;
         let check: String = db.connection().query_row("PRAGMA integrity_check", [], |r| r.get(0))?;

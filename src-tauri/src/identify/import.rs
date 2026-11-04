@@ -189,7 +189,8 @@ pub(crate) fn open_copy(copy: &Path, original: &rbl_db::LibraryLocation) -> Resu
         share_root: canonical.parent().map_or_else(|| PathBuf::from("share"), |p| p.join("share")),
         master_db: canonical,
         passphrase: original.passphrase.clone(),
-        is_real_install: false,
+        is_user_library: false,
+        is_rekordbox_install: false,
     };
     let db = rbl_db::Library::open(location, rbl_db::OpenMode::ReadOnly)
         .map_err(|e| format!("the library copy could not be opened read-only: {e}"))?;

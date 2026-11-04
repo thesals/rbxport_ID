@@ -63,11 +63,11 @@ where
 pub async fn library_summary(state: State<'_, Arc<AppState>>) -> AppResult<LibrarySummaryDto> {
     let library = state.library()?;
     let (read_only, db_version, load_ms, _generation) = state.summary();
-    let is_real_install = state.location()?.is_real_install;
+    let is_rekordbox_install = state.location()?.is_rekordbox_install;
     blocking("library_summary", move || {
         // The UI refreshes this while open; startup's process state is stale
         // as soon as rekordbox launches or exits. Fixtures keep their own gate.
-        let read_only = if is_real_install {
+        let read_only = if is_rekordbox_install {
             rbl_db::is_rekordbox_running() && !rbl_db::unsafe_writes_enabled()
         } else {
             read_only

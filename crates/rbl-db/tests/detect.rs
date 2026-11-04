@@ -15,7 +15,7 @@ fn a_fixture_s_options_json_leads_the_detector_to_the_fixture() {
     assert_eq!(found.master_db, built.master_db);
     assert_eq!(found.share_root, dir.path().join("share"));
     assert_eq!(found.passphrase, FIXTURE_PASSPHRASE, "the wrapped passphrase derives back");
-    assert!(found.is_real_install, "detected through options.json, it is treated as an install");
+    assert!(found.is_rekordbox_install, "detected through options.json, it is treated as rekordbox's install");
 
     // And the key it derived opens the database.
     let db = Library::open(found, OpenMode::ReadOnly).expect("open with the derived key");

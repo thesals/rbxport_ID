@@ -5,7 +5,7 @@
 //! writer that satisfies the fixture satisfies the real thing. A hand-written
 //! approximation would let a wrong column type or a missing `NOT NULL` pass.
 //!
-//! Fixtures are always `is_real_install: false`, so opening one read-write is
+//! Fixtures are always `is_user_library: false`, so opening one read-write is
 //! allowed even under `RBXPORT_TEST`.
 
 use std::path::Path;
@@ -182,7 +182,8 @@ pub fn build(dir: &Path, shape: Shape) -> Result<LibraryLocation> {
         passphrase: FIXTURE_PASSPHRASE.to_owned(),
         // The whole point: a fixture is never mistaken for the real install,
         // so opening it read-write is allowed even under RBXPORT_TEST.
-        is_real_install: false,
+        is_user_library: false,
+        is_rekordbox_install: false,
     })
 }
 

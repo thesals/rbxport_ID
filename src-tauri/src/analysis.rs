@@ -372,7 +372,7 @@ pub async fn edit_phrase<R: tauri::Runtime>(
 /// Whether the library cannot be written right now: rekordbox holds the
 /// installed library's file. A fixture is never held.
 fn library_locked(state: &AppState) -> bool {
-    state.location().is_ok_and(|location| location.is_real_install) && rbl_db::is_rekordbox_running()
+    state.location().is_ok_and(|location| location.is_rekordbox_install) && rbl_db::is_rekordbox_running()
 }
 
 /// Writes the three files beside `dat`, each through a temporary name so a

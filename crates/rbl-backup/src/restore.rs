@@ -353,7 +353,7 @@ fn validate_database(database: &Path, wal: &Path, location: &rbl_db::LibraryLoca
         }
         let mut copy = location.clone();
         copy.master_db = database.to_path_buf();
-        copy.is_real_install = false;
+        copy.is_user_library = false;
         let db = rbl_db::Library::open(copy, rbl_db::OpenMode::ReadOnly)
             .map_err(|_| refused("The backup's library database could not be opened. It may be damaged, or belong to another rekordbox installation."))?;
         let check: String = db.connection().query_row("PRAGMA quick_check", [], |r| r.get(0))?;
