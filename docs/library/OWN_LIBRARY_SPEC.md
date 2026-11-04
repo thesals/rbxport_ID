@@ -1,6 +1,6 @@
 # Own library — specification
 
-Status: Phase 0 (spec). Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
+Status: Phase 0 complete; waiting for approval to start Phase 1. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
 
 ## Goal
 
@@ -168,6 +168,25 @@ The delta report lists:
 - The user guide gets a "Library and import" page.
 
 **Not changed:** the `rbl-index` loading and cache, `rbl-export`/`rbl-pdb`/`rbl-onelibrary`, `rbl-dbserver`/`rbl-nfs`, `rbl-analysis`, `rbl-deck`. They all take a `LibraryLocation` and don't care whose folder it's in.
+
+## Phase 0 findings (checked 2026-11-03)
+
+These were checked against the code, and against a verified copy of the user's library. The original was only listed, never opened.
+
+| Assumption | Evidence | Status |
+|---|---|---|
+| Analysis files and artwork carry over unchanged if `share/PIONEER/` is copied | All 1,910 tracks have `AnalysisDataPath` starting with `/PIONEER/USBANLZ/`. All 1,572 with artwork have `ImagePath` starting with `/PIONEER/Artwork/`. Both are relative to `share/` [OBS] | Confirmed |
+| Audio files need no path change | All 1,910 `FolderPath` values are absolute drive paths [OBS] | Confirmed |
+| A rekordbox UUID is available to match on | 1,910 of 1,910 tracks have a `UUID` [OBS] | Confirmed |
+| Track IDs can collide between rbxport and rekordbox on later imports | rbxport picks random numeric IDs and checks only its own table (`Writer::unused_id`, `write.rs` around line 2549). rekordbox's IDs are 5–9 digits [OBS]. A clash is unlikely but possible | Confirmed; that's why later imports use fresh IDs |
+| Lookup rows (artist, album, genre, label, key, colour) must be merged by name, not by ID | `djmdContent` points at `djmdArtist` and the other lookup tables by ID, and rbxport adds lookup rows with `intern(...)` by name (`write.rs`) | A delta import interns by name; only the first import copies IDs as they are |
+| The SQLCipher export is available | `rusqlite` is built with `bundled-sqlcipher-vendored-openssl` (`crates/rbl-db/Cargo.toml`) | Available; tested in Phase 2 |
+| `new_library` must stop writing rekordbox's `options.json` | `crates/rbl-db/src/new_library.rs` creates the library in rekordbox's folder and records it in `options.json` | Changes in Phase 1 (H1) |
+| The size of the first import | rekordbox's `share/` is 1.26 GB: 11,892 ANLZ files and 4,908 artwork files. `master.db` is 18 MB, with an empty WAL [OBS] | Phase 2 checks free space first and shows file-copy progress |
+| What the first import doesn't bring | The rekordbox folder also holds `networkAnalyze6.db`, `networkRecommend.db`, `product.db`, `ExtData.edb`, `datafile.edb`, `automixPlaylist6.xml`, `masterPlaylists6.xml` and dated `master.backup.*.db` files. None of these is read by rbxport today | Not imported (they're rekordbox's cloud, licence, automix and backup data). Revisit only if a feature needs them |
+| The size of the user's library | 1,910 tracks, 9 playlists, 8 cues, 25 history sessions, 0 My Tag assignments, 49 tables [OBS] | Small; a delta import's cost is dominated by file checks, not rows |
+
+Also: the headless Identify import refused to run when an empty `-wal` sat beside the copy. Phase 2's copy check must accept an empty `-wal`/`-shm` (as SQLite leaves after a clean read) and refuse only one that has content.
 
 ## Phases (stop after each for approval)
 
