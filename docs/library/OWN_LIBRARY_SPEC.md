@@ -1,6 +1,6 @@
 # Own library — specification
 
-Status: Phase 1 complete; waiting for approval to start Phase 2. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
+Status: Phase 2 complete; waiting for approval to start Phase 3. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
 
 ## Goal
 
@@ -58,11 +58,23 @@ rbxport becomes a replacement for rekordbox, not another interface to rekordbox'
 ## First import (rbxport's library is empty)
 
 1. Make the verified copy (H2).
-2. Copy the copied database's contents into a new rbxport library. This uses SQLCipher `sqlcipher_export` or the backup API, so no file of rekordbox's is ever opened for writing.
-3. Copy `share/PIONEER/` (ANLZ files and artwork) into rbxport's `share/`. Files are copied, never moved. Each copy's size is checked against its source.
+2. The verified copy itself becomes rbxport's `master.db`, so every row is kept exactly as it was. rekordbox's passphrase is the published one rbxport uses too; a library with any other passphrase is rekeyed (`PRAGMA rekey`) on the copy. The copy is integrity-checked (`PRAGMA quick_check`) and its journal folded in. No file of rekordbox's is ever opened for writing. (Implemented this way in Phase 2 rather than with `sqlcipher_export`: a byte copy keeps every row, and every table rbxport doesn't read yet, without a second transcription.)
+3. Copy `share/PIONEER/` (ANLZ files and artwork) into rbxport's `share/`. Files are copied, never moved. Each copy's size is checked against its source. A file that fails is reported as a problem; its track is still imported and can be analysed again.
+   - Free space is checked first: the database, plus `share/PIONEER/`, plus 10 %, plus 64 MB.
+   - Everything is built in a staging folder beside rbxport's library folder (`…
+bxport\.library-import-*`) and moved into place only when complete. A failure part-way leaves no library behind. A folder already in the library's place, with no `master.db` in it, is moved aside to `library.before-import-<time>`, never deleted. A library that's already there is never imported over.
 4. Record each imported track's **baseline** in `import.db` (see below).
 5. Track IDs stay the same as rekordbox's. Existing Identify results, which are keyed by rekordbox content ID, stay valid.
 6. Show a summary: tracks, playlists, cues, files copied, problems, and confirmation that rekordbox's original is unchanged.
+
+### `import.db` (version 1)
+
+| Table | Holds |
+|---|---|
+| `imports` | One row per import: kind, start and finish time, the source path, its SHA-256 when copied, whether it was unchanged afterwards, the counts and the log's name |
+| `track_map`, `playlist_map`, `history_map` | `rb_id`, `rb_uuid` → `rbx_id`. The first import maps every row to itself |
+| `track_baseline` | Each track's tag fields as imported, as one JSON object (`rbl_db::rekordbox_import::tag_fields`). Artists, album, genre and label are stored by name, so a lookup row's ID never matters |
+| `playlist_baseline` | Each playlist's members as imported, in order, as a JSON array of track IDs |
 
 ## Delta import
 
@@ -185,6 +197,12 @@ These were checked against the code, and against a verified copy of the user's l
 | The size of the first import | rekordbox's `share/` is 1.26 GB: 11,892 ANLZ files and 4,908 artwork files. `master.db` is 18 MB, with an empty WAL [OBS] | Phase 2 checks free space first and shows file-copy progress |
 | What the first import doesn't bring | The rekordbox folder also holds `networkAnalyze6.db`, `networkRecommend.db`, `product.db`, `ExtData.edb`, `datafile.edb`, `automixPlaylist6.xml`, `masterPlaylists6.xml` and dated `master.backup.*.db` files. None of these is read by rbxport today | Not imported (they're rekordbox's cloud, licence, automix and backup data). Revisit only if a feature needs them |
 | The size of the user's library | 1,910 tracks, 9 playlists, 8 cues, 25 history sessions, 0 My Tag assignments, 49 tables [OBS] | Small; a delta import's cost is dominated by file checks, not rows |
+
+Phase 2 dry run (2026-11-04), on a fresh copy of the real `master.db` (SHA-256 `565b7755…b795`), with rekordbox's `share/` read in place:
+- **Imported:** 1,910 tracks, 9 playlists, 8 cues and 17 history sessions. Phase 0's 25 counted every `djmdHistory` row; the other 8 are folders or deleted sessions, and are mapped in `import.db` too.
+- **Files:** 16,800 files (1.32 GB) copied in 76 s cold and 16 s warm, with 0 problems.
+- **Row check:** all 48 tables and 21,280 rows of the imported library equal the copy's, row for row.
+- **rekordbox untouched:** its `master.db` hash, and the sizes and times of its `-wal`/`-shm`, were the same before and after.
 
 Also: the headless Identify import refused to run when an empty `-wal` sat beside the copy. Phase 2's copy check must accept an empty `-wal`/`-shm` (as SQLite leaves after a clean read) and refuse only one that has content.
 
