@@ -14,7 +14,7 @@ import theme from "@/styles/theme";
 
 import type {
   AppErrorDto, Backend, Backup, BackupProgress, BackupSizes, Cue, DeckEvent, Device, DeviceSettings, Edits, ExplorerRoot, ExportReport,
-  EditHistoryState, FilterValues, GridState, LibraryProblem, LibrarySummary, Limiter, LinkPeerSeen, LinkStatus, RelatedCriterion, RowDto, SortKey,
+  EditHistoryState, FilterValues, GridState, ImportProgress, ImportSummary, LibraryProblem, LibrarySummary, Limiter, LinkPeerSeen, LinkStatus, RelatedCriterion, RowDto, SortKey,
   SmartRule, StickDefaults, SyncPlaylist, SyncProgress, Tick, TrackDetails, TrackField,
   PreferencesRequest, UpdateCheck, UpdateProgress, UpdateReady, ExportProgress,
   TrackFilter, TreeNode, ViewHandle, ViewSpec, WaveformKind,
@@ -653,9 +653,12 @@ export function createMockBackend(options: MockOptions = {}): Backend {
    * loads until `createLibrary`, and `libraryProblem` says so.
    */
   let missing = readFlagFromUrl("nolibrary");
+  /** `?norekordbox`: no rekordbox library to import on this machine. */
+  const noRekordbox = readFlagFromUrl("norekordbox");
   let ready =
     !missing && (typeof location === "undefined" || !new URLSearchParams(location.search).has("slow"));
   const readyListeners = new Set<() => void>();
+  const importListeners = new Set<(progress: ImportProgress) => void>();
   if (typeof window !== "undefined") {
     (window as unknown as { __libraryReady: () => void }).__libraryReady = () => {
       ready = true;
@@ -2318,13 +2321,46 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     onLibraryProblem: () => () => undefined,
     libraryProblem: () =>
       wait<LibraryProblem | null>(
-        missing ? { kind: "missing", masterDb: "/Users/you/Library/Application Support/rbxport/library/master.db" } : null,
+        missing
+          ? {
+            kind: "missing",
+            masterDb: "/Users/you/Library/Application Support/rbxport/library/master.db",
+            rekordbox: noRekordbox ? null : "/Users/you/Library/Pioneer/rekordbox/master.db",
+          }
+          : null,
       ),
     createLibrary: async () => {
       await wait(undefined);
       missing = false;
       ready = true;
       for (const listener of readyListeners) listener();
+    },
+    importRekordbox: async () => {
+      const total = 16_800;
+      for (const progress of [
+        { stage: "checking", done: 0, total: 0 },
+        { stage: "copyingDatabase", done: 1, total: 1 },
+        { stage: "copyingFiles", done: total / 2, total },
+        { stage: "copyingFiles", done: total, total },
+        { stage: "recording", done: 1, total: 1 },
+        { stage: "finishing", done: 1, total: 1 },
+      ] satisfies ImportProgress[]) {
+        await wait(undefined);
+        for (const listener of importListeners) listener(progress);
+      }
+      missing = false;
+      ready = true;
+      for (const listener of readyListeners) listener();
+      return {
+        tracks: 1910, playlists: 9, cues: 8, historySessions: 17,
+        filesCopied: total, bytesCopied: 1_320_000_000, problems: [],
+        sourceUnchanged: true, setAside: null,
+        log: "/Users/you/Library/Application Support/rbxport/library/import-log/first-import.txt",
+      } satisfies ImportSummary;
+    },
+    onImportProgress: (listener) => {
+      importListeners.add(listener);
+      return () => importListeners.delete(listener);
     },
 
     // A browser has no native menu bar. The mock exposes the listener so a

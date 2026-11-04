@@ -22,6 +22,7 @@ The [manifest](Cargo.toml) lists dependencies and feature flags.
 | [`details.rs`](src/details.rs) | Track detail queries. |
 | [`import.rs`](src/import.rs) | Import operations. |
 | [`new_library.rs`](src/new_library.rs) | New library creation, in rbxport's folder. |
+| [`rekordbox_import.rs`](src/rekordbox_import.rs) | The first import from rekordbox: a hash-checked copy of its `master.db` becomes rbxport's, `share/PIONEER/` is copied, and `import.db` records the mappings and baselines. rekordbox's files are only read. |
 | [`xml.rs`](src/xml.rs) | Rekordbox XML. |
 | [`itunes.rs`](src/itunes.rs) | Music-library input. |
 | [`export_info.rs`](src/export_info.rs) | Export bookkeeping. |

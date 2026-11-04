@@ -19,7 +19,7 @@ import type { TrackSearchField } from "@/lib/search";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { droppedFilePaths, getBackend, subscribeNativeFileDrops } from "@/ipc/client";
 import type {
-  Backend, DeckId, Device, ImportReport, LibraryProblem, LibrarySummary, RowDto, SortColumn, TrackField, TreeNode, ViewSpec,
+  Backend, DeckId, Device, ImportProgress, ImportReport, ImportSummary, LibraryProblem, LibrarySummary, RowDto, SortColumn, TrackField, TreeNode, ViewSpec,
 } from "@/ipc/types";
 import { TrackTable, type TrackDrag } from "@/views/browser/TrackTable";
 import { clearWaveformPreviewCache } from "@/views/browser/WaveformPreview";
@@ -68,7 +68,7 @@ import type { PreferencePane } from "@/lib/preferences";
 import { answer, deckNumber, setPlaying, whenLoaded, withSetting, type ScriptHandler } from "@/lib/scripting";
 import { useAnalysis } from "@/store/useAnalysis";
 import { AnalysisDialog } from "@/views/analysis/AnalysisDialog";
-import { NewLibraryDialog } from "@/views/library/NewLibraryDialog";
+import { ImportSummaryDialog, NewLibraryDialog } from "@/views/library/NewLibraryDialog";
 import type { QueueItem } from "@/lib/queue";
 import { TrackFilter } from "@/views/browser/TrackFilter";
 import { EMPTY_FILTER, toSpecFilter, type FilterState } from "@/lib/trackFilter";
@@ -183,7 +183,9 @@ function AppBody() {
   // which is a lie once the load has failed.
   const [loadError, setLoadError] = useState<string | null>(null);
   // Where a new library would go, when there is none at all to load.
-  const [missingLibrary, setMissingLibrary] = useState<string | null>(null);
+  const [missingLibrary, setMissingLibrary] = useState<{ masterDb: string; rekordbox: string | null } | null>(null);
+  const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
+  const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
   const [summary, setSummary] = useState<LibrarySummary | null>(null);
   // Do not write the empty bootstrap selection over the session while the
   // backend is still restoring the node that was open at exit. WebKit gets
@@ -621,7 +623,7 @@ function AppBody() {
       });
       const applyProblem = (problem: LibraryProblem | null) => {
         if (cancelled || problem === null) return;
-        if (problem.kind === "missing") setMissingLibrary(problem.masterDb);
+        if (problem.kind === "missing") setMissingLibrary({ masterDb: problem.masterDb, rekordbox: problem.rekordbox });
         else setLoadError(problem.message);
       };
       stopProblem = backend.onLibraryProblem(applyProblem);
@@ -2569,13 +2571,29 @@ function AppBody() {
         />
       ) : null}
       {missingLibrary !== null ? (
-        <NewLibraryDialog masterDb={missingLibrary}
+        <NewLibraryDialog masterDb={missingLibrary.masterDb} rekordbox={missingLibrary.rekordbox}
+          progress={importProgress}
           onCreate={async () => {
             await (await getBackend()).createLibrary();
             // The ready event that follows loads it like any other start.
             setMissingLibrary(null);
           }}
+          onImport={async () => {
+            const backend = await getBackend();
+            const stop = backend.onImportProgress(setImportProgress);
+            try {
+              const done = await backend.importRekordbox();
+              setImportSummary(done);
+              setMissingLibrary(null);
+            } finally {
+              stop();
+              setImportProgress(null);
+            }
+          }}
           onQuit={() => { void getBackend().then(backend => backend.closeWindow()); }} />
+      ) : null}
+      {importSummary !== null ? (
+        <ImportSummaryDialog summary={importSummary} onClose={() => setImportSummary(null)} />
       ) : null}
       {analysisSelection !== null ? (
         <AnalysisDialog count={analysisSelection.length} initialMode={analysisPrefs.mode}

@@ -189,6 +189,8 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
                     tracing::info!(path = %plan.master_db.display(), error = %e, "no library here; offering to make one");
                     report_problem(&app, dto::LibraryProblemDto::Missing {
                         master_db: plan.master_db.display().to_string(),
+                        rekordbox: rbl_db::rekordbox_import::find_rekordbox()
+                            .map(|found| found.master_db.display().to_string()),
                     });
                     return;
                 }
@@ -497,6 +499,7 @@ pub fn run() {
             commands::disable_read_only,
             new_library::library_problem,
             new_library::create_library,
+            new_library::import_rekordbox,
             commands::playlist_tree,
             commands::open_view,
             commands::fetch_rows,

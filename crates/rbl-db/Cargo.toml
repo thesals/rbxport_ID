@@ -25,6 +25,10 @@ cipher = "0.4"
 base64 = "0.22"
 dirs = "5"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# The rekordbox import: hashing the copy, walking and sizing `share/`.
+sha2 = "0.10"
+walkdir = "2"
+fs2 = "0.4"
 # Tag reading for import. Default features pull in every format; the library
 # holds mp3, m4a, flac, wav and aiff, so only those are enabled.
 lofty = { version = "0.22", default-features = false }

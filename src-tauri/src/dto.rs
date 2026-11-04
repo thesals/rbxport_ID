@@ -106,12 +106,40 @@ pub struct LimiterDto {
     pub release_ms: f32,
 }
 
+/// How far the import from rekordbox is, as `library-import:progress`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProgressDto {
+    pub stage: rbl_db::rekordbox_import::Stage,
+    pub done: u64,
+    pub total: u64,
+}
+
+/// What the import from rekordbox did.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSummaryDto {
+    pub tracks: u64,
+    pub playlists: u64,
+    pub cues: u64,
+    pub history_sessions: u64,
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub problems: Vec<String>,
+    /// rekordbox's library hashed the same after the import as before.
+    pub source_unchanged: bool,
+    /// Where a folder in the library's place was moved, if one was.
+    pub set_aside: Option<String>,
+    pub log: String,
+}
+
 /// Why the library did not load at startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum LibraryProblemDto {
-    /// No library here at all, and one can be made at `master_db`.
-    Missing { master_db: String },
+    /// No library here at all, and one can be made at `master_db`; or
+    /// imported from rekordbox's at `rekordbox`, when there is one.
+    Missing { master_db: String, rekordbox: Option<String> },
     /// There is a library, or something in its place, and it would not open.
     Failed { message: String },
 }

@@ -30,7 +30,11 @@
   overflow-wrap: anywhere;
 }
 .error { margin: 0 12px 22px; color: var(--c-error); line-height: 1.5; }
-.buttons { display: flex; justify-content: center; gap: 64px; }
+.error p { margin: 0; }
+.source { margin: -12px 12px 22px; color: var(--c-text-dim); overflow-wrap: anywhere; }
+.progress { margin: 0 12px 22px; line-height: 1.5; }
+.problems { margin: 6px 0 0; padding-left: 18px; max-height: 8em; overflow: auto; overflow-wrap: anywhere; }
+.buttons { display: flex; flex-wrap: wrap; justify-content: center; gap: 32px; }
 .buttons button {
   min-width: 88px;
   height: var(--s-pref-button-h);
@@ -44,5 +48,5 @@
 .buttons button:hover:not(:disabled) { border-color: var(--c-accent); }
 .dialog :focus-visible { outline: 2px solid var(--c-accent); outline-offset: 2px; }
 @media (max-width: 480px) {
-  .buttons { gap: 24px; }
+  .buttons { gap: 16px; }
 }

@@ -21,6 +21,7 @@ pub mod import;
 pub mod itunes;
 pub mod key;
 pub mod new_library;
+pub mod rekordbox_import;
 pub mod write;
 pub mod xml;
 mod schema;
@@ -73,6 +74,8 @@ pub enum DbError {
     Open(String),
     #[error("refusing to open the library for writing: {0}")]
     WriteRefused(String),
+    #[error("{0}")]
+    Import(String),
     #[error("unexpected database schema: {0}")]
     Schema(String),
     #[error(transparent)]

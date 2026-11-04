@@ -134,10 +134,37 @@ export interface TreeNode {
 
 /** Why the library did not load at startup. */
 export type LibraryProblem =
-  /** No rekordbox library here at all; one can be made at `masterDb`. */
-  | { kind: "missing"; masterDb: string }
+  /**
+   * No rbxport library yet; one can be made at `masterDb`, empty or
+   * imported from rekordbox's library at `rekordbox` when there is one.
+   */
+  | { kind: "missing"; masterDb: string; rekordbox: string | null }
   /** A library, or something in its place, that would not open. */
   | { kind: "failed"; message: string };
+
+/** How far the import from rekordbox is. */
+export interface ImportProgress {
+  stage: "checking" | "copyingDatabase" | "copyingFiles" | "recording" | "finishing";
+  done: number;
+  total: number;
+}
+
+/** What the import from rekordbox did. */
+export interface ImportSummary {
+  tracks: number;
+  playlists: number;
+  cues: number;
+  historySessions: number;
+  filesCopied: number;
+  bytesCopied: number;
+  /** Each file that could not be copied, or anything else to look at. */
+  problems: string[];
+  /** rekordbox's library hashed the same after the import as before. */
+  sourceUnchanged: boolean;
+  /** Where a folder in the library's place was moved, if one was. */
+  setAside: string | null;
+  log: string;
+}
 
 export interface LibrarySummary {
   trackCount: number;
@@ -288,11 +315,21 @@ export interface Backend {
   libraryProblem(): Promise<LibraryProblem | null>;
 
   /**
-   * Makes a new, empty library where rekordbox keeps one and loads it;
+   * Makes a new, empty library in rbxport's folder and loads it;
    * `onLibraryReady` fires when it is up. Only when `libraryProblem` said
    * `missing`; a library that has appeared since is loaded, not replaced.
    */
   createLibrary(): Promise<void>;
+
+  /**
+   * Imports rekordbox's library as rbxport's, reading rekordbox's files
+   * only, and loads it; `onLibraryReady` fires when it is up. Only when
+   * `libraryProblem` said `missing` with a `rekordbox` library.
+   */
+  importRekordbox(): Promise<ImportSummary>;
+
+  /** Fires as `importRekordbox` goes. */
+  onImportProgress(listener: (progress: ImportProgress) => void): () => void;
 
   /**
    * Fires after a cue edit with the id of the track whose cues changed.

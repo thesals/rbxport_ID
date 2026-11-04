@@ -3935,6 +3935,7 @@ dependencies = [
  "byteorder",
  "cipher",
  "dirs 5.0.1",
+ "fs2",
  "image",
  "lofty",
  "rbl-anlz",
@@ -3942,10 +3943,12 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]
