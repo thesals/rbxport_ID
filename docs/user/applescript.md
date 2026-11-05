@@ -12,9 +12,9 @@ The first time a program scripts rbxport, macOS asks whether to allow it
 
 ## Library write protection
 
-Every change to the library is refused while rekordbox is running, and
-while Library Protection is on (it is by default). Turn it off from a
-script with `set value of setting "advanced.protectLibrary" to false`, or in
+Every change to the library is refused while Library Protection is on (it
+is off by default). Turn it on or off from a script with
+`set value of setting "advanced.protectLibrary" to true` (or `false`), or in
 Preferences. A refused change raises an error with the same message the
 window shows.
 

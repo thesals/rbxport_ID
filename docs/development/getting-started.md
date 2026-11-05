@@ -51,9 +51,9 @@ legacy alias. Neither variable supplies a fixture. Writable tests must build
 an isolated library with `rbl_db::fixture::build` and explicitly use it.
 Do not test edits, analysis, import, restore, or export against real user data.
 
-The normal library guard also refuses writes while rekordbox is running.
-Library protection and process detection are additional guards, not a reason
-to use an installed library as a writable test fixture.
+rekordbox's own library is never written at all, test mode or not. Library
+Protection is an additional, optional lock, not a reason to use a real
+library as a writable test fixture.
 
 `pnpm dev` runs version synchronization first. It derives the version from
 release tags merged into the checkout and can change version files. Inspect

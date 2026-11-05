@@ -1,6 +1,6 @@
 # Own library — specification
 
-Status: Phase 2 complete; waiting for approval to start Phase 3. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
+Status: Phase 3 complete; waiting for approval to start Phase 4. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
 
 ## Goal
 
@@ -205,6 +205,15 @@ Phase 2 dry run (2026-11-04), on a fresh copy of the real `master.db` (SHA-256 `
 - **rekordbox untouched:** its `master.db` hash, and the sizes and times of its `-wal`/`-shm`, were the same before and after.
 
 Also: the headless Identify import refused to run when an empty `-wal` sat beside the copy. Phase 2's copy check must accept an empty `-wal`/`-shm` (as SQLite leaves after a clean read) and refuse only one that has content.
+
+Phase 3 (2026-11-04): what changed, and the two places rekordbox still matters.
+- **Read-only** now means one thing: `rbl_db::is_read_only`, i.e. `write_refusal_reason` refuses (rekordbox's library, or the user's own under test mode). It is fixed while a library is open, so the window's 2-second `librarySummary` poll is gone. The writer's per-transaction process check, the analysis, phrase and analysis-journal gates, and the `RBX_DISABLE_READ_ONLY` session override (`disable_read_only`, the status bar's double-click) are removed.
+- **Library Protection** defaults to off. A stored choice is kept as it is, so a user who had it on still has it on.
+- **Backups** carry `import.db` beside `master.db` (one of `rbl_backup::LIBRARY_FILES`), and restore it with the other library files. The standalone restore scripts are now `restore-library.sh`/`.ps1`, check that RBXport (not rekordbox) is closed, and say "library", not "rekordbox library". The separate RBXport Restore app isn't in this repository; it follows `LIBRARY_FILES` through `rbl-backup`.
+- **Still waits for rekordbox:**
+  - LINK, which rekordbox really holds the ports for (kept by design).
+  - USB sync, whose refusal is in the export command (`commands.rs`, the sync preamble). H8 keeps the export path untouched, and rekordbox can write a stick it sees. Sync Manager reads a separate `rekordboxRunning` field for it, so the iTunes and play-history imports, which write only rbxport's library, no longer wait.
+  - The first import's "close rekordbox and try again", when its library changed while being copied (H2).
 
 ## Phases (stop after each for approval)
 
