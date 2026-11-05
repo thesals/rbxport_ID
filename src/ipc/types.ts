@@ -144,9 +144,61 @@ export type LibraryProblem =
 
 /** How far the import from rekordbox is. */
 export interface ImportProgress {
-  stage: "checking" | "copyingDatabase" | "copyingFiles" | "recording" | "finishing";
+  /** `comparing` and `merging` are only a repeat import's. */
+  stage: "checking" | "copyingDatabase" | "comparing" | "copyingFiles" | "merging" | "recording" | "finishing";
   done: number;
   total: number;
+}
+
+/** A track a repeat import names: its rbxport id and "Artist — Title". */
+export interface DeltaTrackLine {
+  id: string;
+  name: string;
+}
+
+/** A playlist a repeat import names, and how many tracks the line is about. */
+export interface DeltaPlaylistLine {
+  name: string;
+  tracks: number;
+}
+
+/**
+ * What importing from rekordbox again did, into the library rbxport already
+ * keeps. Every track is named; the log beside the library holds the same.
+ */
+export interface DeltaImport {
+  /** Imported in full, under fresh rbxport ids. */
+  newTracks: DeltaTrackLine[];
+  /** Never edited in rbxport, and given rekordbox's current tags. */
+  updated: DeltaTrackLine[];
+  /** Edited in rbxport, so no tag was taken; where rekordbox differs, shown only. */
+  skipped: {
+    track: DeltaTrackLine;
+    fields: { field: string; rbxport: string; rekordbox: string }[];
+    /** Matched by file path, with no earlier import to compare with. */
+    linkedByPath: boolean;
+  }[];
+  pathMatches: DeltaTrackLine[];
+  /** Given what rbxport had none of. */
+  filled: { track: DeltaTrackLine; what: ("memoryCues" | "hotCues" | "analysis" | "key" | "artwork")[] }[];
+  unchanged: number;
+  /** Imported before and deleted in rbxport since: left deleted. */
+  keptDeleted: number;
+  duplicates: string[];
+  playlistsCreated: DeltaPlaylistLine[];
+  playlistsAppended: DeltaPlaylistLine[];
+  /** Changed in rbxport since, so nothing was added. */
+  playlistsSkipped: DeltaPlaylistLine[];
+  historySessions: number;
+  playsAdded: number;
+  cues: number;
+  filesCopied: number;
+  bytesCopied: number;
+  problems: string[];
+  sourceUnchanged: boolean;
+  log: string;
+  /** New tracks with no analysis files, to queue for analysis. */
+  toAnalyse: { id: string; title: string }[];
 }
 
 /** What the import from rekordbox did. */
@@ -332,7 +384,15 @@ export interface Backend {
    */
   importRekordbox(): Promise<ImportSummary>;
 
-  /** Fires as `importRekordbox` goes. */
+  /**
+   * File › Import from rekordbox…: rekordbox's library again, into the
+   * library rbxport keeps. New tracks come in full; tracks already here take
+   * rekordbox's tags only if never edited in rbxport, and otherwise only
+   * what they have none of. Nothing is removed; rekordbox is only read.
+   */
+  reimportRekordbox(): Promise<DeltaImport>;
+
+  /** Fires as `importRekordbox` and `reimportRekordbox` go. */
   onImportProgress(listener: (progress: ImportProgress) => void): () => void;
 
   /**
@@ -1352,6 +1412,8 @@ export interface XmlImportReport {
   existing: number;
   skipped: string[];
   playlists: number;
+  /** Tracks added to playlists the library already had. */
+  appended: number;
   cues: number;
   tracks: { id: string; title: string }[];
 }

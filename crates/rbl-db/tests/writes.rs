@@ -1787,10 +1787,27 @@ fn a_rekordbox_xml_document_is_imported_with_its_playlists_and_cues() {
     assert_eq!(playlist_parent, folder);
     assert_eq!(f.count("SELECT COUNT(*) FROM djmdSongPlaylist WHERE rb_local_deleted = 0 AND PlaylistID = (SELECT ID FROM djmdPlaylist WHERE Name = 'Warm up')"), 2);
 
-    // Importing again reuses the tracks and doubles no cues.
+    // Importing again reuses the tracks, the folder and the playlist, and
+    // doubles no cues.
     let again = xml::import(&mut f.writer, &parsed, &mut |_, _| {}).unwrap();
-    assert_eq!((again.imported, again.existing, again.cues), (0, 2, 0));
+    assert_eq!((again.imported, again.existing, again.cues, again.playlists, again.appended), (0, 2, 0, 0, 0));
     assert_eq!(f.count("SELECT COUNT(*) FROM djmdContent WHERE rb_local_deleted = 0 AND FolderPath LIKE '%One.wav'"), 1);
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdPlaylist WHERE rb_local_deleted = 0 AND Name IN ('Sets', 'Warm up')"), 2);
+
+    // A track already here keeps its tags, and is given the document's cues
+    // only of a kind it has none of; a track taken out of the playlist here
+    // is put back on the end, and nothing is removed.
+    let one_id: String = f.one("SELECT ID FROM djmdContent WHERE FolderPath = ?1", &[&one.to_string_lossy().into_owned()]);
+    let memory: String = f.one("SELECT ID FROM djmdCue WHERE ContentID = ?1 AND Kind = 0", &[&one_id]);
+    f.writer.delete_cue(&memory).unwrap();
+    f.writer.set_comment(&one_id, "edited here").unwrap();
+    let warm_up: String = f.one("SELECT ID FROM djmdPlaylist WHERE Name = 'Warm up'", &[]);
+    f.writer.remove_tracks(&warm_up, std::slice::from_ref(&one_id)).unwrap();
+    let third = xml::import(&mut f.writer, &parsed, &mut |_, _| {}).unwrap();
+    assert_eq!((third.cues, third.appended, third.playlists), (1, 1, 0));
+    assert_eq!(f.count("SELECT COUNT(*) FROM djmdCue WHERE rb_local_deleted = 0 AND ContentID = (SELECT ID FROM djmdContent WHERE FolderPath LIKE '%One.wav')"), 3);
+    let comment: String = f.one("SELECT Commnt FROM djmdContent WHERE ID = ?1", &[&one_id]);
+    assert_eq!(comment, "edited here");
 }
 
 #[test]

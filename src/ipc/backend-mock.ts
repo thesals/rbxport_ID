@@ -14,7 +14,7 @@ import theme from "@/styles/theme";
 
 import type {
   AppErrorDto, Backend, Backup, BackupProgress, BackupSizes, Cue, DeckEvent, Device, DeviceSettings, Edits, ExplorerRoot, ExportReport,
-  EditHistoryState, FilterValues, GridState, ImportProgress, ImportSummary, LibraryProblem, LibrarySummary, Limiter, LinkPeerSeen, LinkStatus, RelatedCriterion, RowDto, SortKey,
+  DeltaImport, EditHistoryState, FilterValues, GridState, ImportProgress, ImportSummary, LibraryProblem, LibrarySummary, Limiter, LinkPeerSeen, LinkStatus, RelatedCriterion, RowDto, SortKey,
   SmartRule, StickDefaults, SyncPlaylist, SyncProgress, Tick, TrackDetails, TrackField,
   PreferencesRequest, UpdateCheck, UpdateProgress, UpdateReady, ExportProgress,
   TrackFilter, TreeNode, ViewHandle, ViewSpec, WaveformKind,
@@ -2358,6 +2358,41 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         log: "/Users/you/Library/Application Support/rbxport/library/import-log/first-import.txt",
       } satisfies ImportSummary;
     },
+    reimportRekordbox: async () => {
+      for (const progress of [
+        { stage: "checking", done: 0, total: 0 },
+        { stage: "copyingDatabase", done: 1, total: 1 },
+        { stage: "comparing", done: 0, total: 1 },
+        { stage: "copyingFiles", done: 1910, total: 1910 },
+        { stage: "merging", done: 1, total: 1 },
+        { stage: "recording", done: 1, total: 1 },
+        { stage: "finishing", done: 1, total: 1 },
+      ] satisfies ImportProgress[]) {
+        await wait(undefined);
+        for (const listener of importListeners) listener(progress);
+      }
+      // As a repeat import of the mock's own library reports: one track
+      // rekordbox added, one it retagged, one edited here and kept.
+      return {
+        newTracks: [{ id: "9001", name: "TRIODE — New In rekordbox" }],
+        updated: [{ id: "2", name: "Artist 2 — Retagged" }],
+        skipped: [{
+          track: { id: "3", name: "Artist 3 — Edited Here" },
+          fields: [{ field: "title", rbxport: "Edited Here", rekordbox: "Old Title" }],
+          linkedByPath: false,
+        }],
+        pathMatches: [],
+        filled: [{ track: { id: "4", name: "Artist 4 — Track 4" }, what: ["hotCues"] }],
+        unchanged: 1905, keptDeleted: 0, duplicates: [],
+        playlistsCreated: [{ name: "New Playlist", tracks: 3 }],
+        playlistsAppended: [{ name: "Warm up", tracks: 1 }],
+        playlistsSkipped: [],
+        historySessions: 1, playsAdded: 4, cues: 3, filesCopied: 4, bytesCopied: 120_000, problems: [],
+        sourceUnchanged: true,
+        log: "/Users/you/Library/Application Support/rbxport/library/import-log/import.txt",
+        toAnalyse: [],
+      } satisfies DeltaImport;
+    },
     onImportProgress: (listener) => {
       importListeners.add(listener);
       return () => importListeners.delete(listener);
@@ -2473,7 +2508,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
       ],
     }),
     chooseItunesLibrary: () => wait(null),
-    importItunesSelected: (_path, ids) => wait({ imported: ids.length, existing: 0, skipped: [], playlists: ids.length, cues: 0, tracks: [] }),
+    importItunesSelected: (_path, ids) => wait({ imported: ids.length, existing: 0, skipped: [], playlists: ids.length, appended: 0, cues: 0, tracks: [] }),
     // The mock's phrases are drawn from a table, not a file: nothing to cut.
     editPhrase: () => wait(false),
     exportPlaylistFile: () => wait(null),

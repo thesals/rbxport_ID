@@ -12,6 +12,10 @@
 //! rekordbox row became which rbxport row, and each track's tag fields and
 //! each playlist's members as they were imported. A later import compares
 //! with those to tell what was changed in rbxport since.
+//!
+//! Importing again, into a library rbxport already keeps, is
+//! [`import_again`]: the same verified copy, merged by the rules in
+//! [`delta`].
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -22,7 +26,12 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::write::Writer;
 use crate::{DbError, Library, LibraryLocation, OpenMode, Result, SchemaSupport};
+
+pub mod delta;
+
+pub use delta::{DeltaReport, FieldDiff, FillKind, Filled, PlaylistLine, Skipped, TrackLine};
 
 /// The bookkeeping file beside rbxport's `master.db`. Plain SQLite.
 pub const IMPORT_DB: &str = "import.db";
@@ -45,7 +54,11 @@ pub const UNSAVED_CHANGES: &str =
 pub enum Stage {
     Checking,
     CopyingDatabase,
+    /// A repeat import, reading both libraries to match their tracks.
+    Comparing,
     CopyingFiles,
+    /// A repeat import, writing rbxport's library.
+    Merging,
     Recording,
     Finishing,
 }
@@ -173,6 +186,256 @@ pub fn first_import(
     Ok(summary)
 }
 
+/// What a repeat import did, and the checks around it.
+#[derive(Debug, Clone)]
+pub struct DeltaSummary {
+    pub report: DeltaReport,
+    /// SHA-256 of rekordbox's `master.db` as it was copied.
+    pub source_sha256: String,
+    /// rekordbox's `master.db` hashed the same after the import.
+    pub source_unchanged: bool,
+    /// The import log.
+    pub log: PathBuf,
+}
+
+/// Imports rekordbox's library at `source` again, into the library `writer`
+/// holds, which already has one (see [`delta`] for the rules). Reads
+/// `source` only, through a verified copy made in a staging folder beside
+/// rbxport's library folder and removed afterwards.
+pub fn import_again(
+    source: &LibraryLocation,
+    writer: &mut Writer,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<DeltaSummary> {
+    let started_at = rbl_core::time::now();
+    let target = writer.library().location().clone();
+    let dir = target
+        .master_db
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| DbError::Import(format!("{} has no folder", target.master_db.display())))?;
+    if !source.master_db.is_file() {
+        return Err(DbError::Import(format!("there is no rekordbox library at {}", source.master_db.display())));
+    }
+    let mut rekordbox = crate::rekordbox_library_dirs();
+    rekordbox.extend(source.master_db.parent().map(Path::to_path_buf));
+    rekordbox.push(source.share_root.clone());
+    if crate::is_within_any(&dir, &rekordbox) || crate::is_within_any(&target.share_root, &rekordbox) {
+        return Err(DbError::WriteRefused(crate::REKORDBOX_REFUSAL.to_owned()));
+    }
+
+    progress(Progress { stage: Stage::Checking, done: 0, total: 0 });
+    let parent = dir.parent().unwrap_or(&dir);
+    let staging = tempfile::Builder::new().prefix(".rekordbox-copy-").tempdir_in(parent)?;
+    let copy = staging.path().join("master.db");
+    progress(Progress { stage: Stage::CopyingDatabase, done: 0, total: 1 });
+    let source_sha256 = copy_verified(&source.master_db, &copy, &mut |_| {})?;
+    let copied = Library::open(
+        LibraryLocation {
+            master_db: copy,
+            share_root: source.share_root.clone(),
+            passphrase: source.passphrase.clone(),
+            // The staging copy: read only, and neither library.
+            is_user_library: false,
+            is_rekordbox_install: false,
+        },
+        OpenMode::ReadOnly,
+    )?;
+    if let SchemaSupport::Degraded { missing } = &copied.schema().support {
+        return Err(DbError::Import(format!("rekordbox's library is missing what rbxport needs: {}", missing.join(", "))));
+    }
+    progress(Progress { stage: Stage::CopyingDatabase, done: 1, total: 1 });
+
+    let mut import_db = open_import_db(&dir)?;
+    let recorded = delta::Recorded::read(&import_db)?;
+    let (report, book) = delta::merge(writer, &copied, &source.share_root, &recorded, progress)?;
+    drop(copied);
+
+    progress(Progress { stage: Stage::Recording, done: 0, total: 1 });
+    let import_id = record_delta(
+        writer.library().connection(),
+        &mut import_db,
+        &book,
+        &source.master_db,
+        &source_sha256,
+        &started_at,
+    )?;
+    progress(Progress { stage: Stage::Recording, done: 1, total: 1 });
+
+    progress(Progress { stage: Stage::Finishing, done: 0, total: 1 });
+    let after = sha256_file(&source.master_db)?;
+    let source_unchanged = after == source_sha256 && refuse_unsaved(&source.master_db).is_ok();
+    let mut summary = DeltaSummary { report, source_sha256, source_unchanged, log: PathBuf::new() };
+    let log_name = write_delta_log(&dir, source, &summary, &after, &started_at)?;
+    finish_delta_record(&import_db, import_id, &summary, &log_name)?;
+    summary.log = dir.join(LOG_DIR).join(log_name);
+    drop(staging);
+    progress(Progress { stage: Stage::Finishing, done: 1, total: 1 });
+    Ok(summary)
+}
+
+/// Records a repeat import in `import.db`: the new mappings, and the
+/// baselines that change, read from rbxport's library as it is now.
+fn record_delta(
+    library: &Connection,
+    db: &mut Connection,
+    book: &delta::Bookkeeping,
+    source_db: &Path,
+    source_sha256: &str,
+    started_at: &str,
+) -> Result<i64> {
+    let tags: std::collections::HashMap<String, String> = tag_fields(library)?.into_iter().collect();
+    let members = delta::members_now(library)?;
+    let tx = db.transaction()?;
+    tx.execute(
+        "INSERT INTO imports (kind, started_at, source_db, source_sha256) VALUES ('delta', ?1, ?2, ?3)",
+        params![started_at, source_db.display().to_string(), source_sha256],
+    )?;
+    let import_id = tx.last_insert_rowid();
+    // A mapping replaces one for the same rekordbox row, or one that held
+    // the same rbxport row for a rekordbox row that is gone.
+    for (table, rows) in [("track_map", &book.tracks), ("playlist_map", &book.playlists), ("history_map", &book.histories)] {
+        let mut insert = tx.prepare(&format!(
+            "INSERT OR REPLACE INTO {table} (rb_id, rb_uuid, rbx_id, import_id) VALUES (?1, ?2, ?3, ?4)"
+        ))?;
+        for (rb_id, rb_uuid, rbx_id) in rows {
+            insert.execute(params![rb_id, rb_uuid, rbx_id, import_id])?;
+        }
+    }
+    for (table, column, ids, now) in [
+        ("track_baseline", "fields", &book.baselines, &tags),
+        ("playlist_baseline", "members", &book.playlist_baselines, &members),
+    ] {
+        let mut insert =
+            tx.prepare(&format!("INSERT OR REPLACE INTO {table} (rbx_id, {column}, import_id) VALUES (?1, ?2, ?3)"))?;
+        for id in ids {
+            if let Some(value) = now.get(id) {
+                insert.execute(params![id, value, import_id])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(import_id)
+}
+
+fn finish_delta_record(db: &Connection, import_id: i64, summary: &DeltaSummary, log_name: &str) -> Result<()> {
+    let n = |v: usize| i64::try_from(v).unwrap_or(i64::MAX);
+    let m = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    let r = &summary.report;
+    db.execute(
+        "UPDATE imports SET finished_at = ?2, source_unchanged = ?3, tracks = ?4, playlists = ?5, cues = ?6,
+             history_sessions = ?7, files_copied = ?8, bytes_copied = ?9, problems = ?10, log = ?11
+         WHERE id = ?1",
+        params![
+            import_id,
+            rbl_core::time::now(),
+            summary.source_unchanged,
+            n(r.new_tracks.len()),
+            n(r.playlists_created.len()),
+            m(r.cues),
+            m(r.history_sessions),
+            m(r.files_copied),
+            m(r.bytes_copied),
+            n(r.problems.len()),
+            format!("{LOG_DIR}/{log_name}"),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Writes a repeat import's log beside the library and returns its name.
+/// Every track the report names is listed, with the fields that were not
+/// taken.
+fn write_delta_log(
+    dir: &Path,
+    source: &LibraryLocation,
+    summary: &DeltaSummary,
+    after: &str,
+    started_at: &str,
+) -> Result<String> {
+    let r = &summary.report;
+    let mut text = String::new();
+    let _ = writeln!(text, "rbxport: import from rekordbox into an existing library");
+    let _ = writeln!(text, "Started:  {started_at}");
+    let _ = writeln!(text, "Finished: {}", rbl_core::time::now());
+    let _ = writeln!(text, "From rekordbox's library: {}", source.master_db.display());
+    let _ = writeln!(text, "Into rbxport's library:   {}", dir.display());
+    let _ = writeln!(text, "rekordbox's master.db SHA-256 when copied:       {}", summary.source_sha256);
+    let _ = writeln!(text, "rekordbox's master.db SHA-256 after the import:  {after}");
+    let _ = writeln!(
+        text,
+        "rekordbox's library unchanged: {}",
+        if summary.source_unchanged { "yes" } else { "NO: rekordbox changed it after it was copied; the copy was whole" }
+    );
+    let tracks = |text: &mut String, title: &str, lines: &[TrackLine]| {
+        let _ = writeln!(text, "{title}: {}", lines.len());
+        for line in lines {
+            let _ = writeln!(text, "  - {} [{}]", line.name, line.id);
+        }
+    };
+    tracks(&mut text, "New tracks", &r.new_tracks);
+    tracks(&mut text, "Tracks whose tags were updated from rekordbox", &r.updated);
+    let _ = writeln!(text, "Tracks edited in rbxport, so rekordbox's tags were not taken: {}", r.skipped.len());
+    for skipped in &r.skipped {
+        let why = if skipped.linked_by_path { " (no earlier import to compare with)" } else { "" };
+        let _ = writeln!(text, "  - {} [{}]{why}", skipped.track.name, skipped.track.id);
+        for field in &skipped.fields {
+            let _ = writeln!(text, "      {}: rbxport {:?}, rekordbox {:?}", field.field, field.rbxport, field.rekordbox);
+        }
+    }
+    let _ = writeln!(text, "Tracks given what rbxport did not have: {}", r.filled.len());
+    for filled in &r.filled {
+        let what: Vec<&str> = filled.what.iter().map(|k| fill_name(*k)).collect();
+        let _ = writeln!(text, "  - {} [{}]: {}", filled.track.name, filled.track.id, what.join(", "));
+    }
+    tracks(&mut text, "Matched by file path", &r.path_matches);
+    let _ = writeln!(text, "Unchanged: {}", r.unchanged);
+    let _ = writeln!(text, "Deleted in rbxport, left deleted: {}", r.kept_deleted);
+    let _ = writeln!(text, "Left out, their file already came with another rekordbox track: {}", r.duplicates.len());
+    for line in &r.duplicates {
+        let _ = writeln!(text, "  - {line}");
+    }
+    let playlists = |text: &mut String, title: &str, lines: &[PlaylistLine]| {
+        let _ = writeln!(text, "{title}: {}", lines.len());
+        for line in lines {
+            let _ = writeln!(text, "  - {} ({} tracks)", line.name, line.tracks);
+        }
+    };
+    playlists(&mut text, "Playlists made", &r.playlists_created);
+    playlists(&mut text, "Playlists with tracks appended", &r.playlists_appended);
+    playlists(&mut text, "Playlists changed in rbxport, so nothing was appended", &r.playlists_skipped);
+    let _ = writeln!(text, "History sessions added: {} ({} plays of tracks rbxport had)", r.history_sessions, r.plays_added);
+    let _ = writeln!(text, "Cues copied: {}", r.cues);
+    let _ = writeln!(text, "Analysis and artwork files copied: {} ({})", r.files_copied, human_bytes(r.bytes_copied));
+    let _ = writeln!(text, "Problems: {}", r.problems.len());
+    for problem in &r.problems {
+        let _ = writeln!(text, "  - {problem}");
+    }
+    let logs = dir.join(LOG_DIR);
+    std::fs::create_dir_all(&logs)?;
+    let stamp = rbl_core::time::local_backup_stamp();
+    let mut name = format!("{stamp}-import.txt");
+    let mut n = 2;
+    while logs.join(&name).exists() {
+        name = format!("{stamp}-import-{n}.txt");
+        n += 1;
+    }
+    std::fs::write(logs.join(&name), text)?;
+    Ok(name)
+}
+
+/// What the log calls a kind of fill.
+#[must_use]
+pub fn fill_name(kind: FillKind) -> &'static str {
+    match kind {
+        FillKind::MemoryCues => "memory cues",
+        FillKind::HotCues => "hot cues",
+        FillKind::Analysis => "analysis (beat grid and waveforms)",
+        FillKind::Key => "key",
+        FillKind::Artwork => "artwork",
+    }
+}
+
 /// Refuses a target that already holds a library, or that is rekordbox's
 /// or inside rekordbox's folder.
 fn check_target(source: &LibraryLocation, target_dir: &Path) -> Result<()> {
@@ -187,7 +450,7 @@ fn check_target(source: &LibraryLocation, target_dir: &Path) -> Result<()> {
     }
     if target_dir.join("master.db").exists() {
         return Err(DbError::Import(format!(
-            "rbxport already has a library at {}; importing into a library that has one is not available yet",
+            "rbxport already has a library at {}; import into it from the File menu instead",
             target_dir.display()
         )));
     }

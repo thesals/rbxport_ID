@@ -125,6 +125,9 @@ function progressText(progress: ImportProgress | null): string {
     case undefined:
     case "checking": return "Checking rekordbox's library…";
     case "copyingDatabase": return "Copying the library database…";
+    // A repeat import's own, which this dialog never runs.
+    case "comparing":
+    case "merging": return "Importing…";
     case "copyingFiles":
       return `Copying analysis files and artwork… ${progress.done.toLocaleString()} of ${progress.total.toLocaleString()}`;
     case "recording": return "Recording what was imported…";

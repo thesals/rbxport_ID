@@ -102,6 +102,9 @@ fn build_with_labels<R: Runtime>(app: &AppHandle<R>, labels: &Labels) -> tauri::
         .build(app)?;
     let missing =
         MenuItemBuilder::with_id("missing", label(labels, "Missing File Manager")).build(app)?;
+    // rekordbox's library again, into rbxport's: only what is new there.
+    let import_rekordbox =
+        MenuItemBuilder::with_id("import-rekordbox", label(labels, "Import from rekordbox…")).build(app)?;
     // rekordbox's own two, worded as its File menu words them.
     let import_xml = MenuItemBuilder::with_id("import-xml", label(labels, "Import rekordbox xml…"))
         .build(app)?;
@@ -149,6 +152,7 @@ fn build_with_labels<R: Runtime>(app: &AppHandle<R>, labels: &Labels) -> tauri::
     let mut file = SubmenuBuilder::new(app, label(labels, "File"))
         .item(&import)
         .item(&import_folder)
+        .item(&import_rekordbox)
         .item(&import_xml)
         .item(&import_itunes)
         .item(&export_xml);

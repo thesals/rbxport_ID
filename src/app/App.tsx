@@ -19,7 +19,7 @@ import type { TrackSearchField } from "@/lib/search";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { droppedFilePaths, getBackend, subscribeNativeFileDrops } from "@/ipc/client";
 import type {
-  Backend, DeckId, Device, ImportProgress, ImportReport, ImportSummary, LibraryProblem, LibrarySummary, RowDto, SortColumn, TrackField, TreeNode, ViewSpec,
+  Backend, DeckId, DeltaImport, Device, ImportProgress, ImportReport, ImportSummary, LibraryProblem, LibrarySummary, RowDto, SortColumn, TrackField, TreeNode, ViewSpec,
 } from "@/ipc/types";
 import { TrackTable, type TrackDrag } from "@/views/browser/TrackTable";
 import { clearWaveformPreviewCache } from "@/views/browser/WaveformPreview";
@@ -92,6 +92,7 @@ const Preferences = lazy(() => import("@/views/settings/Preferences").then(m => 
 const SyncManager = lazy(() => import("@/views/sync/SyncManager").then(m => ({ default: m.SyncManager })));
 const SmartPlaylistEditor = lazy(() => import("@/views/tree/SmartPlaylistEditor").then(m => ({ default: m.SmartPlaylistEditor })));
 const IdentifyPanel = lazy(() => import("@/views/identify/IdentifyPanel").then(m => ({ default: m.IdentifyPanel })));
+const DeltaImportDialog = lazy(() => import("@/views/library/DeltaImportDialog").then(m => ({ default: m.DeltaImportDialog })));
 
 /** Track ids read per call when a whole playlist or library is identified, so each answer stays small. */
 const IDENTIFY_IDS_PER_CALL = 2048;
@@ -186,6 +187,10 @@ function AppBody() {
   const [missingLibrary, setMissingLibrary] = useState<{ masterDb: string; rekordbox: string | null } | null>(null);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
+  // File › Import from rekordbox…, while it runs and once it is done.
+  const [deltaImport, setDeltaImport] = useState<{
+    progress: ImportProgress | null; report: DeltaImport | null; error: string | null;
+  } | null>(null);
   const [summary, setSummary] = useState<LibrarySummary | null>(null);
   // Do not write the empty bootstrap selection over the session while the
   // backend is still restoring the node that was open at exit. WebKit gets
@@ -1697,6 +1702,7 @@ function AppBody() {
         imported.existing > 0 ? `${imported.existing} already here` : "",
         imported.skipped.length > 0 ? `${imported.skipped.length} skipped` : "",
         `${imported.playlists} playlist${imported.playlists === 1 ? "" : "s"}`,
+        imported.appended > 0 ? `${imported.appended} added to playlists already here` : "",
         imported.cues > 0 ? `${imported.cues} cue${imported.cues === 1 ? "" : "s"}` : "",
       ].filter((part) => part !== "");
       report(`${parts.join(", ")}.`);
@@ -1706,6 +1712,24 @@ function AppBody() {
       refuse(e instanceof Error ? e.message : "That XML could not be imported.");
     }
   }, [report, refuse, analysisPrefs.auto, analysis]);
+
+  const reimportFromMenu = useCallback(async () => {
+    setDeltaImport({ progress: null, report: null, error: null });
+    const backend = await getBackend();
+    const stop = backend.onImportProgress(progress => setDeltaImport(open => open && { ...open, progress }));
+    try {
+      const done = await backend.reimportRekordbox();
+      setDeltaImport({ progress: null, report: done, error: null });
+      setTree(await backend.playlistTree());
+      if (analysisPrefs.auto && done.toAnalyse.length > 0) analysis.add(done.toAnalyse);
+    } catch (e) {
+      const message = typeof e === "object" && e !== null && "message" in e && typeof e.message === "string"
+        ? e.message : "Could not import from rekordbox.";
+      setDeltaImport({ progress: null, report: null, error: message });
+    } finally {
+      stop();
+    }
+  }, [analysisPrefs.auto, analysis]);
 
   const exportXmlFromMenu = useCallback(async () => {
     report("Choosing where to write the XML…");
@@ -1754,6 +1778,10 @@ function AppBody() {
       void importFolderFromMenu();
       return;
     }
+    if (outcome.action === "import-rekordbox") {
+      void reimportFromMenu();
+      return;
+    }
     if (outcome.action === "import-xml") {
       void importXmlFromMenu();
       return;
@@ -1791,6 +1819,7 @@ function AppBody() {
     openPreferences(outcome.action === "missing" ? "advanced" : "view");
   }, [
     readOnly, advancedPrefs.protectLibrary, importFromMenu, importFolderFromMenu, importXmlFromMenu, exportXmlFromMenu, refuse,
+    reimportFromMenu,
     openPreferences, checkForUpdates, prefs, viewPrefs.tempoSlider, openReport,
     editHistory, runLibraryHistory,
   ]);
@@ -2577,6 +2606,10 @@ function AppBody() {
       ) : null}
       {importSummary !== null ? (
         <ImportSummaryDialog summary={importSummary} onClose={() => setImportSummary(null)} />
+      ) : null}
+      {deltaImport !== null ? (
+        <DeltaImportDialog progress={deltaImport.progress} report={deltaImport.report} error={deltaImport.error}
+          onClose={() => setDeltaImport(null)} />
       ) : null}
       {analysisSelection !== null ? (
         <AnalysisDialog count={analysisSelection.length} initialMode={analysisPrefs.mode}

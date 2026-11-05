@@ -3,8 +3,12 @@
 //!
 //! ```text
 //! cargo run --release -p rbl-db --example import_dry_run -- \
-//!     --master-db <a copy of master.db> --share <a share folder to read> --target <an empty folder>
+//!     --master-db <a copy of master.db> --share <a share folder to read> --target <an empty folder> [--again]
 //! ```
+//!
+//! `--again` then imports from the same copy a second time, as File ›
+//! Import from rekordbox… would, and prints what that took: from an
+//! unchanged source, nothing.
 //!
 //! The passphrase comes from rekordbox's agent settings, read only. The
 //! installed `master.db` itself is refused as `--master-db`, and a target
@@ -17,7 +21,12 @@ use std::path::PathBuf;
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut master_db, mut share, mut target) = (None, None, None);
+    let mut again = false;
     while let Some(flag) = args.next() {
+        if flag == "--again" {
+            again = true;
+            continue;
+        }
         let value = args.next().map(PathBuf::from);
         match flag.as_str() {
             "--master-db" => master_db = value,
@@ -106,4 +115,39 @@ fn main() {
         after.iter().map(|t| t.1.len()).sum::<usize>(),
         differing
     );
+
+    if !again {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut location = summary.location.clone();
+    location.is_user_library = false; // the dry run's target, checked above not to be the real one
+    let backups = target.parent().expect("target has a folder").join("dry-run-backups");
+    let mut writer = rbl_db::write::Writer::open(location, backups).expect("open the imported library");
+    let delta = rbl_db::rekordbox_import::import_again(&source, &mut writer, &mut |_| {}).expect("import again");
+    let r = &delta.report;
+    println!(
+        "again: new {} updated {} skipped {} filled {} path matches {} unchanged {} kept deleted {} duplicates {}          playlists made {} appended {} skipped {} histories {} cues {} files {} problems {} source unchanged {} in {:.1}s",
+        r.new_tracks.len(),
+        r.updated.len(),
+        r.skipped.len(),
+        r.filled.len(),
+        r.path_matches.len(),
+        r.unchanged,
+        r.kept_deleted,
+        r.duplicates.len(),
+        r.playlists_created.len(),
+        r.playlists_appended.len(),
+        r.playlists_skipped.len(),
+        r.history_sessions,
+        r.cues,
+        r.files_copied,
+        r.problems.len(),
+        delta.source_unchanged,
+        started.elapsed().as_secs_f64()
+    );
+    for skipped in r.skipped.iter().take(5) {
+        println!("  skipped {}: {:?}", skipped.track.name, skipped.fields);
+    }
+    println!("log {}", delta.log.display());
 }

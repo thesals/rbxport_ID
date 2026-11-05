@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{Manager, State};
 
 use crate::commands::blocking;
-use crate::dto::{ImportProgressDto, ImportSummaryDto, LibraryProblemDto};
+use crate::dto::{DeltaImportDto, ImportProgressDto, ImportSummaryDto, ImportedTrackDto, LibraryProblemDto};
 use crate::error::{AppError, AppResult, ErrorKind};
 use crate::state::AppState;
 
@@ -40,6 +40,68 @@ pub async fn create_library(app: tauri::AppHandle) -> AppResult<()> {
         Ok(())
     })
     .await
+}
+
+/// File › Import from rekordbox…: rekordbox's library again, into the
+/// library rbxport keeps ([`rbl_db::rekordbox_import::import_again`]):
+/// new tracks in full, rekordbox's tags only for tracks never edited here,
+/// and otherwise only what rbxport has none of. rekordbox's files are only
+/// read. The library is backed up first and reloaded after. Progress is
+/// `library-import:progress`.
+#[tauri::command]
+pub async fn reimport_rekordbox(app: tauri::AppHandle, state: State<'_, Arc<AppState>>) -> AppResult<DeltaImportDto> {
+    let writing = Arc::clone(&state);
+    let emitter = app.clone();
+    let dto = blocking("reimport_rekordbox", move || {
+        let source = rbl_db::rekordbox_import::find_rekordbox()
+            .ok_or_else(|| AppError::new(ErrorKind::NotFound, "rekordbox's library was not found on this computer."))?;
+        let summary = writing
+            .write(|writer| {
+                writer.back_up_now()?;
+                rbl_db::rekordbox_import::import_again(&source, writer, &mut |p| {
+                    let _ = tauri::Emitter::emit(
+                        &emitter,
+                        "library-import:progress",
+                        ImportProgressDto { stage: p.stage, done: p.done, total: p.total },
+                    );
+                })
+            })
+            .map_err(crate::commands::write_error)?;
+        let r = summary.report;
+        tracing::info!(
+            new = r.new_tracks.len(),
+            updated = r.updated.len(),
+            skipped = r.skipped.len(),
+            filled = r.filled.len(),
+            source_unchanged = summary.source_unchanged,
+            "imported from rekordbox again"
+        );
+        Ok(DeltaImportDto {
+            to_analyse: r.to_analyse.into_iter().map(|t| ImportedTrackDto { id: t.id, title: t.name }).collect(),
+            new_tracks: r.new_tracks,
+            updated: r.updated,
+            skipped: r.skipped,
+            path_matches: r.path_matches,
+            filled: r.filled,
+            unchanged: r.unchanged,
+            kept_deleted: r.kept_deleted,
+            duplicates: r.duplicates,
+            playlists_created: r.playlists_created,
+            playlists_appended: r.playlists_appended,
+            playlists_skipped: r.playlists_skipped,
+            history_sessions: r.history_sessions,
+            plays_added: r.plays_added,
+            cues: r.cues,
+            files_copied: r.files_copied,
+            bytes_copied: r.bytes_copied,
+            problems: r.problems,
+            source_unchanged: summary.source_unchanged,
+            log: summary.log.display().to_string(),
+        })
+    })
+    .await?;
+    crate::commands::reload(app, Arc::clone(&state)).await?;
+    Ok(dto)
 }
 
 /// Imports rekordbox's library as rbxport's, then loads it as startup would.

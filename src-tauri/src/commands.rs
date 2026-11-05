@@ -3179,12 +3179,13 @@ async fn import_collection<R: tauri::Runtime>(
             existing: u32::try_from(report.existing).unwrap_or(u32::MAX),
             skipped: report.skipped,
             playlists: u32::try_from(report.playlists).unwrap_or(u32::MAX),
+            appended: u32::try_from(report.appended).unwrap_or(u32::MAX),
             cues: u32::try_from(report.cues).unwrap_or(u32::MAX),
             tracks: report.tracks.into_iter().map(|(id, title)| crate::dto::ImportedTrackDto { id, title }).collect(),
         })
     })
     .await?;
-    if report.imported > 0 || report.playlists > 0 {
+    if report.imported > 0 || report.playlists > 0 || report.appended > 0 || report.cues > 0 {
         reload(app, state_for_reload).await?;
     }
     Ok(report)

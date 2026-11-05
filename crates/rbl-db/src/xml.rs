@@ -11,16 +11,25 @@
 //! for the files, [`Writer::create_folder`], [`Writer::create_playlist`] and
 //! [`Writer::add_tracks`] for the tree, [`Writer::add_cue`] and
 //! [`Writer::add_loop`] for the marks — so every row lands in the shape the
-//! writer already makes. A track whose file is already in the library is
-//! reused rather than doubled, and keeps its own cues.
+//! writer already makes.
+//!
+//! Importing a document again follows the rules of rekordbox's repeat
+//! import ([`crate::rekordbox_import::delta`]), as far as a document allows:
+//! a track whose file is already in the library is reused rather than
+//! doubled, and keeps its tags (a document has no record of what was
+//! imported before, so nothing tells whether they were changed here since);
+//! it is given the document's memory cues, or its hot cues, only when it
+//! has none of that kind. A folder or playlist of the same name in the same
+//! place is reused, and the tracks it lacks are appended. Nothing is
+//! removed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rbl_core::xml::{attribute, tags, Tag};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
-use crate::write::{Writer, ROOT};
+use crate::write::{Writer, ATTRIBUTE_FOLDER, ATTRIBUTE_PLAYLIST, ROOT};
 use crate::Result;
 
 /// One `POSITION_MARK`.
@@ -218,7 +227,10 @@ pub struct XmlImportReport {
     pub skipped: Vec<String>,
     /// Playlists and folders made.
     pub playlists: usize,
-    /// Cues and loops added to the tracks that were imported.
+    /// Tracks appended to playlists the library already had.
+    pub appended: usize,
+    /// Cues and loops added: onto the tracks that were imported, and onto
+    /// tracks already here that had none of that kind.
     pub cues: usize,
     /// The tracks that landed, `(id, title)`, so they can be analysed.
     pub tracks: Vec<(String, String)>,
@@ -306,10 +318,19 @@ pub fn import(writer: &mut Writer, library: &XmlLibrary, progress: &mut dyn FnMu
                 ids.insert(track.id.as_str(), id);
             }
             Err(crate::DbError::WriteRefused(reason)) => {
-                // Already in the library: reused, with its own cues kept.
+                // Already in the library: reused, its tags and cues kept;
+                // given the document's cues of a kind it has none of.
                 match existing_id(writer, path) {
                     Some(id) => {
                         report.existing += 1;
+                        let (memory, hot) = cue_kinds(writer, &id)?;
+                        let missing: Vec<XmlCue> = track
+                            .cues
+                            .iter()
+                            .filter(|cue| if cue.num < 0 { memory == 0 } else { hot == 0 })
+                            .cloned()
+                            .collect();
+                        report.cues += add_cues(writer, &id, &missing)?;
                         ids.insert(track.id.as_str(), id);
                     }
                     None => report.skipped.push(format!("{label}: {reason}")),
@@ -321,25 +342,58 @@ pub fn import(writer: &mut Writer, library: &XmlLibrary, progress: &mut dyn FnMu
     }
 
     // The tree, in document order: a node's parent is the nearest open node
-    // one level up, so a stack of the ids made so far finds it.
+    // one level up, so a stack of the ids made so far finds it. A node of the same name and kind already in that place is reused.
     let mut parents: Vec<String> = vec![ROOT.to_owned()];
     for node in &library.nodes {
         parents.truncate(node.depth + 1);
         let parent = parents.last().cloned().unwrap_or_else(|| ROOT.to_owned());
-        if node.folder {
-            let id = writer.create_folder(&node.name, &parent)?;
-            parents.push(id);
-        } else {
-            let id = writer.create_playlist(&node.name, &parent)?;
+        let attribute = if node.folder { ATTRIBUTE_FOLDER } else { ATTRIBUTE_PLAYLIST };
+        let existing = existing_node(writer, &node.name, &parent, attribute)?;
+        let id = match existing.clone() {
+            Some(id) => id,
+            None if node.folder => writer.create_folder(&node.name, &parent)?,
+            None => writer.create_playlist(&node.name, &parent)?,
+        };
+        if existing.is_none() {
+            report.playlists += 1;
+        }
+        if !node.folder {
             let members: Vec<String> = node.track_ids.iter().filter_map(|key| ids.get(key.as_str()).cloned()).collect();
             if !members.is_empty() {
-                writer.add_tracks(&id, &members)?;
+                // Tracks already there are left where they are.
+                let added = writer.add_tracks(&id, &members)?.rows;
+                if existing.is_some() {
+                    report.appended += added;
+                }
             }
-            parents.push(id);
         }
-        report.playlists += 1;
+        parents.push(id);
     }
     Ok(report)
+}
+
+/// The live folder or playlist called `name` under `parent`, if there is one.
+fn existing_node(writer: &Writer, name: &str, parent: &str, attribute: i64) -> Result<Option<String>> {
+    Ok(writer
+        .library()
+        .connection()
+        .query_row(
+            "SELECT ID FROM djmdPlaylist WHERE Name = ?1 AND ParentID = ?2 AND Attribute = ?3 AND rb_local_deleted = 0
+             ORDER BY Seq, ID LIMIT 1",
+            params![name, parent, attribute],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// How many memory cues and how many hot cues a track has.
+fn cue_kinds(writer: &Writer, content: &str) -> Result<(i64, i64)> {
+    Ok(writer.library().connection().query_row(
+        "SELECT COALESCE(SUM(Kind = 0), 0), COALESCE(SUM(Kind > 0), 0) FROM djmdCue
+         WHERE ContentID = ?1 AND rb_local_deleted = 0",
+        params![content],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
 }
 
 /// The cues of a document track onto a library track. `Num` -1 is a memory
@@ -380,18 +434,9 @@ fn millis(secs: f64) -> u32 {
     (secs * 1000.0).round().clamp(0.0, f64::from(u32::MAX)) as u32
 }
 
-/// The library's id for a file already in it.
+/// The library's id for a file already in it, found as the writer finds it.
 fn existing_id(writer: &Writer, path: &Path) -> Option<String> {
-    let folder = path.to_string_lossy().into_owned();
-    writer
-        .library()
-        .connection()
-        .query_row(
-            "SELECT ID FROM djmdContent WHERE FolderPath = ?1 AND rb_local_deleted = 0",
-            params![folder],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
+    writer.track_id_at(path).ok().flatten()
 }
 
 #[cfg(test)]

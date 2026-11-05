@@ -54,3 +54,31 @@ test("a library that is there never asks", async ({ page }) => {
     .toBeGreaterThan(0);
   await expect(page.getByRole("dialog", { name: "Welcome to rbxport" })).toHaveCount(0);
 });
+
+test("importing from rekordbox again shows what was taken and what was kept", async ({ page }) => {
+  await page.goto("/?writable=1");
+  await expect
+    .poll(async () => page.locator('[role="row"] [data-col="title"]').count(), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await page.evaluate(() => (window as unknown as { __menu: (id: string) => void }).__menu("import-rekordbox"));
+
+  const report = page.getByRole("dialog", { name: "Import Complete" });
+  await expect(report).toBeVisible();
+  await expect(report).toContainText("1 new tracks, 1 updated, 1 kept as edited in rbxport, 1 filled in, 1,905 unchanged.");
+  await expect(report).toContainText("rekordbox's library is unchanged.");
+  // What was kept is listed with rekordbox's value beside it, not applied.
+  await report.getByText("Edited in rbxport, so rekordbox's tags were not taken (1)").click();
+  await expect(report).toContainText("Track Title: Edited Here (rekordbox: Old Title)");
+  await report.getByRole("button", { name: "Close" }).click();
+  await expect(report).toBeHidden();
+});
+
+test("a read-only library refuses importing from rekordbox again", async ({ page }) => {
+  await page.goto("/");
+  await expect
+    .poll(async () => page.locator('[role="row"] [data-col="title"]').count(), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await page.evaluate(() => (window as unknown as { __menu: (id: string) => void }).__menu("import-rekordbox"));
+  await expect(page.getByRole("alert").filter({ hasText: "This library is open read-only, so it can't be edited." })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Import Complete" })).toHaveCount(0);
+});

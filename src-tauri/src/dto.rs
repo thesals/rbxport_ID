@@ -133,6 +133,35 @@ pub struct ImportSummaryDto {
     pub log: String,
 }
 
+/// What importing from rekordbox again did (File › Import from rekordbox…).
+/// The lists name every track; the log beside the library holds the same.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeltaImportDto {
+    pub new_tracks: Vec<rbl_db::rekordbox_import::TrackLine>,
+    pub updated: Vec<rbl_db::rekordbox_import::TrackLine>,
+    pub skipped: Vec<rbl_db::rekordbox_import::Skipped>,
+    pub path_matches: Vec<rbl_db::rekordbox_import::TrackLine>,
+    pub filled: Vec<rbl_db::rekordbox_import::Filled>,
+    pub unchanged: u64,
+    pub kept_deleted: u64,
+    pub duplicates: Vec<String>,
+    pub playlists_created: Vec<rbl_db::rekordbox_import::PlaylistLine>,
+    pub playlists_appended: Vec<rbl_db::rekordbox_import::PlaylistLine>,
+    pub playlists_skipped: Vec<rbl_db::rekordbox_import::PlaylistLine>,
+    pub history_sessions: u64,
+    pub plays_added: u64,
+    pub cues: u64,
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub problems: Vec<String>,
+    /// rekordbox's library hashed the same after the import as before.
+    pub source_unchanged: bool,
+    pub log: String,
+    /// New tracks with no analysis files, so they can be queued for analysis.
+    pub to_analyse: Vec<ImportedTrackDto>,
+}
+
 /// Why the library did not load at startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -434,6 +463,8 @@ pub struct XmlImportReportDto {
     pub existing: u32,
     pub skipped: Vec<String>,
     pub playlists: u32,
+    /// Tracks appended to playlists the library already had.
+    pub appended: u32,
     pub cues: u32,
     /// The tracks that landed, so they can be queued for analysis.
     pub tracks: Vec<ImportedTrackDto>,

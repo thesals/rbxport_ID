@@ -2647,6 +2647,15 @@ impl Writer {
         Ok(copy)
     }
 
+    /// The open library and the id generator, for rekordbox's repeat import
+    /// ([`crate::rekordbox_import::import_again`]), which writes rows of many
+    /// tables in one transaction. The session's backup is taken first, as
+    /// before any write.
+    pub(crate) fn import_session(&mut self) -> Result<(&mut Library, &mut Rng)> {
+        self.prepare()?;
+        Ok((&mut self.library, &mut self.rng))
+    }
+
     /// Finds an id no row in `table` is using.
     fn unused_id(&mut self, table: &str) -> Result<String> {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE ID = ?1");
@@ -2780,7 +2789,7 @@ fn normalized(path: &Path) -> PathBuf {
 
 /// The `djmdKey` row for a key name: where two rows share a name, the one
 /// rekordbox's own analyses point at, which is the one on the most tracks.
-fn key_id_for(conn: &Connection, name: &str) -> Result<String> {
+pub(crate) fn key_id_for(conn: &Connection, name: &str) -> Result<String> {
     conn.query_row(
         "SELECT k.ID FROM djmdKey k
          LEFT JOIN djmdContent c ON c.KeyID = k.ID AND c.rb_local_deleted = 0

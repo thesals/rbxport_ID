@@ -12,6 +12,7 @@ export type MenuAction =
   | "settings"
   | "import"
   | "import-folder"
+  | "import-rekordbox"
   | "import-xml"
   | "import-itunes"
   | "export-xml"
@@ -28,7 +29,7 @@ export type MenuAction =
 
 export interface MenuCommand {
   action: MenuAction;
-  /** Writes to the library, so rekordbox running is a refusal, not a race. */
+  /** Writes to the library, so a read-only or protected library refuses it. */
   writes: boolean;
 }
 
@@ -36,6 +37,7 @@ const COMMANDS: Record<string, MenuCommand> = {
   settings: { action: "settings", writes: false },
   import: { action: "import", writes: true },
   "import-folder": { action: "import-folder", writes: true },
+  "import-rekordbox": { action: "import-rekordbox", writes: true },
   "import-xml": { action: "import-xml", writes: true },
   "import-itunes": { action: "import-itunes", writes: true },
   "export-xml": { action: "export-xml", writes: false },

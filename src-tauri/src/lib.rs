@@ -509,6 +509,7 @@ pub fn run() {
             new_library::library_problem,
             new_library::create_library,
             new_library::import_rekordbox,
+            new_library::reimport_rekordbox,
             commands::playlist_tree,
             commands::open_view,
             commands::fetch_rows,
