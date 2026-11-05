@@ -83,6 +83,26 @@ describe("DeltaImportDialog", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("takes rekordbox's tags for the kept tracks you choose, with the differences it showed", () => {
+    const onTake = vi.fn();
+    act(() => root.render(<DeltaImportDialog progress={null} report={REPORT} error={null} onClose={() => undefined} onTake={onTake} />));
+    const take = [...host.querySelectorAll<HTMLButtonElement>("button[type=button]")].find(b => b.textContent?.startsWith("Take"));
+    expect(take?.textContent).toBe("Take rekordbox's tags (0)");
+    expect(take?.disabled).toBe(true);
+    const boxes = host.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
+    expect(boxes).toHaveLength(2);
+    act(() => boxes[1]?.click());
+    expect(take?.textContent).toBe("Take rekordbox's tags (1)");
+    expect(boxes[0]?.checked).toBe(true);
+    act(() => take?.click());
+    expect(onTake).toHaveBeenCalledWith([{ id: "3", fields: REPORT.skipped[0]?.fields }]);
+  });
+
+  it("offers no choice while the library is read-only", () => {
+    act(() => root.render(<DeltaImportDialog progress={null} report={REPORT} error={null} onClose={() => undefined} />));
+    expect(host.querySelectorAll("input[type=checkbox]")).toHaveLength(0);
+  });
+
   it("says when there was nothing new, and shows a failure", () => {
     const empty: DeltaImport = { ...REPORT, newTracks: [], skipped: [], filled: [], playlistsAppended: [], keptDeleted: 0 };
     act(() => root.render(<DeltaImportDialog progress={null} report={empty} error={null} onClose={() => undefined} />));

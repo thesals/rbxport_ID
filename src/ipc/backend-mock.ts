@@ -2358,7 +2358,7 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         log: "/Users/you/Library/Application Support/rbxport/library/import-log/first-import.txt",
       } satisfies ImportSummary;
     },
-    reimportRekordbox: async () => {
+    reimportRekordbox: async (take) => {
       for (const progress of [
         { stage: "checking", done: 0, total: 0 },
         { stage: "copyingDatabase", done: 1, total: 1 },
@@ -2372,15 +2372,18 @@ export function createMockBackend(options: MockOptions = {}): Backend {
         for (const listener of importListeners) listener(progress);
       }
       // As a repeat import of the mock's own library reports: one track
-      // rekordbox added, one it retagged, one edited here and kept.
+      // rekordbox added, one it retagged, one edited here and kept, unless
+      // that one's rekordbox tags were chosen.
+      const kept = [{
+        track: { id: "3", name: "Artist 3 — Edited Here" },
+        fields: [{ field: "title", rbxport: "Edited Here", rekordbox: "Old Title" }],
+        linkedByPath: false,
+      }];
+      const chosen = new Set((take ?? []).map(t => t.id));
       return {
         newTracks: [{ id: "9001", name: "TRIODE — New In rekordbox" }],
-        updated: [{ id: "2", name: "Artist 2 — Retagged" }],
-        skipped: [{
-          track: { id: "3", name: "Artist 3 — Edited Here" },
-          fields: [{ field: "title", rbxport: "Edited Here", rekordbox: "Old Title" }],
-          linkedByPath: false,
-        }],
+        updated: [{ id: "2", name: "Artist 2 — Retagged" }, ...kept.filter(k => chosen.has(k.track.id)).map(k => k.track)],
+        skipped: kept.filter(k => !chosen.has(k.track.id)),
         pathMatches: [],
         filled: [{ track: { id: "4", name: "Artist 4 — Track 4" }, what: ["hotCues"] }],
         unchanged: 1905, keptDeleted: 0, duplicates: [],

@@ -124,7 +124,7 @@ fn main() {
     location.is_user_library = false; // the dry run's target, checked above not to be the real one
     let backups = target.parent().expect("target has a folder").join("dry-run-backups");
     let mut writer = rbl_db::write::Writer::open(location, backups).expect("open the imported library");
-    let delta = rbl_db::rekordbox_import::import_again(&source, &mut writer, &mut |_| {}).expect("import again");
+    let delta = rbl_db::rekordbox_import::import_again(&source, &mut writer, &rbl_db::rekordbox_import::Take::new(), &mut |_| {}).expect("import again");
     let r = &delta.report;
     println!(
         "again: new {} updated {} skipped {} filled {} path matches {} unchanged {} kept deleted {} duplicates {}          playlists made {} appended {} skipped {} histories {} cues {} files {} problems {} source unchanged {} in {:.1}s",

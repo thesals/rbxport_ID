@@ -8,7 +8,8 @@
 //! A track that is already in rbxport takes rekordbox's tag fields only when
 //! rbxport's still equal the baseline the last import recorded, so a track
 //! edited in rbxport (by hand, by Identify, over LINK, any way at all) keeps
-//! its tags. Everything else is filled, never replaced: memory cues, hot
+//! its tags, unless you chose to take rekordbox's for it from the report
+//! (a [`Take`]). Everything else is filled, never replaced: memory cues, hot
 //! cues, the analysis files (beat grid and waveforms), the key and the
 //! artwork are taken only where rbxport has none of that kind. Playlists and
 //! history sessions rekordbox has made since are added; tracks added to a
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use rbl_core::ids::{Rng, MAX_CONTENT_ID, MAX_CUE_ID, MAX_PLAYLIST_ID};
 use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{copy_file, playlist_members, tag_fields, Progress, Stage};
 use crate::write::{Writer, ROOT};
@@ -40,7 +41,7 @@ pub struct TrackLine {
 }
 
 /// One tag field where rbxport and rekordbox disagree.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FieldDiff {
     /// As [`tag_fields`] names it: `title`, `album_artist`, `my_tags`, …
@@ -60,6 +61,12 @@ pub struct Skipped {
     /// changed it, so rbxport's tags are kept.
     pub linked_by_path: bool,
 }
+
+/// Tracks a report kept as edited whose rekordbox tags you chose to take:
+/// rbxport ID → the differences the report showed. A track's tags are taken
+/// only while the differences are still those, so what you saw is what you
+/// get.
+pub type Take = HashMap<String, Vec<FieldDiff>>;
 
 /// What an existing track was given because rbxport had none of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -645,6 +652,7 @@ pub(super) fn merge(
     source: &Library,
     source_share: &Path,
     recorded: &Recorded,
+    take: &Take,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<(DeltaReport, Bookkeeping)> {
     progress(Progress { stage: Stage::Comparing, done: 0, total: 1 });
@@ -689,9 +697,17 @@ pub(super) fn merge(
                 let linked = matches!(matched, Match::Path(_));
                 let now = our_tags.get(rbx).map_or("", String::as_str);
                 let theirs_now = theirs.tags.get(&rb_id).map_or("", String::as_str);
-                let same_now = differences(now, theirs_now).is_empty();
+                let diffs = differences(now, theirs_now);
+                let same_now = diffs.is_empty();
                 let untouched = recorded.baselines.get(rbx).is_some_and(|b| differences(now, b).is_empty());
-                let take_tags = untouched && !same_now;
+                let chosen = take.get(rbx).map(|shown| *shown == diffs);
+                if chosen == Some(false) && !same_now {
+                    report.problems.push(format!(
+                        "{}: its tags changed after the report you chose from, so rekordbox's were not taken; it is listed again with the differences as they are now",
+                        label(row, &theirs)
+                    ));
+                }
+                let take_tags = (untouched || chosen == Some(true)) && !same_now;
                 if same_now && (linked || !untouched) {
                     // Equal now: record that as the baseline.
                     book.baselines.push(rbx.clone());
@@ -700,7 +716,7 @@ pub(super) fn merge(
                 } else if !same_now {
                     report.skipped.push(Skipped {
                         track: TrackLine { id: rbx.clone(), name: label(row, &theirs) },
-                        fields: differences(now, theirs_now),
+                        fields: diffs,
                         linked_by_path: linked || !recorded.baselines.contains_key(rbx),
                     });
                 }
@@ -1472,6 +1488,7 @@ pub(super) fn members_now(conn: &Connection) -> Result<HashMap<String, String>> 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 mod tests {
     use super::super::{first_import, import_again, open_import_db, DeltaSummary};
+    use super::Take;
     use crate::fixture::{history_id, playlist_id, track_id};
     use crate::write::{TrackField, Writer};
     use crate::{Library, LibraryLocation, OpenMode};
@@ -1509,7 +1526,7 @@ mod tests {
         }
 
         fn import(&self) -> DeltaSummary {
-            import_again(&self.rekordbox, &mut self.writer(), &mut |_| {}).unwrap()
+            import_again(&self.rekordbox, &mut self.writer(), &Take::new(), &mut |_| {}).unwrap()
         }
 
         fn one<T: rusqlite::types::FromSql>(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> T {
@@ -1709,6 +1726,48 @@ mod tests {
     }
 
     #[test]
+    fn rekordbox_tags_are_taken_for_kept_tracks_you_choose_while_they_still_differ_as_shown() {
+        let w = world();
+        let (t1, t2, t3) = (track_id(1), track_id(2), track_id(3));
+        // Edited in rbxport: a title by hand, and a rating as a CDJ sets it
+        // over LINK (Q1: that counts as an edit too).
+        let mut writer = w.writer();
+        writer.set_field(&t1, TrackField::Title, "Mine").unwrap();
+        writer.set_field(&t2, TrackField::Title, "Mine too").unwrap();
+        writer.set_rating(&t3, 4).unwrap();
+        drop(writer);
+        w.rb(&format!(
+            "UPDATE djmdContent SET Commnt = 'from rekordbox' WHERE ID IN ('{t1}', '{t2}', '{t3}');"
+        ));
+        let first = w.import().report;
+        let ids: Vec<&str> = first.skipped.iter().map(|s| s.track.id.as_str()).collect();
+        assert_eq!(ids, [t1.as_str(), t2.as_str(), t3.as_str()]);
+
+        // Take t1 and t2 as the report showed them; t2 then changes again
+        // in rekordbox, so its choice no longer holds.
+        let take: Take = first
+            .skipped
+            .iter()
+            .filter(|s| s.track.id != t3)
+            .map(|s| (s.track.id.clone(), s.fields.clone()))
+            .collect();
+        w.rb(&format!("UPDATE djmdContent SET Commnt = 'changed again' WHERE ID = '{t2}';"));
+        let taken = import_again(&w.rekordbox, &mut w.writer(), &take, &mut |_| {}).unwrap().report;
+        assert_eq!(taken.updated.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [t1.as_str()]);
+        assert_eq!(w.one::<String>("SELECT Title FROM djmdContent WHERE ID = ?1", &[&t1]), "Track 001");
+        assert_eq!(w.one::<String>("SELECT Commnt FROM djmdContent WHERE ID = ?1", &[&t1]), "from rekordbox");
+        assert_eq!(w.one::<String>("SELECT Title FROM djmdContent WHERE ID = ?1", &[&t2]), "Mine too");
+        assert_eq!(taken.skipped.iter().map(|s| s.track.id.as_str()).collect::<Vec<_>>(), [t2.as_str(), t3.as_str()]);
+        assert!(taken.problems.iter().any(|p| p.contains("changed after the report")), "{:?}", taken.problems);
+        assert_eq!(w.one::<i64>("SELECT Rating FROM djmdContent WHERE ID = ?1", &[&t3]), 4);
+
+        // Taken, t1 is untouched again: it follows rekordbox from now on.
+        w.rb(&format!("UPDATE djmdContent SET Title = 'Renamed in rekordbox' WHERE ID = '{t1}';"));
+        assert_eq!(w.import().report.updated.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), [t1.as_str()]);
+        assert_eq!(w.one::<String>("SELECT Title FROM djmdContent WHERE ID = ?1", &[&t1]), "Renamed in rekordbox");
+    }
+
+    #[test]
     fn a_track_rbxport_has_by_its_file_is_linked_not_doubled() {
         let w = world();
         // Backslashes in rbxport's, and on Windows another case in rekordbox's.
@@ -1761,7 +1820,7 @@ mod tests {
         put_file(&w.rekordbox.share_root, dat, b"dat");
         // rbxport's update counter is gone, so the transaction fails at its end.
         w.ours("DELETE FROM agentRegistry WHERE registry_id = 'localUpdateCount';");
-        assert!(import_again(&w.rekordbox, &mut w.writer(), &mut |_| {}).is_err());
+        assert!(import_again(&w.rekordbox, &mut w.writer(), &Take::new(), &mut |_| {}).is_err());
         assert!(!rbl_anlz::resolve(&w.rbxport.share_root, dat).exists());
         assert_eq!(w.one::<i64>("SELECT COUNT(*) FROM djmdContent WHERE FolderPath = '/n.mp3'", &[]), 0);
     }

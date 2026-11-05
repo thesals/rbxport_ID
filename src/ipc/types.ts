@@ -163,6 +163,16 @@ export interface DeltaPlaylistLine {
 }
 
 /**
+ * A track a repeat import kept as edited, whose rekordbox tags were chosen,
+ * with the differences its report showed. They are taken only while the
+ * differences are still those.
+ */
+export interface TakeTags {
+  id: string;
+  fields: DeltaImport["skipped"][number]["fields"];
+}
+
+/**
  * What importing from rekordbox again did, into the library rbxport already
  * keeps. Every track is named; the log beside the library holds the same.
  */
@@ -389,8 +399,10 @@ export interface Backend {
    * library rbxport keeps. New tracks come in full; tracks already here take
    * rekordbox's tags only if never edited in rbxport, and otherwise only
    * what they have none of. Nothing is removed; rekordbox is only read.
+   * `take` names tracks a report kept as edited that take rekordbox's tags
+   * this time.
    */
-  reimportRekordbox(): Promise<DeltaImport>;
+  reimportRekordbox(take?: TakeTags[]): Promise<DeltaImport>;
 
   /** Fires as `importRekordbox` and `reimportRekordbox` go. */
   onImportProgress(listener: (progress: ImportProgress) => void): () => void;

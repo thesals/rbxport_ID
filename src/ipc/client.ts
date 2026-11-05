@@ -367,7 +367,7 @@ async function realBackend(): Promise<Backend> {
     libraryProblem: () => invoke<LibraryProblem | null>("library_problem"),
     createLibrary: () => invoke<void>("create_library"),
     importRekordbox: () => invoke<ImportSummary>("import_rekordbox"),
-    reimportRekordbox: () => invoke<DeltaImport>("reimport_rekordbox"),
+    reimportRekordbox: (take) => invoke<DeltaImport>("reimport_rekordbox", { take: take ?? null }),
     onImportProgress: (listener) => subscribe<ImportProgress>("library-import:progress", listener),
     onCuesChanged: (listener) => subscribe<string>("cues:changed", listener),
     onGridChanged: (listener) => subscribe<string>("grid:changed", listener),

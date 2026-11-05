@@ -31,7 +31,7 @@ use crate::{DbError, Library, LibraryLocation, OpenMode, Result, SchemaSupport};
 
 pub mod delta;
 
-pub use delta::{DeltaReport, FieldDiff, FillKind, Filled, PlaylistLine, Skipped, TrackLine};
+pub use delta::{DeltaReport, FieldDiff, FillKind, Filled, PlaylistLine, Skipped, Take, TrackLine};
 
 /// The bookkeeping file beside rbxport's `master.db`. Plain SQLite.
 pub const IMPORT_DB: &str = "import.db";
@@ -201,10 +201,13 @@ pub struct DeltaSummary {
 /// Imports rekordbox's library at `source` again, into the library `writer`
 /// holds, which already has one (see [`delta`] for the rules). Reads
 /// `source` only, through a verified copy made in a staging folder beside
-/// rbxport's library folder and removed afterwards.
+/// rbxport's library folder and removed afterwards. Tracks in `take` take
+/// rekordbox's tags although edited in rbxport, while they still differ as
+/// the report showed.
 pub fn import_again(
     source: &LibraryLocation,
     writer: &mut Writer,
+    take: &Take,
     progress: &mut dyn FnMut(Progress),
 ) -> Result<DeltaSummary> {
     let started_at = rbl_core::time::now();
@@ -248,7 +251,7 @@ pub fn import_again(
 
     let mut import_db = open_import_db(&dir)?;
     let recorded = delta::Recorded::read(&import_db)?;
-    let (report, book) = delta::merge(writer, &copied, &source.share_root, &recorded, progress)?;
+    let (report, book) = delta::merge(writer, &copied, &source.share_root, &recorded, take, progress)?;
     drop(copied);
 
     progress(Progress { stage: Stage::Recording, done: 0, total: 1 });

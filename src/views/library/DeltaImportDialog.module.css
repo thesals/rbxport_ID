@@ -34,3 +34,12 @@
 .note {
   opacity: 0.7;
 }
+
+.take {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-block: 0.25rem;
+}

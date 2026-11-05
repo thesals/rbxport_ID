@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "@/i18n";
-import type { DeltaImport, DeltaPlaylistLine, DeltaTrackLine, ImportProgress } from "@/ipc/types";
+import type { DeltaImport, DeltaPlaylistLine, DeltaTrackLine, ImportProgress, TakeTags } from "@/ipc/types";
 import styles from "./NewLibraryDialog.module.css";
 import own from "./DeltaImportDialog.module.css";
 
@@ -12,12 +12,17 @@ const SHOWN = 50;
  * how far it is while it runs, then what it did. Nothing in it can be
  * cancelled once started (the library is written in one transaction), so
  * the dialog closes only when it is done or failed.
+ *
+ * Tracks kept as edited in rbxport can be chosen to take rekordbox's tags
+ * anyway (`onTake`, absent while the library is read-only): that imports
+ * again, taking them for those tracks while they still differ as shown.
  */
-export function DeltaImportDialog({ progress, report, error, onClose }: {
+export function DeltaImportDialog({ progress, report, error, onClose, onTake }: {
   progress: ImportProgress | null;
   report: DeltaImport | null;
   error: string | null;
   onClose: () => void;
+  onTake?: ((take: TakeTags[]) => void) | undefined;
 }) {
   const t = useTranslation();
   const dialog = useRef<HTMLDialogElement>(null);
@@ -45,7 +50,7 @@ export function DeltaImportDialog({ progress, report, error, onClose }: {
           </>
         ) : null}
         {error !== null ? <p className={styles.error} role="alert">{error}</p> : null}
-        {report !== null ? <Report report={report} /> : null}
+        {report !== null ? <Report report={report} onTake={onTake} /> : null}
         <div className={styles.buttons}>
           <button type="submit" disabled={!done} autoFocus>{t("Close")}</button>
         </div>
@@ -54,8 +59,15 @@ export function DeltaImportDialog({ progress, report, error, onClose }: {
   );
 }
 
-function Report({ report }: { report: DeltaImport }) {
+function Report({ report, onTake }: { report: DeltaImport; onTake: ((take: TakeTags[]) => void) | undefined }) {
   const t = useTranslation();
+  const [chosen, setChosen] = useState<ReadonlySet<string>>(() => new Set());
+  const toggle = (id: string) => setChosen(now => {
+    const next = new Set(now);
+    if (!next.delete(id)) next.add(id);
+    return next;
+  });
+  const all = report.skipped.length > 0 && chosen.size === report.skipped.length;
   const nothing = report.newTracks.length === 0 && report.updated.length === 0 && report.filled.length === 0
     && report.playlistsCreated.length === 0 && report.playlistsAppended.length === 0 && report.historySessions === 0;
   return (
@@ -74,10 +86,28 @@ function Report({ report }: { report: DeltaImport }) {
         {report.skipped.length > 0 ? (
           <details className={own.section}>
             <summary>{t("Edited in rbxport, so rekordbox's tags were not taken")} ({report.skipped.length.toLocaleString()})</summary>
+            {onTake !== undefined ? (
+              <div className={own.take}>
+                <label>
+                  <input type="checkbox" checked={all}
+                    onChange={() => setChosen(all ? new Set() : new Set(report.skipped.map(s => s.track.id)))} />
+                  {" "}{t("Select all")}
+                </label>
+                <button type="button" disabled={chosen.size === 0}
+                  onClick={() => onTake(report.skipped.filter(s => chosen.has(s.track.id)).map(s => ({ id: s.track.id, fields: s.fields })))}>
+                  {t("Take rekordbox's tags ({n})", { n: chosen.size.toLocaleString() })}
+                </button>
+              </div>
+            ) : null}
             <ul className={own.list}>
               {report.skipped.slice(0, SHOWN).map(skipped => (
                 <li key={skipped.track.id}>
-                  {skipped.track.name}
+                  {onTake !== undefined ? (
+                    <label>
+                      <input type="checkbox" checked={chosen.has(skipped.track.id)} onChange={() => toggle(skipped.track.id)} />
+                      {" "}{skipped.track.name}
+                    </label>
+                  ) : skipped.track.name}
                   {skipped.linkedByPath ? <span className={own.note}> · {t("matched by file path")}</span> : null}
                   <ul className={own.fields}>
                     {skipped.fields.map(field => (

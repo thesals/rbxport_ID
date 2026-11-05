@@ -19,7 +19,7 @@ import type { TrackSearchField } from "@/lib/search";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { droppedFilePaths, getBackend, subscribeNativeFileDrops } from "@/ipc/client";
 import type {
-  Backend, DeckId, DeltaImport, Device, ImportProgress, ImportReport, ImportSummary, LibraryProblem, LibrarySummary, RowDto, SortColumn, TrackField, TreeNode, ViewSpec,
+  Backend, DeckId, DeltaImport, Device, ImportProgress, ImportReport, ImportSummary, LibraryProblem, LibrarySummary, RowDto, SortColumn, TakeTags, TrackField, TreeNode, ViewSpec,
 } from "@/ipc/types";
 import { TrackTable, type TrackDrag } from "@/views/browser/TrackTable";
 import { clearWaveformPreviewCache } from "@/views/browser/WaveformPreview";
@@ -1713,12 +1713,13 @@ function AppBody() {
     }
   }, [report, refuse, analysisPrefs.auto, analysis]);
 
-  const reimportFromMenu = useCallback(async () => {
+  // `take`: tracks the last report kept as edited whose rekordbox tags were chosen.
+  const reimportFromMenu = useCallback(async (take?: TakeTags[]) => {
     setDeltaImport({ progress: null, report: null, error: null });
     const backend = await getBackend();
     const stop = backend.onImportProgress(progress => setDeltaImport(open => open && { ...open, progress }));
     try {
-      const done = await backend.reimportRekordbox();
+      const done = await backend.reimportRekordbox(take);
       setDeltaImport({ progress: null, report: done, error: null });
       setTree(await backend.playlistTree());
       if (analysisPrefs.auto && done.toAnalyse.length > 0) analysis.add(done.toAnalyse);
@@ -2609,7 +2610,8 @@ function AppBody() {
       ) : null}
       {deltaImport !== null ? (
         <DeltaImportDialog progress={deltaImport.progress} report={deltaImport.report} error={deltaImport.error}
-          onClose={() => setDeltaImport(null)} />
+          onClose={() => setDeltaImport(null)}
+          onTake={readOnly ? undefined : take => { void reimportFromMenu(take); }} />
       ) : null}
       {analysisSelection !== null ? (
         <AnalysisDialog count={analysisSelection.length} initialMode={analysisPrefs.mode}

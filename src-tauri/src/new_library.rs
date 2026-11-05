@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{Manager, State};
 
 use crate::commands::blocking;
-use crate::dto::{DeltaImportDto, ImportProgressDto, ImportSummaryDto, ImportedTrackDto, LibraryProblemDto};
+use crate::dto::{DeltaImportDto, ImportProgressDto, ImportSummaryDto, ImportedTrackDto, LibraryProblemDto, TakeTagsDto};
 use crate::error::{AppError, AppResult, ErrorKind};
 use crate::state::AppState;
 
@@ -47,9 +47,15 @@ pub async fn create_library(app: tauri::AppHandle) -> AppResult<()> {
 /// new tracks in full, rekordbox's tags only for tracks never edited here,
 /// and otherwise only what rbxport has none of. rekordbox's files are only
 /// read. The library is backed up first and reloaded after. Progress is
-/// `library-import:progress`.
+/// `library-import:progress`. `take` names tracks the last report kept as
+/// edited that take rekordbox's tags this time.
 #[tauri::command]
-pub async fn reimport_rekordbox(app: tauri::AppHandle, state: State<'_, Arc<AppState>>) -> AppResult<DeltaImportDto> {
+pub async fn reimport_rekordbox(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    take: Option<Vec<TakeTagsDto>>,
+) -> AppResult<DeltaImportDto> {
+    let take: rbl_db::rekordbox_import::Take = take.unwrap_or_default().into_iter().map(|t| (t.id, t.fields)).collect();
     let writing = Arc::clone(&state);
     let emitter = app.clone();
     let dto = blocking("reimport_rekordbox", move || {
@@ -58,7 +64,7 @@ pub async fn reimport_rekordbox(app: tauri::AppHandle, state: State<'_, Arc<AppS
         let summary = writing
             .write(|writer| {
                 writer.back_up_now()?;
-                rbl_db::rekordbox_import::import_again(&source, writer, &mut |p| {
+                rbl_db::rekordbox_import::import_again(&source, writer, &take, &mut |p| {
                     let _ = tauri::Emitter::emit(
                         &emitter,
                         "library-import:progress",
@@ -72,6 +78,7 @@ pub async fn reimport_rekordbox(app: tauri::AppHandle, state: State<'_, Arc<AppS
             new = r.new_tracks.len(),
             updated = r.updated.len(),
             skipped = r.skipped.len(),
+            chosen = take.len(),
             filled = r.filled.len(),
             source_unchanged = summary.source_unchanged,
             "imported from rekordbox again"

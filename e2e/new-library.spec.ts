@@ -69,6 +69,10 @@ test("importing from rekordbox again shows what was taken and what was kept", as
   // What was kept is listed with rekordbox's value beside it, not applied.
   await report.getByText("Edited in rbxport, so rekordbox's tags were not taken (1)").click();
   await expect(report).toContainText("Track Title: Edited Here (rekordbox: Old Title)");
+  // Chosen, it takes rekordbox's tags after all.
+  await report.getByRole("checkbox", { name: "Artist 3 — Edited Here" }).check();
+  await report.getByRole("button", { name: "Take rekordbox's tags (1)" }).click();
+  await expect(report).toContainText("1 new tracks, 2 updated, 0 kept as edited in rbxport, 1 filled in, 1,905 unchanged.");
   await report.getByRole("button", { name: "Close" }).click();
   await expect(report).toBeHidden();
 });

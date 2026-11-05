@@ -162,6 +162,16 @@ pub struct DeltaImportDto {
     pub to_analyse: Vec<ImportedTrackDto>,
 }
 
+/// A track the repeat import's report kept as edited, whose rekordbox tags
+/// were chosen, with the differences the report showed: they are taken only
+/// while the differences are still those.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeTagsDto {
+    pub id: String,
+    pub fields: Vec<rbl_db::rekordbox_import::FieldDiff>,
+}
+
 /// Why the library did not load at startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
