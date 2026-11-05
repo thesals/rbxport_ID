@@ -146,11 +146,8 @@ fn analyse_and_save(
     }
     // Checked before the decode, which is seconds of work that would
     // only end in the same refusal.
-    if library_locked(state) {
-        return Err(AppError::new(
-            ErrorKind::ReadOnly,
-            "rekordbox is running. Quit it before analysing.",
-        ));
+    if let Some(reason) = library_refusal(state) {
+        return Err(AppError::new(ErrorKind::ReadOnly, reason));
     }
 
     let started = std::time::Instant::now();
@@ -340,8 +337,8 @@ pub async fn edit_phrase<R: tauri::Runtime>(
     };
     let reported = track_id.clone();
     let changed = blocking("edit_phrase", move || {
-        if library_locked(&state) {
-            return Err(AppError::new(ErrorKind::ReadOnly, "rekordbox is running. Quit it before editing phrases."));
+        if let Some(reason) = library_refusal(&state) {
+            return Err(AppError::new(ErrorKind::ReadOnly, reason));
         }
         let Some(row) = library.row_of(&track_id) else {
             return Err(AppError::new(ErrorKind::NotFound, "That track is not in the library."));
@@ -369,10 +366,10 @@ pub async fn edit_phrase<R: tauri::Runtime>(
     Ok(changed)
 }
 
-/// Whether the library cannot be written right now: rekordbox holds the
-/// installed library's file. A fixture is never held.
-fn library_locked(state: &AppState) -> bool {
-    state.location().is_ok_and(|location| location.is_rekordbox_install) && rbl_db::is_rekordbox_running()
+/// Why the library cannot be written, if it cannot: checked before seconds of
+/// decoding that would only end in the same refusal.
+fn library_refusal(state: &AppState) -> Option<&'static str> {
+    state.location().ok().and_then(|location| rbl_db::write_refusal_reason(&location, rbl_db::test_mode()))
 }
 
 /// Writes the three files beside `dat`, each through a temporary name so a

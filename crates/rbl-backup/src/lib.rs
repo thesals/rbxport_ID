@@ -1,5 +1,6 @@
 //! RBXport backup archives. RBXport writes them; RBXport Restore reads them
-//! and puts them back as the rekordbox library.
+//! and puts them back as rbxport's library. rekordbox's library is never
+//! restored over: [`writable`] refuses it.
 //!
 //! An archive is a standard ZIP holding:
 //!
@@ -52,9 +53,11 @@ pub(crate) fn refused(message: impl Into<String>) -> Error {
     Error::Refused(message.into())
 }
 
-/// Library selections kept beside `master.db`, outside the SQL database:
-/// Sync Manager's playlist choices and the Automix playlist.
-pub const LIBRARY_FILES: [&str; 2] = ["masterPlaylists6.xml", "automixPlaylist6.xml"];
+/// Files kept beside `master.db`, outside it: Sync Manager's playlist
+/// choices, the Automix playlist, and `import.db`, the record of what came
+/// from rekordbox. That travels with the database so a restored library and
+/// its import baselines stay in step.
+pub const LIBRARY_FILES: [&str; 3] = ["masterPlaylists6.xml", "automixPlaylist6.xml", rbl_db::rekordbox_import::IMPORT_DB];
 
 /// `PIONEER/USBANLZ`: beat grids, waveforms, cues, phrases and vocals.
 pub fn analysis_dir(location: &rbl_db::LibraryLocation) -> PathBuf {

@@ -238,11 +238,10 @@ impl AppState {
     }
 
     /// Opens the library for writing, runs one edit against it, and closes
-    /// it. Refused while rekordbox is running.
+    /// it. Refused for rekordbox's library and, under test mode, the user's.
     ///
-    /// Opened per edit rather than held: holding it would keep the database
-    /// open read-write for the life of the app, and rekordbox launching
-    /// behind us must be able to take the file back. Database backups are
+    /// Opened per edit rather than held, so the database is not open
+    /// read-write for the life of the app. Database backups are
     /// made only by an explicit request, never automatically on edits.
     ///
     /// Blocking — call from `spawn_blocking`, never from a command body.

@@ -25,10 +25,9 @@ export interface StatusBarProps {
   /** e.g. "Selected: 4 Tracks, 18 minutes, 58.4 MB"; empty when nothing is selected. */
   selection?: string;
   readOnly?: boolean;
-  /** Library Protection in Preferences is why, rather than rekordbox running. */
+  /** Library Protection in Preferences is why, rather than the library itself. */
   protectedLibrary?: boolean;
   onExplainReadOnly?: (() => void) | undefined;
-  onDisableReadOnly?: (() => void) | undefined;
   onOpenProtection?: (() => void) | undefined;
   onReportBug?: (() => void) | undefined;
   onSupport?: (() => void) | undefined;
@@ -60,7 +59,6 @@ export function StatusBar({
   readOnly = false,
   protectedLibrary = false,
   onExplainReadOnly,
-  onDisableReadOnly,
   onOpenProtection,
   onReportBug,
   onSupport,
@@ -110,7 +108,7 @@ export function StatusBar({
       </span>
       {readOnly ? (
         <button type="button" className={styles.readOnly} title={refusal(protectedLibrary)}
-          onClick={onExplainReadOnly} onDoubleClick={onDisableReadOnly}>
+          onClick={onExplainReadOnly}>
           Library read-only
         </button>
       ) : null}

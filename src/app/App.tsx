@@ -387,38 +387,14 @@ function AppBody() {
   }, []);
   const prefs = usePreferencesStore();
   const { view: viewPrefs, advanced: advancedPrefs, analysis: analysisPrefs } = prefs.preferences;
-  // Every write path reads this one flag: rekordbox holding the database,
-  // or Library Protection in Preferences, refuse the same way.
+  // Every write path reads this one flag: a library open read-only, or
+  // Library Protection in Preferences, refuse the same way. The first is
+  // fixed while the library is open, so nothing polls for it.
   const backupJob = useBackupProgress();
   const exportJobs = useExportProgress();
   const exportBatch = [...exportJobs.values()];
   const exportRunning = exportBatch.some(job => ["preparing", "checking", "copying", "database", "verifying", "publishing", "ejecting"].includes(job.state));
   const readOnly = (summary?.readOnly ?? false) || advancedPrefs.protectLibrary;
-  useEffect(() => {
-    let live = true;
-    let timer: ReturnType<typeof setTimeout>;
-    const refresh = async () => {
-      try {
-        const backend = await getBackend();
-        if (!live) return;
-        const info = await backend.librarySummary();
-        if (live) {
-          setSummary((current) => current && current.readOnly !== info.readOnly
-            ? { ...current, readOnly: info.readOnly }
-            : current);
-        }
-      } catch {
-        // Keep the last known lock state if the library is temporarily unavailable.
-      } finally {
-        if (live) timer = setTimeout(() => void refresh(), 2000);
-      }
-    };
-    timer = setTimeout(() => void refresh(), 2000);
-    return () => {
-      live = false;
-      clearTimeout(timer);
-    };
-  }, []);
 
   useEffect(() => {
     let stop: (() => void) | undefined;
@@ -528,9 +504,9 @@ function AppBody() {
   /**
    * The last thing the app has to say, and whether it went wrong.
    *
-   * One channel, two colours: "Added 3 tracks" and "rekordbox is running, so
-   * the library is open read-only" arrive the same way and are not the same
-   * kind of news.
+   * One channel, two colours: "Added 3 tracks" and "Editing is locked by
+   * Library Protection" arrive the same way and are not the same kind of
+   * news.
    */
   const [note, setNote] = useState<{ text: string; failed: boolean } | null>(null);
   const [playerError, setPlayerError] = useState<string | null>(null);
@@ -1599,7 +1575,7 @@ function AppBody() {
   }, [note]);
 
   // Analysis writes the result to the library, so it is refused the way any
-  // other write is while rekordbox holds the file or the library is protected.
+  // other write is while the library is read-only or protected.
   const ANALYSIS_REFUSED = "The library is read-only, so nothing can be analysed.";
   const [analysisSelection, setAnalysisSelection] = useState<readonly QueueItem[] | null>(null);
   /** Capture either browser's selection before opening the settings dialog. */
@@ -2697,16 +2673,6 @@ function AppBody() {
         readOnly={readOnly}
         protectedLibrary={advancedPrefs.protectLibrary}
         onExplainReadOnly={() => { setPlayerError(null); explainEditLock(); }}
-        onDisableReadOnly={() => {
-          if (advancedPrefs.protectLibrary) {
-            explainEditLock();
-            return;
-          }
-          void getBackend().then(backend => backend.disableReadOnly()).then(() => {
-            setSummary(current => current ? { ...current, readOnly: false } : current);
-            setNote({ text: "Read-only mode disabled for this session.", failed: false });
-          }).catch(error => refuse(error instanceof Error ? error.message : String(error)));
-        }}
       />
     </div>
     </PreferencesProvider>

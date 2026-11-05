@@ -549,7 +549,8 @@ mod tests {
             .read_to_string(&mut powershell)
             .unwrap();
         assert!(powershell.starts_with("param([string]$MasterDb"));
-        assert!(powershell.contains("Get-Process -Name rekordbox, rekordboxAgent"));
+        assert!(powershell.contains("Get-Process -Name rbxport"));
+        assert!(!powershell.contains("rekordbox") && !shell.contains("rekordbox"));
     }
 
     #[test]

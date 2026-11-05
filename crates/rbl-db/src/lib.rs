@@ -26,35 +26,14 @@ pub mod write;
 pub mod xml;
 mod schema;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
 
-/// Opts a deliberately launched app into the manual, session-only write override.
-pub const UNSAFE_WRITES_ENV: &str = "RBX_DISABLE_READ_ONLY";
 /// Prevents tests from opening the detected rekordbox library read-write.
 pub const TEST_ENV: &str = "RBXPORT_TEST";
 /// Accepted so older test scripts retain their installed-library protection.
 const LEGACY_TEST_ENV: &str = "RB_LITE_TEST";
-
-static UNSAFE_WRITES_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Arms writes while rekordbox is running, but only for a process explicitly
-/// launched with [`UNSAFE_WRITES_ENV`]. The choice is not persisted.
-pub fn enable_unsafe_writes() -> bool {
-    if std::env::var_os(UNSAFE_WRITES_ENV).is_none() {
-        return false;
-    }
-    UNSAFE_WRITES_ENABLED.store(true, Ordering::Release);
-    true
-}
-
-pub fn unsafe_writes_enabled() -> bool {
-    UNSAFE_WRITES_ENABLED.load(Ordering::Acquire)
-}
 
 /// Whether this process must refuse writes to the detected rekordbox library.
 pub fn test_mode() -> bool {
@@ -309,7 +288,10 @@ fn comparable(path: &Path) -> PathBuf {
     }
 }
 
-/// True when rekordbox (or its agent) is running, in which case we must not write.
+/// True when rekordbox (or its agent) is running.
+///
+/// rbxport's own library never waits on this. It matters only where rekordbox
+/// really holds something: the LINK ports, and a USB stick it may write.
 pub fn is_rekordbox_running() -> bool {
     use sysinfo::{ProcessRefreshKind, RefreshKind, System};
     let sys = System::new_with_specifics(
@@ -326,6 +308,13 @@ pub fn is_rekordbox_running() -> bool {
 /// What rbxport says when asked to change rekordbox's library.
 pub const REKORDBOX_REFUSAL: &str =
     "This is rekordbox's library. rbxport never changes it; import it into rbxport's library instead.";
+
+/// True when the library at `location` is open for reading only: rekordbox's,
+/// or the user's own under test mode. Nothing else makes it read-only.
+#[must_use]
+pub fn is_read_only(location: &LibraryLocation) -> bool {
+    write_refusal_reason(location, test_mode()).is_some()
+}
 
 /// Why writing the library at `location` must be refused, if it must.
 ///

@@ -149,7 +149,11 @@ pub enum LibraryProblemDto {
 pub struct LibrarySummaryDto {
     pub track_count: u32,
     pub playlist_count: u32,
+    /// The library is open for reading only: rekordbox's, or the user's own
+    /// under test mode.
     pub read_only: bool,
+    /// rekordbox is running. Only USB sync waits for it to quit.
+    pub rekordbox_running: bool,
     pub db_version: Option<i64>,
     /// Milliseconds the library took to open and index; shown in diagnostics.
     pub load_ms: u64,

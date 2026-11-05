@@ -126,9 +126,12 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
   const [loadingDevices, setLoadingDevices] = useState(true);
   const [devicesError, setDevicesError] = useState("");
   // This window may live in its own webview, so it keeps its own live view
-  // of rekordbox's process lock instead of relying on the main window.
-  // Unknown is locked: do not briefly enable SYNC before the first check.
+  // of whether rekordbox is running: it may write a stick it sees, so SYNC
+  // waits for it to quit. Unknown is locked: do not briefly enable SYNC
+  // before the first check. The library itself never waits on rekordbox;
+  // only a read-only library stops the imports here.
   const [rekordboxOpen, setRekordboxOpen] = useState<boolean | null>(null);
+  const [libraryReadOnly, setLibraryReadOnly] = useState<boolean | null>(null);
   const [operation, setOperation] = useState<"sync" | "import" | "eject" | "itunes" | null>(null);
   // The iTunes / Music library shown in the left column, its ticks, and which
   // of its folders are closed. Null until the auto-detect answers, or when no
@@ -165,7 +168,7 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
   const importBlocked = (kind: ImportKind): string | null =>
     kind === "cues" && preferences.advanced.protectLibrary ? t("Turn off Library Protection to import cues and grids.")
     : kind === "history" && preferences.advanced.protectLibrary ? t("Turn off Library Protection to import play history.")
-    : kind === "history" && rekordboxOpen !== false ? t("Quit rekordbox to import play history.")
+    : kind === "history" && libraryReadOnly !== false ? t("The library is read-only, so play history can't be imported.")
     : null;
   const importKinds = IMPORT_KINDS.map(({ kind }) => kind).filter(kind => importTicked(kind) && !importBlocked(kind));
   const deleteUnlistedMusic = preferences.usbExport.deleteUnlistedMusic;
@@ -199,7 +202,10 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
       try {
         const backend = await getBackend();
         const summary = await backend.librarySummary();
-        if (live) setRekordboxOpen(summary.readOnly);
+        if (live) {
+          setRekordboxOpen(summary.rekordboxRunning);
+          setLibraryReadOnly(summary.readOnly);
+        }
       } catch {
         // Preserve the last known state during a temporary backend failure.
       } finally {
@@ -255,6 +261,9 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
   }, [refreshDevices]);
 
   const firstReadDone = !loadingTree && !loadingDevices && rekordboxOpen !== null;
+  const itunesBlocked = preferences.advanced.protectLibrary ? t("Turn off Library Protection to import from iTunes.")
+    : libraryReadOnly ? t("The library is read-only, so nothing can be imported from iTunes.")
+    : null;
   useEffect(() => {
     if (firstReadDone) onReady?.();
   }, [firstReadDone, onReady]);
@@ -402,7 +411,7 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
     })();
   }, [busy]);
 
-  const canImportItunes = rekordboxOpen === false && itunes !== null && itunesSelectedCount > 0 && !busy;
+  const canImportItunes = libraryReadOnly === false && itunesBlocked === null && itunes !== null && itunesSelectedCount > 0 && !busy;
 
   const importItunes = useCallback(() => {
     if (!itunes || !canImportItunes) return;
@@ -415,14 +424,6 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
     void (async () => {
       try {
         const backend = await getBackend();
-        // Close the gap between the last poll and the click: rekordbox holds
-        // the database, and importing writes to it.
-        const summary = await backend.librarySummary();
-        setRekordboxOpen(summary.readOnly);
-        if (summary.readOnly) {
-          setStatus([t("Quit rekordbox to import from iTunes.")]);
-          return;
-        }
         const report = await backend.importItunesSelected(itunes.path, ids);
         // Show the imported playlists in the rekordbox column at once.
         setTree(await backend.playlistTree());
@@ -489,8 +490,8 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
         // Close the interval between the last poll and the click: rekordbox
         // may have launched while the button was still visibly enabled.
         const summary = await backend.librarySummary();
-        setRekordboxOpen(summary.readOnly);
-        if (summary.readOnly) {
+        setRekordboxOpen(summary.rekordboxRunning);
+        if (summary.rekordboxRunning) {
           setStatus([t("Quit rekordbox to enable synchronization.")]);
           return;
         }
@@ -665,7 +666,7 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
             className={styles.sync}
             onClick={importItunes}
             disabled={!canImportItunes}
-            title={rekordboxOpen ? "Quit rekordbox to import from iTunes." : undefined}
+            title={itunesBlocked ?? undefined}
             aria-label="Import selected iTunes playlists"
             aria-busy={operation === "itunes" || undefined}
           >

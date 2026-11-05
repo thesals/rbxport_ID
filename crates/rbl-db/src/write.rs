@@ -89,7 +89,7 @@ use rbl_core::time;
 use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-use crate::{is_rekordbox_running, DbError, Library, OpenMode, Result};
+use crate::{DbError, Library, OpenMode, Result};
 
 /// Tables whose `rb_local_usn` participates in the shared counter.
 const USN_TABLES: &[&str] = &[
@@ -254,9 +254,7 @@ pub struct AnalysisRegistration<'a> {
 /// A guarded write session.
 ///
 /// Holds the library open read-write. Every action is one immediate
-/// transaction, and the process gate is re-checked before each: rekordbox can
-/// be launched at any moment, and a check made when the session opened would
-/// be stale by the time an edit happens.
+/// transaction, with the session's backup taken before the first.
 #[derive(Debug)]
 pub struct Writer {
     library: Library,
@@ -362,7 +360,7 @@ impl PlaylistDeletion {
 impl Writer {
     /// Opens the library for writing and prepares the backup directory.
     ///
-    /// Fails if rekordbox is running, or if this is the real library under
+    /// Fails for rekordbox's library, and for the user's own under
     /// `RBXPORT_TEST` — both enforced by [`Library::open`].
     pub fn open(location: crate::LibraryLocation, backup_dir: impl Into<PathBuf>) -> Result<Self> {
         let library = Library::open(location, OpenMode::ReadWrite)?;
@@ -2490,19 +2488,9 @@ impl Writer {
         Ok(Changed { rows, usn })
     }
 
-    /// Runs before every transaction.
-    ///
-    /// rekordbox can be launched between one edit and the next, so the check
-    /// made when the session opened is not enough. The backup is taken once,
-    /// before the first write of the session.
+    /// Runs before every transaction: the backup is taken once, before the
+    /// first write of the session.
     fn prepare(&mut self) -> Result<()> {
-        // Only the installed library needs this: rekordbox holds that file's
-        // WAL, and nothing else's.
-        if self.library.location().is_rekordbox_install && is_rekordbox_running() {
-            return Err(DbError::WriteRefused(
-                "rekordbox is running. Quit it before making changes.".to_owned(),
-            ));
-        }
         if self.automatic_backups && !self.backup_taken {
             self.back_up()?;
             self.backup_taken = true;
@@ -2981,9 +2969,9 @@ pub fn backups_in(dir: &Path) -> Vec<PathBuf> {
 /// Puts a backup back as the library.
 ///
 /// The backup is validated and normalized to a standalone database, then
-/// atomically replaces the checkpointed live file. Refused
-/// while rekordbox holds the installed library, and for a file that is not
-/// one of this app's backups. The caller reopens every handle it holds:
+/// atomically replaces the checkpointed live file. Refused for
+/// rekordbox's library, and for a file that is not one of this app's
+/// backups. The caller reopens every handle it holds:
 /// one on the old inode would answer with the old rows for ever.
 pub fn restore_backup(location: &crate::LibraryLocation, backup: &Path) -> Result<()> {
     if let Some(reason) = crate::write_refusal_reason(location, crate::test_mode()) {

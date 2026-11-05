@@ -102,7 +102,7 @@ beforeEach(async () => {
   itunesLibrary = null;
   importItunesSelected = vi.fn(() => Promise.resolve({ imported: 5, existing: 0, skipped: [], playlists: 1, cues: 0, tracks: [] }));
   __setBackend({
-    librarySummary: () => Promise.resolve({ trackCount: 3, playlistCount: 3, readOnly: rekordboxOpen, dbVersion: 6000 }),
+    librarySummary: () => Promise.resolve({ trackCount: 3, playlistCount: 3, readOnly: false, rekordboxRunning: rekordboxOpen, dbVersion: 6000 }),
     playlistTree: () => Promise.resolve(TREE.map((n) => ({ ...n }))),
     itunesDefaultLibrary: () => Promise.resolve(itunesLibrary),
     chooseItunesLibrary: () => Promise.resolve(null),
@@ -352,6 +352,28 @@ describe("SyncManager", () => {
     await settle();
     expect(importItunesSelected).toHaveBeenCalledWith("/Users/dj/Music/Music/Library.xml", ["itunes:1"]);
     expect(status()).toContain("Imported 1 playlists from iTunes");
+  });
+
+  it("imports from iTunes while rekordbox runs: only SYNC waits for it", async () => {
+    act(() => root.unmount());
+    rekordboxOpen = true;
+    itunesLibrary = {
+      path: "/Users/dj/Music/Music/Library.xml",
+      tree: [{ id: "itunes:1", name: "Airplane Mix", kind: "playlist", depth: 1 }],
+    };
+    root = createRoot(host);
+    act(() => root.render(<SyncManager onClose={onClose} />));
+    await settle();
+
+    click(box("Airplane Mix"));
+    await settle();
+    const itunesSync = host.querySelector<HTMLButtonElement>('button[aria-label="Import selected iTunes playlists"]');
+    expect(itunesSync?.disabled).toBe(false);
+    expect(itunesSync?.title).toBe("");
+    click(itunesSync);
+    await settle();
+    expect(importItunesSelected).toHaveBeenCalledWith("/Users/dj/Music/Music/Library.xml", ["itunes:1"]);
+    expect(host.querySelector<HTMLButtonElement>('button[aria-label="SYNC"]')?.title).toBe("Quit rekordbox to enable synchronization.");
   });
 
   it("offers a file picker when no iTunes library is detected", () => {

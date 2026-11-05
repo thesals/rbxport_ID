@@ -17,8 +17,9 @@ describe("sanitisePreferences", () => {
     expect(sanitisePreferences({ rekordbox: { syncBrowseSettings: "no" } }).rekordbox.syncBrowseSettings).toBe(true);
     expect(sanitisePreferences({ rekordbox: { syncBrowseSettings: false } }).rekordbox.syncBrowseSettings).toBe(false);
   });
-  it("protects a new library without making existing users read-only", () => {
-    expect(DEFAULT_PREFERENCES.advanced.protectLibrary).toBe(true);
+  it("leaves Library Protection off unless it was turned on", () => {
+    expect(DEFAULT_PREFERENCES.advanced.protectLibrary).toBe(false);
+    expect(sanitisePreferences({}).advanced.protectLibrary).toBe(false);
     expect(sanitisePreferences({ view: { tooltips: true } }).advanced.protectLibrary).toBe(false);
     expect(sanitisePreferences({ advanced: { protectLibrary: false } }).advanced.protectLibrary).toBe(false);
     expect(sanitisePreferences({ advanced: { protectLibrary: true } }).advanced.protectLibrary).toBe(true);

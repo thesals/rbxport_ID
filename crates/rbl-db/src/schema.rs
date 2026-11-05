@@ -103,7 +103,7 @@ impl SchemaProbe {
     }
 
     /// Whether the *schema* is complete enough to write. This is not permission
-    /// to write: `Library::open` still refuses while rekordbox is running.
+    /// to write: `Library::open` still refuses rekordbox's library.
     pub fn schema_supports_writes(&self) -> bool {
         matches!(self.support, SchemaSupport::Full)
     }

@@ -8,7 +8,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ErrorKind {
-    /// The library is open read-only (rekordbox is running, or the schema is unknown).
+    /// The library is open read-only (rekordbox's library, test mode, or an unknown schema).
     ReadOnly,
     /// Rekordbox's database or a required file could not be found.
     NotFound,

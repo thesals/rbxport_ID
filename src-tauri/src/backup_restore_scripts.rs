@@ -1,8 +1,8 @@
 //! Standalone restore helpers embedded in every backup archive.
 use std::path::Path;
 
-pub const SHELL_NAME: &str = "restore-rekordbox.sh";
-pub const POWERSHELL_NAME: &str = "restore-rekordbox.ps1";
+pub const SHELL_NAME: &str = "restore-library.sh";
+pub const POWERSHELL_NAME: &str = "restore-library.ps1";
 
 fn shell_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -26,7 +26,7 @@ SHARE_DIR="$DB_DIR/share"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 ROLLBACK="$DB_DIR/.rbxport-before-restore-$STAMP-$$"
 
-echo "RBXport standalone rekordbox restore"
+echo "RBXport standalone library restore"
 echo "Backup folder: $SCRIPT_DIR"
 echo "Checking the extracted backup contents…"
 if [[ ! -f "$SCRIPT_DIR/master.db" || ! -d "$SCRIPT_DIR/analysis" || ! -d "$SCRIPT_DIR/artwork" ]]; then
@@ -34,14 +34,14 @@ if [[ ! -f "$SCRIPT_DIR/master.db" || ! -d "$SCRIPT_DIR/analysis" || ! -d "$SCRI
   exit 1
 fi
 echo "Backup contents found."
-echo "Checking whether rekordbox is running…"
-if pgrep -ix rekordbox >/dev/null 2>&1 || pgrep -ix rekordboxAgent >/dev/null 2>&1; then
-  echo "Quit rekordbox before restoring this backup." >&2
+echo "Checking whether RBXport is running…"
+if pgrep -ix rbxport >/dev/null 2>&1; then
+  echo "Quit RBXport before restoring this backup." >&2
   exit 1
 fi
-echo "rekordbox is not running."
+echo "RBXport is not running."
 
-echo "This will replace the rekordbox library at:"
+echo "This will replace the RBXport library at:"
 echo "  $MASTER_DB"
 read -r -p "Continue? [y/N] " answer
 case "$answer" in [yY]|[yY][eE][sS]) ;; *) echo "Restore cancelled."; exit 0 ;; esac
@@ -95,7 +95,7 @@ save_and_remove() {{
   fi
 }}
 
-echo "Restoring the rekordbox database…"
+echo "Restoring the library database…"
 replace_file "$SCRIPT_DIR/master.db" "$MASTER_DB" "$ROLLBACK/database/master.db"
 echo "Removing stale SQLite sidecars…"
 save_and_remove "$MASTER_DB-wal" "$ROLLBACK/database/master.db-wal"
@@ -105,7 +105,7 @@ replace_tree "$SCRIPT_DIR/analysis" "$SHARE_DIR/PIONEER/USBANLZ" "$ROLLBACK/shar
 echo "Restoring artwork…"
 replace_tree "$SCRIPT_DIR/artwork" "$SHARE_DIR/PIONEER/Artwork" "$ROLLBACK/share/PIONEER/Artwork"
 echo "Restoring library playlist settings…"
-for name in masterPlaylists6.xml automixPlaylist6.xml; do
+for name in masterPlaylists6.xml automixPlaylist6.xml import.db; do
   if [[ -f "$SCRIPT_DIR/$name" ]]; then
     replace_file "$SCRIPT_DIR/$name" "$DB_DIR/$name" "$ROLLBACK/database/$name"
   else
@@ -114,7 +114,7 @@ for name in masterPlaylists6.xml automixPlaylist6.xml; do
 done
 
 trap - ERR
-echo "rekordbox was restored successfully."
+echo "The library was restored successfully."
 echo "The previous files are saved at: $ROLLBACK"
 "#
     )
@@ -131,7 +131,7 @@ $ShareDir = Join-Path $DbDir 'share'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $Rollback = Join-Path $DbDir ".rbxport-before-restore-$Stamp-$PID"
 
-Write-Host 'RBXport standalone rekordbox restore'
+Write-Host 'RBXport standalone library restore'
 Write-Host "Backup folder: $SourceDir"
 Write-Host 'Checking the extracted backup contents…'
 if (!(Test-Path -LiteralPath (Join-Path $SourceDir 'master.db') -PathType Leaf) -or
@@ -140,13 +140,13 @@ if (!(Test-Path -LiteralPath (Join-Path $SourceDir 'master.db') -PathType Leaf) 
   throw 'This script must be run from an extracted RBXport backup.'
 }}
 Write-Host 'Backup contents found.'
-Write-Host 'Checking whether rekordbox is running…'
-if (Get-Process -Name rekordbox, rekordboxAgent -ErrorAction SilentlyContinue) {{
-  throw 'Quit rekordbox before restoring this backup.'
+Write-Host 'Checking whether RBXport is running…'
+if (Get-Process -Name rbxport -ErrorAction SilentlyContinue) {{
+  throw 'Quit RBXport before restoring this backup.'
 }}
-Write-Host 'rekordbox is not running.'
+Write-Host 'RBXport is not running.'
 
-Write-Host 'This will replace the rekordbox library at:'
+Write-Host 'This will replace the RBXport library at:'
 Write-Host "  $MasterDb"
 $Answer = Read-Host 'Continue? [y/N]'
 if ($Answer -notmatch '^(?i:y|yes)$') {{ Write-Host 'Restore cancelled.'; exit 0 }}
@@ -195,7 +195,7 @@ function Save-AndRemove([string]$Target, [string]$Saved) {{
 }}
 
 try {{
-  Write-Host 'Restoring the rekordbox database…'
+  Write-Host 'Restoring the library database…'
   Replace-File (Join-Path $SourceDir 'master.db') $MasterDb (Join-Path $Rollback 'database/master.db')
   Write-Host 'Removing stale SQLite sidecars…'
   Save-AndRemove "$MasterDb-wal" (Join-Path $Rollback 'database/master.db-wal')
@@ -205,7 +205,7 @@ try {{
   Write-Host 'Restoring artwork…'
   Replace-Tree (Join-Path $SourceDir 'artwork') (Join-Path $ShareDir 'PIONEER/Artwork') (Join-Path $Rollback 'share/PIONEER/Artwork')
   Write-Host 'Restoring library playlist settings…'
-  foreach ($Name in 'masterPlaylists6.xml', 'automixPlaylist6.xml') {{
+  foreach ($Name in 'masterPlaylists6.xml', 'automixPlaylist6.xml', 'import.db') {{
     $Source = Join-Path $SourceDir $Name
     if (Test-Path -LiteralPath $Source -PathType Leaf) {{
       Replace-File $Source (Join-Path $DbDir $Name) (Join-Path $Rollback "database/$Name")
@@ -218,7 +218,7 @@ try {{
   exit 1
 }}
 
-Write-Host 'rekordbox was restored successfully.'
+Write-Host 'The library was restored successfully.'
 Write-Host "The previous files are saved at: $Rollback"
 "#
     )
@@ -290,16 +290,16 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         for message in [
             "Checking the extracted backup contents",
-            "Checking whether rekordbox is running",
+            "Checking whether RBXport is running",
             "Creating rollback folder",
-            "Restoring the rekordbox database",
+            "Restoring the library database",
             "Preserving current file",
             "Removing stale SQLite sidecars",
             "Restoring analysis files",
             "Restoring artwork",
             "Restoring library playlist settings",
             "Optional file is not in this backup",
-            "rekordbox was restored successfully",
+            "The library was restored successfully",
         ] {
             assert!(
                 stdout.contains(message),

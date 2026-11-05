@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(classify("artwork/abc/artwork_m.jpg"), Some(Entry::Artwork(PathBuf::from("abc/artwork_m.jpg"))));
         assert_eq!(classify("masterPlaylists6.xml"), Some(Entry::LibraryFile("masterPlaylists6.xml")));
         assert_eq!(classify("summary.json"), Some(Entry::Other));
-        assert_eq!(classify("restore-rekordbox.sh"), Some(Entry::Other));
+        assert_eq!(classify("restore-library.sh"), Some(Entry::Other));
         assert_eq!(classify("master.db/inner"), Some(Entry::Other));
         assert_eq!(classify("../escape"), None);
         assert_eq!(classify("analysis/../../escape"), None);

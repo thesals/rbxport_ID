@@ -484,6 +484,28 @@ mod tests {
     }
 
     #[test]
+    fn import_records_travel_with_the_library() {
+        // The baselines a later import from rekordbox compares against must
+        // be the restored library's, not the ones from before the restore.
+        let dir = tempfile::tempdir().unwrap();
+        let location = testing::library(dir.path());
+        let records = location.master_db.parent().unwrap().join(rbl_db::rekordbox_import::IMPORT_DB);
+        fs::write(&records, b"baselines at backup").unwrap();
+        let archive = dir.path().join("backup.zip");
+        testing::archive(&location, &archive, None);
+        fs::write(&records, b"baselines after").unwrap();
+
+        let state_dir = dir.path().join("state");
+        restore(
+            &Request { archive: &archive, parts: Parts::ALL, location: &location, state_dir: &state_dir, sizes: None },
+            &|| Ok(()),
+            &mut |_, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&records).unwrap(), b"baselines at backup");
+    }
+
+    #[test]
     fn restoring_the_database_replaces_a_stale_wal_and_shm() {
         let fixture = fixture();
         let wal = sidecar(&fixture.location.master_db, "-wal");

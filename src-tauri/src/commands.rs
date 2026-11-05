@@ -63,38 +63,19 @@ where
 pub async fn library_summary(state: State<'_, Arc<AppState>>) -> AppResult<LibrarySummaryDto> {
     let library = state.library()?;
     let (read_only, db_version, load_ms, _generation) = state.summary();
-    let is_rekordbox_install = state.location()?.is_rekordbox_install;
     blocking("library_summary", move || {
-        // The UI refreshes this while open; startup's process state is stale
-        // as soon as rekordbox launches or exits. Fixtures keep their own gate.
-        let read_only = if is_rekordbox_install {
-            rbl_db::is_rekordbox_running() && !rbl_db::unsafe_writes_enabled()
-        } else {
-            read_only
-        };
         Ok(LibrarySummaryDto {
             track_count: u32::try_from(library.len()).unwrap_or(u32::MAX),
             playlist_count: u32::try_from(library.playlists().len()).unwrap_or(u32::MAX),
             read_only,
+            // Only USB sync asks: rekordbox may write a stick it sees. The
+            // library itself never waits on rekordbox.
+            rekordbox_running: rbl_db::is_rekordbox_running(),
             db_version,
             load_ms,
         })
     })
     .await
-}
-
-/// Removes the rekordbox-running write gate for this process. This deliberately
-/// requires both an environment opt-in and an explicit gesture in the UI.
-#[tauri::command]
-pub fn disable_read_only() -> AppResult<()> {
-    if rbl_db::enable_unsafe_writes() {
-        Ok(())
-    } else {
-        Err(AppError::internal(format!(
-            "Set {} before launching rbxport to enable this override.",
-            rbl_db::UNSAFE_WRITES_ENV
-        )))
-    }
 }
 
 #[tauri::command]
@@ -731,7 +712,7 @@ pub(crate) fn refresh_after_edit(state: &AppState, db: &rbl_db::Library, touched
             let started = std::time::Instant::now();
             let (library, _) = rbl_index::load(db)?;
             let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            state.set_library(library, rbl_db::is_rekordbox_running(), db.schema().db_version, load_ms, db.location().clone());
+            state.set_library(library, rbl_db::is_read_only(db.location()), db.schema().db_version, load_ms, db.location().clone());
             Ok(state.summary().3)
         }
         touched => {
@@ -780,7 +761,7 @@ pub(crate) async fn reload<R: tauri::Runtime>(app: tauri::AppHandle<R>, state: A
         let (library, _) = rbl_index::load(&db)
             .map_err(|e| AppError::new(ErrorKind::Internal, e.to_string()))?;
         let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let read_only = rbl_db::is_rekordbox_running();
+        let read_only = rbl_db::is_read_only(&location);
         state.set_library(library, read_only, db_version, load_ms, location);
         Ok(state.summary().3)
     })

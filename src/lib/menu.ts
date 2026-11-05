@@ -81,5 +81,5 @@ export function resolveMenu(
 export function refusal(protectedLibrary: boolean): string {
   return protectedLibrary
     ? "Editing is locked by Library Protection. Turn it off in Preferences to edit."
-    : "Editing is locked while rekordbox is running. Quit rekordbox to enable editing.";
+    : "This library is open read-only, so it can't be edited.";
 }

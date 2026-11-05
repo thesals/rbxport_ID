@@ -12,9 +12,9 @@ describe("menu", () => {
     expect(resolveMenu("settings", true)).toEqual({ action: "settings" });
   });
 
-  it("refuses a write while rekordbox holds the library", () => {
+  it("refuses a write while the library is read-only", () => {
     expect(resolveMenu("import", true)).toEqual({
-      refused: "Editing is locked while rekordbox is running. Quit rekordbox to enable editing.",
+      refused: "This library is open read-only, so it can't be edited.",
     });
     expect(resolveMenu("import", false)).toEqual({ action: "import" });
   });
@@ -22,7 +22,7 @@ describe("menu", () => {
   it("treats importing a folder as the write it is", () => {
     expect(menuCommand("import-folder")?.writes).toBe(true);
     expect(resolveMenu("import-folder", true)).toEqual({
-      refused: "Editing is locked while rekordbox is running. Quit rekordbox to enable editing.",
+      refused: "This library is open read-only, so it can't be edited.",
     });
     expect(resolveMenu("import-folder", false)).toEqual({ action: "import-folder" });
   });

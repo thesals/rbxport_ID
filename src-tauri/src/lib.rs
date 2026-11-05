@@ -122,7 +122,7 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
                         let load_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         tracing::debug!(tracks = library.len(), load_ms, "library from cache");
-                        let read_only = location.is_rekordbox_install && rbl_db::is_rekordbox_running();
+                        let read_only = rbl_db::is_read_only(&location);
                         app.state::<Arc<AppState>>().set_library(
                             library, read_only, db_version, load_ms, location,
                         );
@@ -144,8 +144,8 @@ pub(crate) fn spawn_library_load(app: tauri::AppHandle) {
                             "library loaded"
                         );
                         // rbxport's own library is never held by rekordbox;
-                        // only rekordbox's own would be, and it is never opened here.
-                        let read_only = location.is_rekordbox_install && rbl_db::is_rekordbox_running();
+                        // only test mode makes it read-only.
+                        let read_only = rbl_db::is_read_only(&location);
                         app.state::<Arc<AppState>>()
                             .set_library(library, read_only, db_version, load_ms, location);
                         let _ = tauri::Emitter::emit(&app, "library:ready", ());
@@ -496,7 +496,6 @@ pub fn run() {
             menu::set_history_menu,
             menu::set_menu_labels,
             commands::library_summary,
-            commands::disable_read_only,
             new_library::library_problem,
             new_library::create_library,
             new_library::import_rekordbox,

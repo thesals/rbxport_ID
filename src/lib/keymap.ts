@@ -166,7 +166,7 @@ export const KEYMAP: Readonly<Record<KeymapGroup, readonly KeymapRow[]>> = {
     { id: "3003", label: "Volume", key: "command + F12" },
     { id: "3004", label: "Volume Down", key: "command + F11" },
     { id: "3005", label: "Mute", key: "command + F10" },
-    { id: "1001", label: "Quit rekordbox", key: "command + Q" },
+    { id: "1001", label: "Quit rbxport", key: "command + Q" },
   ],
   "File": [
     { id: "2000", label: "Import File", key: "command + O" },

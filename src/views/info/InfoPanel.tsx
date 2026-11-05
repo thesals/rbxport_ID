@@ -69,7 +69,7 @@ const LOCKED: Record<string, string> = {
   publish: "Read from DeliveryControl; how rekordbox spells an unticked box (empty or NULL both occur) has not been seen.",
 };
 
-const READ_ONLY_REASON = "The library is read-only. Check Library Protection in Preferences, and quit rekordbox to edit";
+const READ_ONLY_REASON = "The library is read-only. Check Library Protection in Preferences";
 
 export function InfoPanel({
   track, readOnly, libraryGeneration, onRate, onComment, onEdit,

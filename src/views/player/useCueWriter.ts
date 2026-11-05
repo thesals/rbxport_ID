@@ -12,7 +12,7 @@ import { useCallback, useRef } from "react";
 import { getBackend } from "@/ipc/client";
 
 /** What the interface says when the library cannot be written to. */
-export const READ_ONLY_REASON = "The library is read-only. Check Library Protection in Preferences, and quit rekordbox to edit.";
+export const READ_ONLY_REASON = "The library is read-only. Check Library Protection in Preferences.";
 
 /** The cue commands, as `write` hands them to an action. */
 export type CueEdits = Awaited<ReturnType<typeof getBackend>>["edits"];

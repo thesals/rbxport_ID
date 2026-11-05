@@ -857,7 +857,7 @@ test("preferences are kept, and the key column follows the display format", asyn
   await expect(page.locator('[role="gridcell"][data-col="key"]').first()).toHaveText(classic);
 });
 
-test("Library Protection refuses edits the way a running rekordbox does", async ({ page }) => {
+test("Library Protection refuses edits the way a read-only library does", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
   await page.getByRole("banner").getByRole("button", { name: "Settings" }).click();
@@ -1368,48 +1368,20 @@ test("the key column is not typed over: it is checked against the library's own"
   await expect(page.locator('[role="gridcell"][data-col="key"] input')).toHaveCount(0);
 });
 
-test("editing follows rekordbox opening and closing without reloading", async ({ page }) => {
-  await page.goto("/");
-  await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
-  const cell = page.locator('[role="gridcell"][data-col="title"]').nth(3);
-  await cell.click();
-  await cell.click();
-  const warning = page.getByRole("contentinfo").getByRole("alert");
-  await expect(warning).toContainText("rekordbox is running");
-
-  // Change the mock process state without remounting the app.
-  await page.evaluate(() => history.replaceState(null, "", "/?writable=1"));
-  await expect(page.getByRole("contentinfo")).not.toContainText("Library read-only");
-  await expect(warning).toHaveCount(0);
-  await cell.click();
-  await expect(cell.locator("input")).toBeFocused();
-  const originalTitle = await cell.locator("input").inputValue();
-  await cell.locator("input").fill("Must not save after locking");
-
-  await page.evaluate(() => history.replaceState(null, "", "/"));
-  await expect(page.getByRole("contentinfo")).toContainText("Library read-only");
-  await expect(cell.locator("input")).toHaveAttribute("readonly", "");
-  await cell.locator("input").press("Enter");
-  await expect(cell).toHaveText(originalTitle);
-  await cell.click();
-  await expect(cell.locator("input")).toHaveCount(0);
-  await expect(warning).toContainText("rekordbox is running");
-});
-
-test("with the library held by rekordbox the cells are not editable at all", async ({ page }) => {
+test("with the library read-only the cells are not editable at all", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
   await page.locator('[role="gridcell"][data-col="artist"]').nth(3).dblclick();
   await expect(page.locator('[role="gridcell"][data-col="artist"] input')).toHaveCount(0);
   const warning = page.getByRole("contentinfo").getByRole("alert");
-  await expect(warning).toHaveText("Editing is locked while rekordbox is running. Quit rekordbox to enable editing.");
+  await expect(warning).toHaveText("This library is open read-only, so it can't be edited.");
   await expect(warning).toHaveCount(0, { timeout: 12000 });
 
   const title = page.locator('[role="gridcell"][data-col="title"]').nth(3);
   await title.click();
   await title.click();
   await expect(title.locator("input")).toHaveCount(0);
-  await expect(warning).toHaveText("Editing is locked while rekordbox is running. Quit rekordbox to enable editing.");
+  await expect(warning).toHaveText("This library is open read-only, so it can't be edited.");
 });
 
 // The missing-file manager is hidden for now (MISSING_FILES_ENABLED).

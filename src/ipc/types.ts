@@ -169,8 +169,14 @@ export interface ImportSummary {
 export interface LibrarySummary {
   trackCount: number;
   playlistCount: number;
-  /** True when rekordbox is running, i.e. writes are refused. */
+  /**
+   * True when the library is open for reading only, so writes are refused.
+   * rbxport's own library is read-only only under test mode; rekordbox
+   * running never makes it so.
+   */
   readOnly: boolean;
+  /** rekordbox is running. Only USB sync waits for it: it may write a stick it sees. */
+  rekordboxRunning: boolean;
   /** rekordbox's own DB schema version, e.g. 6000. */
   dbVersion: number | null;
 }
@@ -219,8 +225,6 @@ export interface Backend {
   /** The installed rekordbox browseSetting.xml, when present. Read-only. */
   rekordboxBrowseSettings(): Promise<string | null>;
   librarySummary(): Promise<LibrarySummary>;
-  /** Session-only escape hatch, available only when the native process opted in. */
-  disableReadOnly(): Promise<void>;
   rememberScreenAssets(ids: string[], waveformKind: WaveformKind): Promise<void>;
   playlistTree(): Promise<TreeNode[]>;
   openView(spec: ViewSpec): Promise<ViewHandle>;
@@ -248,8 +252,8 @@ export interface Backend {
    * Editing. Plain edits return the library generation; reversible edits
    * return that generation together with the shared undo/redo state.
    *
-   * All of these are refused while Rekordbox is running — it holds the
-   * database — and the refusal arrives as an `AppError` of kind `readOnly`.
+   * All of these are refused while the library is read-only, and the
+   * refusal arrives as an `AppError` of kind `readOnly`.
    */
   edits: Edits;
 

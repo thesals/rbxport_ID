@@ -179,7 +179,7 @@ export function AdvancedPane({ tab, summary }: {
           <dt>Editing</dt>
           <dd>
             {summary?.readOnly
-              ? "Read-only — rekordbox is running"
+              ? "Read-only"
               : advanced.protectLibrary
                 ? "Protected — see Browse"
                 : "Available"}
