@@ -255,7 +255,7 @@ export function IdentifyPane() {
   return (
     <Section title={t("Identify")}>
       <p className={`${layout.help} ${styles.intro}`}>
-        {t("Identify tracks with AcoustID, MusicBrainz and Discogs. Only the tags in the audio files are written; the rekordbox library is not changed.")}
+        {t("Identify tracks with AcoustID, MusicBrainz and Discogs. Accepted results are written to rbxport's library, and to the audio files when the setting below is on. The rekordbox library is never changed.")}
       </p>
 
       <section className={`${layout.card} ${styles.card}`} aria-label={t("Write tags to audio files")}>
@@ -274,12 +274,12 @@ export function IdentifyPane() {
           />
         </label>
         <p id={`${id}-writes-help`} className={layout.help}>
-          {t("While this is off, identification only reads the audio files and saves proposals for review. Nothing is written to them, not by Accept, Undo or auto-apply. Off by default.")}
+          {t("While this is off, identification only reads the audio files. Accept, Apply accepted and auto-apply write rbxport's library only; nothing is written to the files. Off by default.")}
         </p>
         {confirmingWrites ? (
           <div className={styles.confirm} role="group" aria-label={t("Confirm writing tags to audio files")}>
             <p className={styles.warning}>
-              {t("Accept, Undo, Apply accepted and auto-apply will change the tags in your audio files, including files in your rekordbox library. The rekordbox library itself is not changed.")}
+              {t("Accept, Undo, Apply accepted and auto-apply will change the tags in your audio files too, including files in your rekordbox library. The rekordbox library itself is not changed.")}
             </p>
             <div className={styles.actions}>
               <button type="button" className={controls.button} disabled={busy} onClick={() => void confirmWrites()}>
@@ -384,7 +384,7 @@ export function IdentifyPane() {
           />
         </label>
         <p id={`${id}-auto-help`} className={layout.help}>
-          {t("When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to the file's tags as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.", {
+          {t("When on, a fingerprint match scoring at least the minimum below that only fills empty fields is written to rbxport's library (and to the file's tags, when writing them is on) as soon as it is identified. It appears under {applied}; if the write fails, it stays under {needsReview}. Everything else waits for review. Off by default.", {
             // The review queue's own filter names, in the same words.
             applied: t("Applied (undoable)"), needsReview: t("Needs review"),
           })}

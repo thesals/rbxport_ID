@@ -14,7 +14,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { __setBackend } from "@/ipc/client";
-import { AUTO_APPLY_LOCKED, FILE_WRITES_OFF, createMockIdentify, type MockIdentifyBackend } from "@/ipc/mock-identify";
+import { FILE_NOT_WRITTEN_OFF, FILE_WRITES_OFF, createMockIdentify, type MockIdentifyBackend } from "@/ipc/mock-identify";
 import type { Backend } from "@/ipc/types";
 import { useIdentifyJob } from "@/store/useIdentifyJob";
 import { IdentifyPanel } from "./IdentifyPanel";
@@ -29,9 +29,12 @@ let root: Root;
 let identify: MockIdentifyBackend;
 const onClose = vi.fn();
 
+/** What App passes as `libraryLocked`; null unless a test locks it. */
+let libraryLocked: string | null = null;
+
 function Harness() {
   const job = useIdentifyJob();
-  return <IdentifyPanel job={job} onClose={onClose} />;
+  return <IdentifyPanel job={job} onClose={onClose} libraryLocked={libraryLocked} />;
 }
 
 const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
@@ -66,6 +69,7 @@ beforeEach(() => {
   document.body.append(host);
   root = createRoot(host);
   onClose.mockReset();
+  libraryLocked = null;
 });
 afterEach(() => {
   act(() => root.unmount());
@@ -130,8 +134,8 @@ describe("IdentifyPanel", () => {
     await click(button("Accept"));
     expect(apply).toHaveBeenCalledWith([{ resultId: expect.any(Number) as number, fields: ["title", "subGenre", "artwork"] }]);
     expect(byText("[role=dialog] section span", "Applied")).toBeDefined();
-    expect(host.querySelector("[role=note]")?.textContent).toBe(
-      "To see the changes in rekordbox, select the tracks there and choose Reload Tag.");
+    // Written to the library and the file: no library-only note.
+    expect(host.querySelector("[aria-label='Identification result'] [role=note]")).toBeNull();
     expect(button("Accept")?.disabled).toBe(true);
     expect(options()).toHaveLength(1);
 
@@ -152,7 +156,7 @@ describe("IdentifyPanel", () => {
     expect(options()[0]?.textContent).toContain("Applied automatically");
     await click(options()[0]);
     expect(button("Accept")?.disabled).toBe(true);
-    expect(host.querySelector("[role=note]")?.textContent).toContain("choose Reload Tag");
+    expect(host.textContent).not.toContain("Reload Tag");
     await click(button("Undo"));
     expect(byText("section span", "Undone")).toBeDefined();
     expect(options()).toHaveLength(0);
@@ -171,20 +175,20 @@ describe("IdentifyPanel", () => {
     expect(byText("section span", "Rejected")).toBeDefined();
   });
 
-  it("shows each result's source, and rekordbox's record where it differs from the file", async () => {
+  it("shows each result's source, and rbxport's library where it differs from the file", async () => {
     await identifyFive();
     await render();
     const row = options()[0]!;
     const source = row.querySelector<HTMLElement>("[title=Fingerprint]");
     expect(source?.textContent).toBe("Fingerprint");
     await click(row);
-    // The mock's rekordbox record has an older label and no comment; its
-    // title matches the file, so that row says nothing about rekordbox.
+    // The mock's library record has an older label and no comment; its
+    // title matches the file, so that row says nothing about the library.
     const rowOf = (label: string) => [...host.querySelectorAll("tr")].find((tr) => tr.querySelector("th")?.textContent === label);
-    expect(rowOf("Label")?.textContent).toContain("rekordbox: Older Label");
-    expect(rowOf("Sub-genre (added to Comment)")?.textContent).toContain("rekordbox: (empty)");
-    expect(rowOf("Track Title")?.textContent).not.toContain("rekordbox:");
-    expect(host.textContent).toContain("the rekordbox library is not changed");
+    expect(rowOf("Label")?.textContent).toContain("In library: Older Label");
+    expect(rowOf("Sub-genre (added to Comment)")?.textContent).toContain("In library: (empty)");
+    expect(rowOf("Track Title")?.textContent).not.toContain("In library:");
+    expect(host.textContent).toContain("Accepted fields are written to rbxport's library and to the audio file.");
   });
 
   it("accepts above the threshold, then applies what was accepted", async () => {
@@ -210,7 +214,8 @@ describe("IdentifyPanel", () => {
     await click(button("Apply"));
     expect(apply).toHaveBeenCalledTimes(1);
     expect(apply.mock.calls[0]?.[0]).toEqual([{ resultId: expect.any(Number) as number, fields: ["label", "catalogNumber"] }]);
-    expect(host.textContent).toContain("1 applied. To see the changes in rekordbox");
+    expect(host.textContent).toContain("1 applied.");
+    expect(host.textContent).not.toContain("Reload Tag");
     await click(byText("[role=tab]", "Applied (undoable)"));
     expect(options()).toHaveLength(1);
     await click(byText("[role=tab]", "All"));
@@ -252,7 +257,6 @@ describe("IdentifyPanel", () => {
     await click(button("Retry now"));
     expect(host.querySelector("section[aria-label='Waiting for file']")).toBeNull();
     expect(byText("[role=dialog] section span", "Applied")).toBeDefined();
-    expect(host.querySelector("[role=note]")?.textContent).toContain("choose Reload Tag");
     expect(options()).toHaveLength(0);
     await click(byText("[role=tab]", "Applied (undoable)"));
     expect(name).not.toBe("");
@@ -327,56 +331,57 @@ describe("IdentifyPanel", () => {
 });
 
 describe("IdentifyPanel with writing to audio files off", () => {
-  const notice = "Writing to audio files is off. Results are saved for review only.";
+  const notice = "Writing to audio files is off. Accepted results are written to rbxport's library only.";
 
-  it("says so, disables every write and keeps review changes", async () => {
+  it("says so, writes rbxport's library only and keeps review changes", async () => {
     useMock(false, false);
     await identifyFive();
-    const apply = vi.spyOn(identify, "apply");
     await render();
     expect(host.querySelector("[role=note]#identify-writes-off")?.textContent).toBe(notice);
-    expect(button("Apply accepted")?.disabled).toBe(true);
-    expect(button("Apply accepted")?.title).toBe(notice);
+    expect(button("Apply accepted")?.disabled).toBe(false);
     expect(button("Accept above")?.disabled).toBe(false);
     await click(options()[0]);
-    expect(button("Accept")?.disabled).toBe(true);
-    expect(button("Accept")?.title).toBe(notice);
-    expect(button("Accept")?.getAttribute("aria-describedby")).toBe("identify-writes-off");
+    expect(host.textContent).toContain("Writing to audio files is off, so the files are left as they are.");
     // Edit, Reject and Back to review change only the identify store.
     await click(host.querySelector<HTMLButtonElement>('button[aria-label="Edit Label"]') ?? undefined);
     type(host.querySelector<HTMLInputElement>('input[aria-label="Proposed Label"]')!, "Edited Records");
     await click(button("Save"));
     expect(host.textContent).toContain("Edited Records");
-    expect(button("Reject")?.disabled).toBe(false);
     await click(button("Reject"));
     expect(byText("section span", "Rejected")).toBeDefined();
     await click(button("Back to review"));
     expect(byText("section span", "Needs review")).toBeDefined();
-    // Accept above only marks results accepted.
-    await click(button("Accept above"));
-    expect(host.textContent).toContain("1 result accepted.");
-    expect(apply).not.toHaveBeenCalled();
+
+    expect(button("Accept")?.disabled).toBe(false);
+    await click(button("Accept"));
+    expect(byText("[aria-label='Identification result'] [role=status]", FILE_NOT_WRITTEN_OFF)).toBeDefined();
+    expect(byText("[role=dialog] section span", "Applied")).toBeDefined();
+    expect(byText("[role=note]", "Written to rbxport's library only; the audio file was not changed.")).toBeDefined();
+    await click(button("Undo"));
+    expect(byText("section span", "Undone")).toBeDefined();
   });
 
-  it("is enforced by the store: a forced apply, undo or retry is refused and nothing is written", async () => {
+  it("is enforced by the store: a field only the file keeps is refused and no file is written", async () => {
     useMock(false, false);
     await identifyFive();
     const [first] = (await identify.queue("needsReview", 0, 10)).items;
     expect(first).toBeDefined();
-    const fields = first!.changes.map((c) => c.field);
-    expect(await identify.apply([{ resultId: first!.resultId, fields }])).toEqual([
-      { resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF },
+    const before = await identify.result(first!.resultId);
+    expect(await identify.apply([{ resultId: first!.resultId, fields: ["catalogNumber"] }])).toEqual([
+      { resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF, note: null },
     ]);
     expect(FILE_WRITES_OFF).toBe("Writing to audio files is turned off. Turn on \"Write tags to audio files\" in Preferences → Identify to write.");
-    const after = await identify.result(first!.resultId);
-    expect(after.item.state).toBe("pending");
-    expect(after.item.changes).toEqual(first!.changes);
-    expect(await identify.undo(first!.resultId)).toEqual({ resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF });
-    expect((await identify.queue("applied", 0, 10)).total).toBe(0);
+    expect((await identify.result(first!.resultId)).item.state).toBe("pending");
 
-    // Turned on, the same apply writes.
-    await identify.saveSettings({ fileWrites: true });
-    expect((await identify.apply([{ resultId: first!.resultId, fields }]))[0]?.ok).toBe(true);
+    const fields = first!.changes.map((c) => c.field);
+    expect(await identify.apply([{ resultId: first!.resultId, fields }])).toEqual([
+      { resultId: first!.resultId, ok: true, deferred: false, error: null, note: FILE_NOT_WRITTEN_OFF },
+    ]);
+    const after = await identify.result(first!.resultId);
+    expect(after.item).toMatchObject({ state: "applied", inLibrary: true, inFile: false });
+    expect(after.existing).toEqual(before.existing);
+    expect(after.item.changes.map((c) => c.current)).toEqual(first!.changes.map((c) => c.current));
+    expect(await identify.undo(first!.resultId)).toMatchObject({ ok: true });
   });
 
   it("keeps a waiting write waiting while off, and refuses its retry", async () => {
@@ -393,19 +398,17 @@ describe("IdentifyPanel with writing to audio files off", () => {
     expect(button("Retry now")?.disabled).toBe(true);
     expect(button("Retry now")?.title).toBe(notice);
     expect(button("Cancel write")?.disabled).toBe(false);
-    expect(await identify.retryWaiting()).toEqual([{ resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF }]);
+    expect(await identify.retryWaiting()).toEqual([{ resultId: first!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF, note: null }]);
     expect((await identify.queue("waiting", 0, 10)).total).toBe(1);
   });
 
-  it("leaves a match auto-apply would write for review, with a warning", async () => {
+  it("auto-applies a match to rbxport's library only", async () => {
     useMock(true, false);
     await identifyFive();
     await render();
-    expect(host.textContent).toContain("0 applied automatically · 3 to review");
-    expect(options()).toHaveLength(3);
-    await click(options().find((row) => row.textContent?.includes("97%")));
-    expect(host.querySelector("section[aria-label=Warnings]")?.textContent).toContain(AUTO_APPLY_LOCKED);
-    expect((await identify.queue("applied", 0, 10)).total).toBe(0);
+    expect(host.textContent).toContain("1 applied automatically · 2 to review");
+    const [applied] = (await identify.queue("applied", 0, 10)).items;
+    expect(applied).toMatchObject({ state: "autoApplied", inLibrary: true, inFile: false });
   });
 
   it("reads the setting again when the window gets focus back", async () => {
@@ -413,13 +416,36 @@ describe("IdentifyPanel with writing to audio files off", () => {
     await identifyFive();
     await render();
     await click(options()[0]);
-    expect(button("Accept")?.disabled).toBe(true);
+    expect(host.querySelector("#identify-writes-off")).not.toBeNull();
     // Saved in the Preferences window, which emits no event.
     await identify.saveSettings({ fileWrites: true });
     act(() => { window.dispatchEvent(new Event("focus")); });
     await flush(200);
     expect(host.querySelector("#identify-writes-off")).toBeNull();
-    expect(button("Accept")?.disabled).toBe(false);
-    expect(button("Apply accepted")?.disabled).toBe(false);
+    expect(host.textContent).toContain("Accepted fields are written to rbxport's library and to the audio file.");
+  });
+});
+
+describe("IdentifyPanel with rbxport's library locked", () => {
+  it("disables every write with the reason, and keeps review changes", async () => {
+    libraryLocked = "Editing is locked by Library Protection. Turn it off in Preferences to edit.";
+    await identifyFive();
+    const apply = vi.spyOn(identify, "apply");
+    await render();
+    expect(byText("[role=note]", libraryLocked)).toBeDefined();
+    expect(button("Apply accepted")?.disabled).toBe(true);
+    expect(button("Apply accepted")?.title).toBe(libraryLocked);
+    await click(options()[0]);
+    expect(button("Accept")?.disabled).toBe(true);
+    expect(button("Accept")?.title).toBe(libraryLocked);
+    expect(button("Reject")?.disabled).toBe(false);
+    await click(button("Accept above"));
+    expect(apply).not.toHaveBeenCalled();
+
+    // A result the job applied cannot be undone while locked either.
+    await click(byText("[role=tab]", "Applied (undoable)"));
+    await click(options()[0]);
+    expect(button("Undo")?.disabled).toBe(true);
+    expect(button("Undo")?.title).toBe(libraryLocked);
   });
 });

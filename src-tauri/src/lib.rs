@@ -425,6 +425,16 @@ pub fn run() {
             // waiting for a file another program held open are tried.
             {
                 let identify = Arc::clone(app.state::<Arc<crate::identify::IdentifyState>>().inner());
+                // Accepted results are written to rbxport's library through
+                // the single edit path, which announces each edit.
+                let library_state = Arc::clone(app.state::<Arc<AppState>>().inner());
+                let edits = app.handle().clone();
+                identify.set_library(Arc::new(crate::identify::library::AppLibrary::new(
+                    library_state,
+                    Box::new(move |generation| {
+                        let _ = tauri::Emitter::emit(&edits, "library:changed", generation);
+                    }),
+                )));
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     let changed = identify.settle_on_start();
@@ -530,6 +540,7 @@ pub fn run() {
             identify::identify_edit,
             identify::identify_apply,
             identify::identify_undo,
+            identify::identify_set_library_protected,
             identify::identify_accept_above,
             identify::identify_retry_waiting,
             identify::identify_cancel_waiting,

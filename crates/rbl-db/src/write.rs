@@ -156,6 +156,8 @@ const WRITABLE_COLUMNS: &[&str] = &[
     // The information panel's Info tab.
     "Title", "Lyricist", "ReleaseYear", "TrackNo", "DiscNo", "DJPlayCount", "KeyID", "BPM", "ImagePath",
     "ArtistID", "OrgArtistID", "ComposerID", "RemixerID", "AlbumID", "GenreID", "LabelID",
+    // Identify's accepted results.
+    "ISRC",
 ];
 
 /// Lookup tables [`intern`] may add a row to. Same reason as above.
@@ -348,6 +350,97 @@ impl TrackEdit {
     pub fn is_empty(&self) -> bool {
         self.before == self.after
     }
+
+    /// The edit as plain data, to be kept outside the library (Identify's
+    /// store keeps one per accepted field, to undo it later).
+    #[must_use]
+    pub fn record(&self) -> TrackEditRecord {
+        TrackEditRecord {
+            content: self.content.clone(),
+            column: self.column.to_owned(),
+            before: RecordedValue::from(&self.before),
+            after: RecordedValue::from(&self.after),
+        }
+    }
+
+    /// An edit from its [`TrackEdit::record`]. Refused for a column the
+    /// writer does not set, so a record cannot name an arbitrary column.
+    pub fn from_record(record: &TrackEditRecord) -> Result<Self> {
+        let column = WRITABLE_COLUMNS
+            .iter()
+            .copied()
+            .find(|c| *c == record.column)
+            .ok_or_else(|| DbError::WriteRefused(format!("{} is not a writable column", record.column)))?;
+        Ok(Self {
+            content: record.content.clone(),
+            column,
+            before: record.before.clone().into(),
+            after: record.after.clone().into(),
+        })
+    }
+}
+
+/// A [`TrackEdit`] as plain data: the track, the column and the exact
+/// values before and after.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackEditRecord {
+    pub content: String,
+    pub column: String,
+    pub before: RecordedValue,
+    pub after: RecordedValue,
+}
+
+/// A column value as it was stored, kept exactly.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum RecordedValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl From<&Value> for RecordedValue {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Integer(n) => Self::Integer(*n),
+            Value::Real(n) => Self::Real(*n),
+            Value::Text(t) => Self::Text(t.clone()),
+            Value::Blob(b) => Self::Blob(b.clone()),
+        }
+    }
+}
+
+impl From<RecordedValue> for Value {
+    fn from(value: RecordedValue) -> Self {
+        match value {
+            RecordedValue::Null => Self::Null,
+            RecordedValue::Integer(n) => Self::Integer(n),
+            RecordedValue::Real(n) => Self::Real(n),
+            RecordedValue::Text(t) => Self::Text(t),
+            RecordedValue::Blob(b) => Self::Blob(b),
+        }
+    }
+}
+
+/// Whether the library still holds what each edit left: the check before
+/// putting edits back, so a value changed since is never overwritten.
+pub fn track_edits_still_hold(library: &Library, edits: &[TrackEdit]) -> Result<bool> {
+    for edit in edits {
+        let now: Option<Value> = library
+            .connection()
+            .query_row(
+                &format!("SELECT `{}` FROM djmdContent WHERE ID = ?1 AND rb_local_deleted = 0", edit.column),
+                params![edit.content],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if now.as_ref() != Some(&edit.after) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl PlaylistDeletion {
@@ -1568,6 +1661,12 @@ impl Writer {
         self.track_edit(content, "Commnt", |writer| writer.set_comment(content, comment))
     }
 
+    /// Sets a track's ISRC; empty clears it.
+    pub fn set_isrc_with_undo(&mut self, content: &str, isrc: &str) -> Result<(Changed, TrackEdit)> {
+        let value = Value::Text(isrc.trim().to_owned());
+        self.track_edit(content, "ISRC", |writer| writer.touch_content(content, "ISRC", &value))
+    }
+
     /// Sets a track's colour, or clears it with `None`.
     pub fn set_color(&mut self, content: &str, color: Option<&str>) -> Result<Changed> {
         self.touch_content(
@@ -1677,6 +1776,21 @@ impl Writer {
 
     pub fn undo_track_edit(&mut self, edit: &TrackEdit) -> Result<Changed> {
         self.touch_content(&edit.content, edit.column, &edit.before)
+    }
+
+    /// Puts `edits` back, last first, but only if the library still holds
+    /// what every one of them left ([`track_edits_still_hold`]): a value
+    /// changed since is refused, and then nothing is put back.
+    pub fn undo_track_edits_if_unchanged(&mut self, edits: &[TrackEdit]) -> Result<()> {
+        if !track_edits_still_hold(&self.library, edits)? {
+            return Err(DbError::WriteRefused(
+                "the track was changed in the library since, so it is left as it is".to_owned(),
+            ));
+        }
+        for edit in edits.iter().rev() {
+            self.undo_track_edit(edit)?;
+        }
+        Ok(())
     }
 
     pub fn redo_track_edit(&mut self, edit: &TrackEdit) -> Result<Changed> {

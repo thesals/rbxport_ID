@@ -13,7 +13,7 @@
  * few hundred lines.
  */
 import type {
-  AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyChangedEvent, IdentifyDecision, IdentifyDetail, IdentifyField, IdentifyFieldChange,
+  AppErrorDto, IdentifyBackend, IdentifyCandidate, IdentifyChangedEvent, IdentifyDecision, IdentifyDetail, IdentifyField, IdentifyFieldChange, IdentifyLibraryRecord,
   IdentifyFilter, IdentifyProgress, IdentifyQueueItem, IdentifyResultEvent, IdentifyReviewAction, IdentifyReviewState,
   IdentifyKeySource, IdentifySettings, IdentifyWriteOutcome,
 } from "./types";
@@ -121,6 +121,10 @@ export const FILE_WRITES_OFF = "Writing to audio files is turned off. Turn on \"
 
 /** The warning a job leaves on a match it would have applied but for the lock. */
 export const AUTO_APPLY_LOCKED = "Not applied automatically: writing to audio files is turned off. It waits for review.";
+export const LIBRARY_PROTECTED = "Library Protection is on, so nothing was written. Turn it off in Preferences to apply.";
+export const FILE_NOT_WRITTEN_OFF = "Written to rbxport's library. Not written to the file: writing tags to audio files is turned off.";
+/** The fields rbxport's library keeps; the rest go to the file only. */
+const KEPT: ReadonlySet<IdentifyField> = new Set(["title", "artist", "album", "label", "genre", "year", "subGenre", "isrc", "artwork"]);
 
 /** What a write to a file in use answers: not a failure, a write for later. */
 export const DEFERRED_MESSAGE = "The file is open in another program. It will be written when the file is free.";
@@ -160,6 +164,11 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
   const changedListeners = new Set<(event: IdentifyChangedEvent) => void>();
   /** The values an apply replaced, by result, for its undo. */
   const snapshots = new Map<number, IdentifyFieldChange[]>();
+  /** What each applied result replaced in rbxport's library, for undo. */
+  const librarySnapshots = new Map<number, IdentifyLibraryRecord>();
+  // Library Protection, as the window says (off by default, as the
+  // preferences are; the window passes it on as soon as it opens).
+  let libraryProtected = false;
   /** Every result, current or replaced, by id. */
   const results = new Map<number, IdentifyDetail>();
   /** Each file's current result. */
@@ -231,7 +240,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       item: {
         resultId: id, trackId, path, state, decision, score: decision === "unidentified" ? null : score,
         artist, title, changes, updatedUnix: Math.floor(Date.now() / 1000), undoable: false,
-        source: candidates[0]?.source ?? null, waiting: null,
+        inLibrary: false, inFile: false, source: candidates[0]?.source ?? null, waiting: null,
       },
       existing: {
         artist, title, album: "", label: overwrites ? "Old Label" : "", year: null, isrc: "", genre: "",
@@ -244,11 +253,11 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
         : null,
       warnings: decision === "unidentified" ? ["AcoustID: no match"] : [],
       writeInProgress: false,
-      // As imported from rekordbox: its record of a reviewed track lags the
-      // file, with an older label and no comment.
-      rekordbox: {
-        trackId, importedAt: new Date().toISOString(), title, artist, album: "",
-        label: overwrites ? "Older Label" : "", genre: "", year: "", comment: "", isrc: "",
+      // rbxport's library: its record of a reviewed track lags the file,
+      // with an older label and no comment.
+      library: {
+        title, artist, album: "", label: overwrites ? "Older Label" : "", genre: "", year: "", comment: "", isrc: "",
+        artwork: false,
       },
     });
     current.set(path, id);
@@ -284,8 +293,8 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
         const fills = slot === "autoApply";
         // The decision as `decide` makes it: auto-apply only when switched on.
         const qualifies = fills && settings.autoApply && 0.97 >= settings.autoApplyThreshold;
-        // A match that qualifies is still only reviewed while file writes are off.
-        const locked = qualifies && !settings.fileWrites;
+        // A match that qualifies is only reviewed while the library is protected.
+        const locked = qualifies && libraryProtected;
         const outcome: Outcome = fills && (!qualifies || locked) ? "review" : slot;
         let counted: "identified" | "review" | "unidentified" | "failed" =
           outcome === "autoApply" ? "identified" : outcome === "failed" ? "failed" : outcome;
@@ -307,7 +316,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
           result.error = "identify store: this track has a write waiting for the file to be closed; cancel it before identifying again";
         } else {
           const id = save(trackId, path, artist, title, outcome, fills);
-          if (locked) results.get(id)?.warnings.push(AUTO_APPLY_LOCKED);
+          if (locked) results.get(id)?.warnings.push(`Not applied automatically: ${LIBRARY_PROTECTED}`);
           result.resultId = id;
           result.score = results.get(id)?.item.score ?? null;
           if (outcome === "autoApply") {
@@ -315,7 +324,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
             const detail = results.get(id);
             const fields = detail ? detail.item.changes.map((c) => c.field) : [];
             const written: IdentifyWriteOutcome = options.refuseAutoWrite
-              ? { resultId: id, ok: false, error: "The file is open in another program.", deferred: false }
+              ? { resultId: id, ok: false, error: "The file is open in another program.", deferred: false, note: null }
               : write(id, fields, true);
             // A deferred write stays accepted, waiting for the file; it is not written yet.
             if (written.deferred) counted = "review";
@@ -336,16 +345,16 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
   };
 
   /**
-   * Writes a result's fields as the store does, snapshotting what they
-   * replace. `auto` is the job's own write of an auto-apply decision, which
-   * the store records as autoApplied; a person's is applied. A file in use
-   * defers the write: the result is accepted and waits, with its fields,
-   * for a retry.
+   * Writes a result's fields as the backend does: rbxport's library first,
+   * then the file while file writes are on, snapshotting what each replaces.
+   * `auto` is the job's own write of an auto-apply decision, which the store
+   * records as autoApplied; a person's is applied. A file in use defers the
+   * file write: the result is accepted and waits, with its fields, for a
+   * retry, the library edit standing.
    */
-  function write(resultId: number, fields: readonly IdentifyField[], auto: boolean): IdentifyWriteOutcome {
+  function write(resultId: number, fields: readonly IdentifyField[], auto: boolean, retrying = false): IdentifyWriteOutcome {
     const detail = changeable(resultId);
-    const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error, deferred: false });
-    if (!settings.fileWrites) return refuse(FILE_WRITES_OFF);
+    const refuse = (error: string): IdentifyWriteOutcome => ({ resultId, ok: false, error, deferred: false, note: null });
     if (!detail) return refuse("That identification result is no longer in the store.");
     if (detail.item.state !== "pending" && detail.item.state !== "accepted") {
       return refuse(`A ${detail.item.state} result cannot be applied.`);
@@ -353,6 +362,28 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
     if (fields.length === 0) return refuse("Choose at least one field to write.");
     const picked = detail.item.changes.filter((c) => fields.includes(c.field));
     if (picked.length !== new Set(fields).size) return refuse("That change could not be made to this result.");
+    const kept = picked.filter((c) => KEPT.has(c.field));
+    if (!retrying && kept.length > 0) {
+      if (libraryProtected) return refuse(LIBRARY_PROTECTED);
+      if (detail.library) {
+        librarySnapshots.set(resultId, { ...detail.library });
+        for (const change of kept) {
+          if (change.field === "artwork") detail.library.artwork = true;
+          else if (change.field === "subGenre") detail.library.comment = change.proposed;
+          else (detail.library as unknown as Record<string, string>)[change.field] = change.proposed;
+        }
+        detail.item.inLibrary = true;
+      }
+    } else if (!retrying && !settings.fileWrites) {
+      return refuse(FILE_WRITES_OFF);
+    }
+    if (!settings.fileWrites) {
+      detail.item.state = auto ? "autoApplied" : "applied";
+      detail.item.undoable = true;
+      detail.item.inFile = false;
+      touch(detail);
+      return { resultId, ok: true, error: null, deferred: false, note: FILE_NOT_WRITTEN_OFF };
+    }
     if (busy(detail.item.path)) {
       detail.item.state = "accepted";
       detail.item.waiting = {
@@ -363,7 +394,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       if (auto) waitingAuto.add(resultId);
       else waitingAuto.delete(resultId);
       touch(detail);
-      return { resultId, ok: false, error: DEFERRED_MESSAGE, deferred: true };
+      return { resultId, ok: false, error: DEFERRED_MESSAGE, deferred: true, note: null };
     }
     detail.item.waiting = null;
     waitingAuto.delete(resultId);
@@ -379,8 +410,9 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
     }
     detail.item.state = auto ? "autoApplied" : "applied";
     detail.item.undoable = true;
+    detail.item.inFile = true;
     touch(detail);
-    return { resultId, ok: true, error: null, deferred: false };
+    return { resultId, ok: true, error: null, deferred: false, note: null };
   }
 
   /**
@@ -394,7 +426,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
     if (!settings.fileWrites) {
       for (const id of current.values()) {
         if (!skip.has(id) && results.get(id)?.item.waiting) {
-          outcomes.push({ resultId: id, ok: false, error: FILE_WRITES_OFF, deferred: false });
+          outcomes.push({ resultId: id, ok: false, error: FILE_WRITES_OFF, deferred: false, note: null });
         }
       }
       return outcomes;
@@ -404,7 +436,7 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       if (skip.has(id)) continue;
       const waiting = results.get(id)?.item.waiting;
       if (!waiting) continue;
-      const outcome = write(id, waiting.fields, waitingAuto.has(id));
+      const outcome = write(id, waiting.fields, waitingAuto.has(id), true);
       outcomes.push(outcome);
       if (outcome.deferred) continue;
       // Written, or refused for good: either way it waits no longer.
@@ -526,12 +558,20 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       return Promise.resolve(outcomes);
     },
     undo: (resultId) => {
-      if (!settings.fileWrites) return Promise.resolve({ resultId, ok: false, error: FILE_WRITES_OFF, deferred: false });
       const detail = changeable(resultId);
-      const snapshot = snapshots.get(resultId);
-      if (!detail || !detail.item.undoable || !snapshot) {
-        return Promise.resolve({ resultId, ok: false, error: "There is nothing to undo for this result.", deferred: false });
+      if (!detail || !detail.item.undoable) {
+        return Promise.resolve({ resultId, ok: false, error: "There is nothing to undo for this result.", deferred: false, note: null });
       }
+      if (detail.item.inLibrary && libraryProtected) {
+        return Promise.resolve({ resultId, ok: false, error: LIBRARY_PROTECTED, deferred: false, note: null });
+      }
+      if (detail.item.inFile && !settings.fileWrites) {
+        return Promise.resolve({ resultId, ok: false, error: FILE_WRITES_OFF, deferred: false, note: null });
+      }
+      const before = librarySnapshots.get(resultId);
+      if (detail.item.inLibrary && before) detail.library = before;
+      librarySnapshots.delete(resultId);
+      const snapshot = detail.item.inFile ? (snapshots.get(resultId) ?? []) : [];
       for (const original of snapshot) {
         const now = detail.item.changes.find((c) => c.field === original.field);
         if (!now || now.current === original.current) continue;
@@ -548,11 +588,17 @@ export function createMockIdentify(options: MockIdentifyOptions = {}): MockIdent
       snapshots.delete(resultId);
       detail.item.state = "undone";
       detail.item.undoable = false;
+      detail.item.inLibrary = false;
+      detail.item.inFile = false;
       touch(detail);
       tellChanged([resultId]);
-      return Promise.resolve({ resultId, ok: true, error: null, deferred: false });
+      return Promise.resolve({ resultId, ok: true, error: null, deferred: false, note: null });
     },
     retryWaiting: () => Promise.resolve(retryAll()),
+    setLibraryProtected: (protect) => {
+      libraryProtected = protect;
+      return Promise.resolve();
+    },
     cancelWaiting: (resultId) => {
       const detail = changeable(resultId);
       if (!detail) return fail("notFound", "That identification result is no longer in the store.");

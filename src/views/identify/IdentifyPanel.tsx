@@ -11,16 +11,16 @@
  * or above a threshold accepted; Apply accepted then fills the empty fields
  * of those results, after saying what it will do (see `bulkPlan`).
  *
- * One way: results are written to the audio files' tags only, never to the
- * rekordbox library, so a read-only library does not stop them. rekordbox
- * shows them after its own Reload Tag.
- *
- * While "Write tags to audio files" is off (the default), the backend
- * refuses every write, so Accept, Apply accepted, Undo and Retry now are
- * disabled with the reason beside them; review changes, which touch only
- * the identify store, stay. Saving a setting emits no event and the
- * Preferences may be a window of their own, so the setting is read when the
- * panel opens and again whenever this window gets focus back.
+ * Accepted results are written to rbxport's own library, and to the audio
+ * files' tags while "Write tags to audio files" is on (it is off by
+ * default: then the files are left as they are). rekordbox's library is
+ * never written. While rbxport's library is locked (`libraryLocked`:
+ * Library Protection, or a read-only library) Accept, Apply accepted and
+ * Undo are disabled with the reason beside them; Retry now needs file
+ * writes on. Review changes, which touch only the identify store, stay.
+ * Saving a setting emits no event and the Preferences may be a window of
+ * their own, so the setting is read when the panel opens and again
+ * whenever this window gets focus back.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
@@ -33,8 +33,8 @@ import type { IdentifyJob } from "@/store/useIdentifyJob";
 import { useElementSize } from "@/store/useElementSize";
 import { IdentifyDetailPane } from "./IdentifyDetailPane";
 import {
-  FILTERS, bulkPlan, decisionLabel, filterLabel, formatScore, reloadHint, sourceLabel, sourceShort, stateLabel, trackName,
-  waitingLabel, waitingNotice, WRITES_OFF_NOTICE_ID, type BulkPlan, type Translate,
+  FILTERS, bulkPlan, decisionLabel, filterLabel, formatScore, sourceLabel, sourceShort, stateLabel, trackName,
+  waitingLabel, waitingNotice, writeTargetHint, WRITES_OFF_NOTICE_ID, type BulkPlan, type Translate,
 } from "./identifyText";
 import { useIdentifyQueue } from "./useIdentifyQueue";
 import styles from "./IdentifyPanel.module.css";
@@ -49,6 +49,8 @@ const APPLY_BATCH = 32;
 export interface IdentifyPanelProps {
   job: IdentifyJob;
   onClose: () => void;
+  /** Why rbxport's library cannot be written now; null when it can. */
+  libraryLocked?: string | null;
 }
 
 function jobSummary(job: IdentifyJob, t: Translate): string {
@@ -62,7 +64,7 @@ function jobSummary(job: IdentifyJob, t: Translate): string {
   }
 }
 
-export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
+export function IdentifyPanel({ job, onClose, libraryLocked = null }: IdentifyPanelProps) {
   const t = useTranslation();
   const [filter, setFilter] = useState<IdentifyFilter>("needsReview");
   const queue = useIdentifyQueue(filter);
@@ -78,7 +80,7 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
   const [fileWrites, setFileWrites] = useState<boolean | null>(null);
   // Unknown counts as off: no write is offered before the lock is known to be open.
   const writesOff = fileWrites !== true;
-  const writesOffReason = t("Writing to audio files is off. Results are saved for review only.");
+  const writesOffReason = t("Writing to audio files is off. Accepted results are written to rbxport's library only.");
   const window_ = visibleWindow(scrollTop, listSize.height || 480, ROW_H, queue.total ?? 0);
   const { show } = queue;
 
@@ -101,8 +103,8 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
     };
   }, []);
 
-  // A plan made while writes were on is not offered once they are off.
-  useEffect(() => { if (writesOff) setPlan(null); }, [writesOff]);
+  // A plan made while the library could be written is not offered once it is locked.
+  useEffect(() => { if (libraryLocked !== null) setPlan(null); }, [libraryLocked]);
 
   // A new filter is a new list, read from the top.
   useEffect(() => {
@@ -235,7 +237,6 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
       else if (failed > 0) parts.push(t("{count} applied, {failed} failed: {reason}", { count: written, failed, reason: firstError ?? "" }));
       else if (written > 0 || deferred === 0) parts.push(t("{count} applied.", { count: written }));
       if (deferred > 0) parts.push(waitingNotice(deferred, t));
-      if (written > 0) parts.push(reloadHint(t));
       const text = parts.join(" ");
       setBulkNote({ text, failed: failed > 0 });
     } catch (e) {
@@ -362,13 +363,15 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
           <button type="button" className={styles.small} disabled={bulkBusy} onClick={() => void acceptAbove()}>
             {t("Accept above")}
           </button>
-          <button type="button" className={styles.small} disabled={bulkBusy || writesOff}
-            title={fileWrites === false ? writesOffReason : undefined}
-            aria-describedby={fileWrites === false ? WRITES_OFF_NOTICE_ID : undefined}
+          <button type="button" className={styles.small} disabled={bulkBusy || libraryLocked !== null}
+            title={libraryLocked ?? undefined}
             onClick={() => void planAccepted()}>
             {t("Apply accepted")}
           </button>
         </div>
+        {libraryLocked !== null ? (
+          <p className={styles.locked} role="note">{libraryLocked}</p>
+        ) : null}
         {fileWrites === false ? (
           <p id={WRITES_OFF_NOTICE_ID} className={styles.locked} role="note">{writesOffReason}</p>
         ) : null}
@@ -378,9 +381,9 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
               {t("Fill {fields} empty fields in {results} results. {left} results with overwrites or a sub-genre are left for individual review.", {
                 fields: plan.fields, results: plan.items.length, left: plan.leftForReview,
               })}
-              {" "}{t("Only the tags in the audio files are written; the rekordbox library is not changed.")}
+              {" "}{writeTargetHint(!writesOff, t)}
             </p>
-            <button type="button" className={styles.small} disabled={bulkBusy || writesOff || plan.items.length === 0}
+            <button type="button" className={styles.small} disabled={bulkBusy || libraryLocked !== null || plan.items.length === 0}
               onClick={() => void applyPlan(plan)}>
               {t("Apply")}
             </button>
@@ -409,7 +412,8 @@ export function IdentifyPanel({ job, onClose }: IdentifyPanelProps) {
           <div className={styles.detailColumn}>
             {selected ? (
               <IdentifyDetailPane resultId={selected.id} onChanged={queue.refresh}
-                writesOff={writesOff} writesOffReason={fileWrites === false ? writesOffReason : null} />
+                writesOff={writesOff} writesOffReason={fileWrites === false ? writesOffReason : null}
+                libraryLocked={libraryLocked} />
             ) : (
               <p className={styles.detailEmpty}>{t("Choose a result to review it.")}</p>
             )}

@@ -1860,8 +1860,12 @@ export interface IdentifyQueueItem {
   title: string;
   changes: IdentifyFieldChange[];
   updatedUnix: number;
-  /** Applied, with the original tags snapshotted, so `identify.undo` can restore them. */
+  /** Applied, with what it replaced kept, so `identify.undo` can put it back. */
   undoable: boolean;
+  /** Applied: rbxport's library holds the result's fields. */
+  inLibrary: boolean;
+  /** Applied: the audio file holds them. */
+  inFile: boolean;
   /** Where the top candidate came from; null with no candidate. */
   source: IdentifyCandidate["source"] | null;
   /** A write waiting for the file to be free; null when none is. */
@@ -1906,14 +1910,10 @@ export interface IdentifyCandidate {
 }
 
 /**
- * A track's rekordbox record as the identify store imported it when the
- * track was identified: read from rekordbox, never written back. An empty
- * string is a field rekordbox has no value for.
+ * What rbxport's library holds for a track now, in the fields Identify
+ * writes. An empty string is a field it has no value for.
  */
-export interface IdentifyRekordboxRecord {
-  trackId: string;
-  /** When it was read, RFC 3339. */
-  importedAt: string;
+export interface IdentifyLibraryRecord {
   title: string;
   artist: string;
   album: string;
@@ -1922,6 +1922,7 @@ export interface IdentifyRekordboxRecord {
   year: string;
   comment: string;
   isrc: string;
+  artwork: boolean;
 }
 
 export interface IdentifyDetail {
@@ -1955,8 +1956,8 @@ export interface IdentifyDetail {
   warnings: string[];
   /** A write to the file is open; review changes are refused until it ends. */
   writeInProgress: boolean;
-  /** The track's rekordbox record as imported at identify time; null when none was read. */
-  rekordbox: IdentifyRekordboxRecord | null;
+  /** What rbxport's library holds for the track now; null when the result is tied to no library track. */
+  library: IdentifyLibraryRecord | null;
 }
 
 export type IdentifyReviewAction = "accept" | "reject" | "pending";
@@ -1982,6 +1983,8 @@ export interface IdentifyWriteOutcome {
   ok: boolean;
   error: string | null;
   deferred: boolean;
+  /** Written to rbxport's library but not to the file (`ok` is true): why. */
+  note: string | null;
 }
 
 /** `identify:changed`: results whose state or values changed. */
@@ -2010,13 +2013,16 @@ export interface IdentifyBackend {
   /** Replaces proposed values; only fields the proposal lists, never artwork. */
   edit(resultId: number, changes: readonly IdentifyFieldEdit[]): Promise<IdentifyQueueItem>;
   /**
-   * Writes the ticked fields of each result to its file's tags, snapshotting
-   * the originals first. The rekordbox library is never written: rekordbox
-   * shows the change after its own Reload Tag. Each item answers for itself.
+   * Writes the ticked fields of each result to rbxport's library and, while
+   * "Write tags to audio files" is on, to its file's tags, keeping what each
+   * replaced. rekordbox's library is never written. Each item answers for
+   * itself; `note` says when the file was not written.
    */
   apply(items: readonly IdentifyApplyItem[]): Promise<IdentifyWriteOutcome[]>;
-  /** Puts an applied result's original tags back in the file; the library is not touched. */
+  /** Puts back what an applied result replaced, in rbxport's library and in the file; refused if either changed since. */
   undo(resultId: number): Promise<IdentifyWriteOutcome>;
+  /** Library Protection, from the preferences: while it is on, nothing is written (auto-apply waits for review). */
+  setLibraryProtected(protect: boolean): Promise<void>;
   /** Marks every pending result scoring at least `threshold` accepted; resolves to how many. */
   acceptAbove(threshold: number): Promise<number>;
   /** Tries every waiting write now; one outcome each, `deferred` again for a file still in use. */

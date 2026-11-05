@@ -646,12 +646,12 @@ mod tests {
         assert_eq!(all.total, 3);
         for item in &all.items {
             let detail = state.detail(item.result_id).unwrap();
-            let record = detail.rekordbox.expect("imported with the result");
+            let record = state.imported_record(detail.item.result_id).expect("imported with the result");
             assert_eq!(record.track_id, item.track_id);
             assert!(["review", "auto", "unknown"].iter().any(|p| record.title.starts_with(p)), "{}", record.title);
         }
         let first = all.items.iter().find(|i| i.track_id == rbl_db::fixture::track_id(0)).unwrap();
-        assert_eq!(state.detail(first.result_id).unwrap().rekordbox.unwrap().isrc, "GBAAA1400001");
+        assert_eq!(state.imported_record(first.result_id).unwrap().isrc, "GBAAA1400001");
         // The auto-apply decision was never written: it waits in review.
         let auto = all.items.iter().find(|i| i.track_id == rbl_db::fixture::track_id(1)).unwrap();
         assert_eq!((auto.state.as_str(), auto.decision.as_str()), ("pending", "review"));

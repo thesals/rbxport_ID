@@ -1602,10 +1602,17 @@ function AppBody() {
 
   // Track identification (fork-only; docs/identify/IDENTIFY_SPEC.md). The
   // job runs in the backend; the review queue is drawn over the window and
-  // loaded the first time it opens. It is one way: it reads the rekordbox
-  // library into its own store and writes only the audio files' tags, never
-  // the library, so all of it is offered while the library is read-only.
+  // loaded the first time it opens. Accepted results are written to
+  // rbxport's library (and to the files when that is on), so a read-only or
+  // protected library locks them as it locks any other edit.
   const identifyJob = useIdentifyJob();
+  // Identify writes rbxport's library, so it keeps to Library Protection
+  // too, auto-apply included: the backend is told whenever it changes.
+  useEffect(() => {
+    void getBackend()
+      .then((backend) => backend.identify.setLibraryProtected(advancedPrefs.protectLibrary))
+      .catch((error: unknown) => console.warn("identify: Library Protection was not passed on", error));
+  }, [advancedPrefs.protectLibrary]);
   const [identifyOpen, setIdentifyOpen] = useState(false);
   const openIdentify = useCallback(() => setIdentifyOpen(true), []);
   const identifyTracks = useEventCallback((ids: readonly string[]) => {
@@ -2600,7 +2607,8 @@ function AppBody() {
       ) : null}
       {reportOpen ? <ReportBug onClose={() => setReportOpen(false)} /> : null}
       {identifyOpen ? (
-        <IdentifyPanel job={identifyJob} onClose={() => setIdentifyOpen(false)} />
+        <IdentifyPanel job={identifyJob} onClose={() => setIdentifyOpen(false)}
+          libraryLocked={readOnly ? refusal(advancedPrefs.protectLibrary) : null} />
       ) : null}
       {smartEditor ? (
         <SmartPlaylistEditor

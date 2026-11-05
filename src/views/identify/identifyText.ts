@@ -5,7 +5,7 @@
  */
 import type {
   IdentifyCandidate, IdentifyDecision, IdentifyField, IdentifyFieldChange, IdentifyFilter, IdentifyQueueItem,
-  IdentifyRekordboxRecord, IdentifyReviewState,
+  IdentifyLibraryRecord, IdentifyReviewState,
 } from "@/ipc/types";
 import type { useTranslation } from "@/i18n";
 
@@ -71,11 +71,11 @@ export function sourceShort(source: IdentifyCandidate["source"], t: Translate): 
 }
 
 /**
- * What rekordbox's imported record holds for a field the diff shows, or
- * null for a field rekordbox does not keep. The sub-genre is appended to the
- * comment, so its rekordbox value is the comment.
+ * What rbxport's library holds for a field the diff shows, or null for a
+ * field it does not keep (those go to the file only). The sub-genre is
+ * appended to the comment, so its library value is the comment.
  */
-export function rekordboxValue(field: IdentifyField, record: IdentifyRekordboxRecord): string | null {
+export function libraryValue(field: IdentifyField, record: IdentifyLibraryRecord): string | null {
   switch (field) {
     case "title": return record.title;
     case "artist": return record.artist;
@@ -89,12 +89,11 @@ export function rekordboxValue(field: IdentifyField, record: IdentifyRekordboxRe
   }
 }
 
-/**
- * How to see a written change in rekordbox, which reads a file's tags again
- * only when asked: its own Reload Tag, in the words its menu uses.
- */
-export function reloadHint(t: Translate): string {
-  return t("To see the changes in rekordbox, select the tracks there and choose {reloadTag}.", { reloadTag: t("Reload Tag") });
+/** Where an accepted result is written, as the file-writes setting has it. */
+export function writeTargetHint(fileWrites: boolean, t: Translate): string {
+  return fileWrites
+    ? t("Accepted fields are written to rbxport's library and to the audio file.")
+    : t("Accepted fields are written to rbxport's library. Writing to audio files is off, so the files are left as they are.");
 }
 
 export const FILTERS: readonly IdentifyFilter[] = ["needsReview", "unidentified", "waiting", "applied", "all"];

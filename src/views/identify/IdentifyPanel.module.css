@@ -160,7 +160,7 @@
 .rowMeta { display: flex; align-items: center; gap: 8px; color: var(--c-text-dim); font-size: 0.85em; }
 .rowScore { min-width: 3.2em; font-variant-numeric: tabular-nums; }
 .rowSource { white-space: nowrap; }
-.rekordbox { display: block; margin-top: 2px; color: var(--c-text-dim); font-size: 0.85em; }
+.library { display: block; margin-top: 2px; color: var(--c-text-dim); font-size: 0.85em; }
 
 .badge {
   padding: 0 5px;

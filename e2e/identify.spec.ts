@@ -61,15 +61,15 @@ test("identify a selection, review a result, apply ticked fields and undo", asyn
   const detail = panel.getByRole("region", { name: "Identification result" });
   await expect(detail.getByRole("row").filter({ hasText: "Sub-genre (added to Comment)" })).toContainText("Purchased at Beatport.com; Tech House");
   await expect(detail.getByRole("checkbox", { name: "Write Track Title" })).toBeChecked();
-  // rekordbox's imported record, where it differs from the file.
-  await expect(detail).toContainText("rekordbox: Older Label");
+  // rbxport's own library, where it differs from the file.
+  await expect(detail).toContainText("In library: Older Label");
   await expect(review).toContainText("Fingerprint");
   await detail.getByRole("checkbox", { name: "Write Label" }).uncheck();
 
   await detail.getByRole("button", { name: "Accept", exact: true }).click();
   await expect(detail.locator("header")).toContainText("Applied");
   await expect(detail.getByRole("button", { name: "Accept", exact: true })).toBeDisabled();
-  await expect(detail).toContainText("select the tracks there and choose Reload Tag");
+  await expect(detail).not.toContainText("Reload Tag");
   await expect(list.getByRole("option")).toHaveCount(2);
 
   await panel.getByRole("tab", { name: "Applied (undoable)" }).click();
@@ -237,13 +237,12 @@ test("with auto-apply on, the job writes a qualifying match and files it under A
   await expect(written.first()).toContainText("Applied automatically");
   await written.first().click();
   const detail = panel.getByRole("region", { name: "Identification result" });
-  await expect(detail).toContainText("choose Reload Tag");
   await detail.getByRole("button", { name: "Undo", exact: true }).click();
   await expect(detail.locator("header")).toContainText("Undone");
   await expect(written).toHaveCount(0);
 });
 
-test("with writing to audio files off, nothing is written until it is turned on and confirmed", async ({ page }) => {
+test("with writing to audio files off, Accept writes rbxport's library only until it is turned on and confirmed", async ({ page }) => {
   await page.goto("/?writable=1");
   await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
   const rows = page.getByRole("row").filter({ has: page.getByRole("gridcell") });
@@ -254,17 +253,18 @@ test("with writing to audio files off, nothing is written until it is turned on 
   const panel = page.getByRole("dialog", { name: "Identify Tracks" });
   await expect(panel.getByRole("status").first()).toHaveText("Identified 5 of 5", { timeout: 10_000 });
 
-  const notice = "Writing to audio files is off. Results are saved for review only.";
+  const notice = "Writing to audio files is off. Accepted results are written to rbxport's library only.";
   await expect(panel.getByRole("note").filter({ hasText: notice })).toBeVisible();
-  await expect(panel.getByRole("button", { name: "Apply accepted" })).toBeDisabled();
+  await expect(panel.getByRole("button", { name: "Apply accepted" })).toBeEnabled();
   const list = panel.getByRole("listbox");
   await list.getByRole("option").filter({ hasText: "81%" }).first().click();
   const detail = panel.getByRole("region", { name: "Identification result" });
   const accept = detail.getByRole("button", { name: "Accept", exact: true });
-  await expect(accept).toBeDisabled();
-  await expect(accept).toHaveAttribute("title", notice);
-  // Review changes touch only the identify store.
   await expect(detail.getByRole("button", { name: "Reject" })).toBeEnabled();
+  await expect(detail).toContainText("Writing to audio files is off, so the files are left as they are.");
+  await accept.click();
+  await expect(detail.locator("header")).toContainText("Applied");
+  await expect(detail.getByRole("note").filter({ hasText: "Written to rbxport's library only; the audio file was not changed." })).toBeVisible();
 
   // Turning it on asks first; Cancel leaves it off.
   await panel.getByRole("button", { name: "Close" }).click();
@@ -293,6 +293,8 @@ test("with writing to audio files off, nothing is written until it is turned on 
   await expect(panel.getByRole("note").filter({ hasText: notice })).toHaveCount(0);
   await list.getByRole("option").filter({ hasText: "81%" }).first().click();
   await expect(accept).toBeEnabled();
+  await expect(detail).toContainText("Accepted fields are written to rbxport's library and to the audio file.");
   await accept.click();
   await expect(detail.locator("header")).toContainText("Applied");
+  await expect(detail).not.toContainText("Written to rbxport's library only");
 });

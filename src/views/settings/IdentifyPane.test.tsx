@@ -173,8 +173,8 @@ describe("IdentifyPane", () => {
     expect(host.querySelector("section section")).toBe(writes);
     const toggle = writes.querySelector<HTMLInputElement>('input[role="switch"]')!;
     expect(toggle.checked).toBe(false);
-    expect(writes.textContent).toContain("identification only reads the audio files and saves proposals for review");
-    expect(writes.textContent).toContain("not by Accept, Undo or auto-apply");
+    expect(writes.textContent).toContain("identification only reads the audio files. Accept, Apply accepted and auto-apply write rbxport's library only");
+    expect(writes.textContent).toContain("nothing is written to the files");
     // Auto-apply is locked while it is off.
     const auto = card("Auto-apply");
     expect(auto.querySelector<HTMLInputElement>('input[role="switch"]')?.disabled).toBe(true);

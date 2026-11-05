@@ -573,6 +573,7 @@ async function realBackend(): Promise<Backend> {
         items: items.map((item) => ({ resultId: item.resultId, fields: [...item.fields] })),
       }),
       undo: (resultId) => invoke<IdentifyWriteOutcome>("identify_undo", { resultId }),
+      setLibraryProtected: (protect) => invoke<void>("identify_set_library_protected", { protected: protect }),
       acceptAbove: (threshold) => invoke<number>("identify_accept_above", { threshold }),
       retryWaiting: () => invoke<IdentifyWriteOutcome[]>("identify_retry_waiting"),
       cancelWaiting: (resultId) => invoke<IdentifyQueueItem>("identify_cancel_waiting", { resultId }),

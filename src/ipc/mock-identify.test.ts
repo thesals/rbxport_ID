@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createMockBackend } from "./backend-mock";
 import {
-  AUTO_APPLY_LOCKED, FILE_WRITES_OFF, IDENTIFY_MAX_ROWS, WAITING_READ_ONLY, createMockIdentify,
+  FILE_NOT_WRITTEN_OFF, FILE_WRITES_OFF, IDENTIFY_MAX_ROWS, LIBRARY_PROTECTED, WAITING_READ_ONLY, createMockIdentify,
 } from "./mock-identify";
 import type { IdentifyBackend, IdentifyProgress, IdentifyResultEvent } from "./types";
 
@@ -217,7 +217,7 @@ describe("mock identify", () => {
     // Still in use: deferred again, nothing written.
     expect(await identify.retryWaiting()).toEqual([expect.objectContaining({ resultId: first!.resultId, deferred: true })]);
     identify.setFileInUse(false, first!.path);
-    expect(await identify.retryWaiting()).toEqual([{ resultId: first!.resultId, ok: true, error: null, deferred: false }]);
+    expect(await identify.retryWaiting()).toEqual([{ resultId: first!.resultId, ok: true, error: null, deferred: false, note: null }]);
     expect(changed.at(-1)).toEqual([first!.resultId]);
     const written = await identify.result(first!.resultId);
     expect(written.item).toMatchObject({ state: "applied", undoable: true, waiting: null });
@@ -338,25 +338,37 @@ describe("mock identify", () => {
     expect(await identify.saveSettings({ autoApply: true, autoApplyThreshold: 0.95 })).toMatchObject({ autoApply: true, autoApplyThreshold: 0.95 });
   });
 
-  it("writes nothing to an audio file while file writes are off, as by default", async () => {
+  it("writes rbxport's library but no audio file while file writes are off, as by default", async () => {
     const identify = createMockIdentify({ tickMs: TICK, settings: { autoApply: true } });
     expect((await identify.settings()).fileWrites).toBe(false);
     const { events } = record(identify);
     await identify.start(["1", "2", "3", "4", "5"]);
     await finish(5);
-    // The match auto-apply would write stays for review, with a warning.
+    // The match auto-apply writes reaches the library only.
     const final = events.at(-1)?.[1] as IdentifyProgress;
-    expect(final).toMatchObject({ identified: 0, review: 3 });
+    expect(final).toMatchObject({ identified: 1, review: 2 });
     const third = (await identify.queue("all", 0, 10)).items.find((item) => item.trackId === "3");
-    expect(third).toMatchObject({ state: "pending", decision: "review", undoable: false });
-    expect((await identify.result(third!.resultId)).warnings).toContain(AUTO_APPLY_LOCKED);
+    expect(third).toMatchObject({ state: "autoApplied", undoable: true, inLibrary: true, inFile: false });
+    expect(await identify.undo(third!.resultId)).toMatchObject({ ok: true });
 
-    const refusal = { resultId: third!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF };
-    expect(await identify.apply([{ resultId: third!.resultId, fields: ["label"] }])).toEqual([refusal]);
-    expect(await identify.undo(third!.resultId)).toEqual(refusal);
+    // A field the library keeps: written there, with a note that the file was not.
+    await identify.setState(third!.resultId, "pending");
+    const [labelled] = await identify.apply([{ resultId: third!.resultId, fields: ["label"] }]);
+    expect(labelled).toMatchObject({ ok: true, note: FILE_NOT_WRITTEN_OFF });
+    expect((await identify.result(third!.resultId)).library?.label).toBe("Mock Records");
+    expect((await identify.result(third!.resultId)).existing.label, "the file is not changed").toBe("");
+    expect(await identify.undo(third!.resultId)).toMatchObject({ ok: true });
+
+    // A field only the file keeps is refused while file writes are off.
+    await identify.setState(third!.resultId, "pending");
+    const refusal = { resultId: third!.resultId, ok: false, deferred: false, error: FILE_WRITES_OFF, note: null };
+    expect(await identify.apply([{ resultId: third!.resultId, fields: ["catalogNumber"] }])).toEqual([refusal]);
     expect((await identify.result(third!.resultId)).item.state).toBe("pending");
-    // Review changes write only the store, so they still work.
-    expect((await identify.setState(third!.resultId, "accept")).state).toBe("accepted");
+
+    // Library Protection refuses everything, the library included.
+    await identify.setLibraryProtected(true);
+    expect(await identify.apply([{ resultId: third!.resultId, fields: ["label"] }])).toEqual([{ ...refusal, error: LIBRARY_PROTECTED }]);
+    await identify.setLibraryProtected(false);
 
     // A write left waiting is refused on retry, and keeps waiting for writes to be turned on.
     await identify.saveSettings({ fileWrites: true });
@@ -367,7 +379,7 @@ describe("mock identify", () => {
     expect(await identify.retryWaiting()).toEqual([refusal]);
     expect((await identify.queue("waiting", 0, 10)).total).toBe(1);
     await identify.saveSettings({ fileWrites: true });
-    expect(await identify.retryWaiting()).toEqual([{ resultId: third!.resultId, ok: true, error: null, deferred: false }]);
-    expect((await identify.result(third!.resultId)).item.state).toBe("applied");
+    expect(await identify.retryWaiting()).toEqual([{ resultId: third!.resultId, ok: true, error: null, deferred: false, note: null }]);
+    expect((await identify.result(third!.resultId)).item).toMatchObject({ state: "applied", inLibrary: true, inFile: true });
   });
 });

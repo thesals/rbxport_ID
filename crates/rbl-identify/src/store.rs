@@ -41,6 +41,15 @@
 //! meanwhile. Like every record of a write it is insert-only: a waiting
 //! write and the row saying how it ended are never changed.
 //!
+//! Version 5 adds library writes ([`LibraryWrite`]): since rbxport keeps
+//! its own library, an accepted result is written to that library as well
+//! as to the file. Each write records the library track, the fields and
+//! the exact values before and after (JSON the store keeps without
+//! reading), and each undo of one is recorded too; both insert-only. The
+//! `rekordbox_imports` of version 3 are kept, read-only, for results made
+//! before: new results don't import a record, since the review now reads
+//! rbxport's own library.
+//!
 //! Snapshots are taken only for writes, not for every track scanned: the raw
 //! ID3 block includes embedded artwork, and a whole library of those would
 //! run to gigabytes. They are stored as JSON for the parsed values and as
@@ -66,7 +75,7 @@ use crate::pipeline::TrackResult;
 
 /// The schema this build creates and understands, kept in
 /// `PRAGMA user_version`. A newer file is refused rather than guessed at.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// `PRAGMA application_id` of an identify store ("RBID"), so a SQLite file
 /// that belongs to something else is recognised and refused.
@@ -303,6 +312,44 @@ WHEN EXISTS (SELECT 1 FROM waiting_write_ends WHERE waiting_id = NEW.waiting_id)
 BEGIN SELECT RAISE(ABORT, 'a waiting write outcome is a permanent record'); END;
 ";
 
+/// Version 5, on top of version 4: writes to rbxport's own library, and
+/// their undos. Insert-only.
+const SCHEMA_V5: &str = r"
+-- One write of a result's reviewed fields to rbxport's library: the
+-- library track (djmdContent.ID), the fields (Vec<Field>, JSON) and the
+-- exact column values before and after (JSON the store keeps without
+-- reading; what undo puts back). Never updated or deleted.
+CREATE TABLE library_writes (
+    id           INTEGER PRIMARY KEY,
+    result_id    INTEGER NOT NULL REFERENCES results(id),
+    track_id     TEXT    NOT NULL,
+    fields_json  TEXT    NOT NULL,
+    edits_json   TEXT    NOT NULL,
+    written_unix INTEGER NOT NULL
+);
+CREATE INDEX library_writes_result ON library_writes(result_id);
+CREATE TRIGGER library_writes_never_update BEFORE UPDATE ON library_writes
+BEGIN SELECT RAISE(ABORT, 'a library write is a permanent record'); END;
+CREATE TRIGGER library_writes_never_delete BEFORE DELETE ON library_writes
+BEGIN SELECT RAISE(ABORT, 'a library write is a permanent record'); END;
+CREATE TRIGGER library_writes_never_replace BEFORE INSERT ON library_writes
+WHEN EXISTS (SELECT 1 FROM library_writes WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'a library write is a permanent record'); END;
+
+-- Each undo of a library write: one row, never updated or deleted.
+CREATE TABLE library_undos (
+    write_id    INTEGER PRIMARY KEY REFERENCES library_writes(id),
+    undone_unix INTEGER NOT NULL
+);
+CREATE TRIGGER library_undos_never_update BEFORE UPDATE ON library_undos
+BEGIN SELECT RAISE(ABORT, 'a library undo is a permanent record'); END;
+CREATE TRIGGER library_undos_never_delete BEFORE DELETE ON library_undos
+BEGIN SELECT RAISE(ABORT, 'a library undo is a permanent record'); END;
+CREATE TRIGGER library_undos_never_replace BEFORE INSERT ON library_undos
+WHEN EXISTS (SELECT 1 FROM library_undos WHERE write_id = NEW.write_id)
+BEGIN SELECT RAISE(ABORT, 'a library undo is a permanent record'); END;
+";
+
 /// A track's row id in the store.
 pub type TrackId = i64;
 /// An identification result's row id in the store.
@@ -311,6 +358,35 @@ pub type ResultId = i64;
 pub type ApplicationId = i64;
 /// The row id of one waiting write.
 pub type WaitingId = i64;
+/// The row id of one write to rbxport's library.
+pub type LibraryWriteId = i64;
+
+/// One write of a result's fields to rbxport's own library
+/// ([`Store::record_library_write`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryWrite {
+    pub id: LibraryWriteId,
+    pub result: ResultId,
+    /// The library track: `djmdContent.ID`.
+    pub track_id: String,
+    /// The fields written.
+    pub fields: Vec<Field>,
+    /// The exact values before and after, as the library's writer records
+    /// them; JSON the store keeps without reading.
+    pub edits_json: String,
+    pub written_unix: i64,
+    /// When it was undone; `None` if it has not been.
+    pub undone_unix: Option<i64>,
+}
+
+/// Where a result's latest writes still stand (not undone).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WrittenTo {
+    /// rbxport's library holds the result's fields.
+    pub library: bool,
+    /// The file holds them.
+    pub file: bool,
+}
 
 /// A write kept until its file is free ([`Store::defer_write`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,8 +490,8 @@ pub struct RekordboxRecord {
 ///
 /// | from          | to                                            |
 /// |---------------|-----------------------------------------------|
-/// | `Pending`     | `Accepted`, `Rejected`                        |
-/// | `Accepted`    | `Pending`, `Rejected`; `Applied` or `AutoApplied` only through [`Store::complete_application`] |
+/// | `Pending`     | `Accepted`, `Rejected`; `Applied` or `AutoApplied` only through [`Store::apply_library_only`] |
+/// | `Accepted`    | `Pending`, `Rejected`; `Applied` or `AutoApplied` only through [`Store::complete_application`] or [`Store::apply_library_only`] |
 /// | `Rejected`    | `Pending`                                     |
 /// | `Applied`     | `Undone`                                      |
 /// | `AutoApplied` | `Undone`                                      |
@@ -946,6 +1022,9 @@ impl Store {
         }
         if from <= 3 {
             tx.execute_batch(SCHEMA_V4).map_err(|e| sql("migrate the schema to version 4", &e))?;
+        }
+        if from <= 4 {
+            tx.execute_batch(SCHEMA_V5).map_err(|e| sql("migrate the schema to version 5", &e))?;
         }
         tx.pragma_update(None, "application_id", APPLICATION_ID).map_err(|e| sql("set the application id", &e))?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION).map_err(|e| sql("set the schema version", &e))?;
@@ -1882,6 +1961,140 @@ impl Store {
         tx.commit().map_err(|e| sql("commit the cancel", &e))
     }
 
+    /// Records a write of `fields` to rbxport's library for `result`, made
+    /// just now: `edits_json` holds the exact values before and after.
+    /// Refused unless the result is current and `Accepted` (the caller
+    /// accepts it before writing the library).
+    pub fn record_library_write(
+        &self,
+        result: ResultId,
+        track_id: &str,
+        fields: &[Field],
+        edits_json: &str,
+    ) -> Result<LibraryWriteId> {
+        let fields = to_json(fields, "library fields")?;
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let from = current_state(&tx, result)?;
+        if from != ReviewState::Accepted {
+            return Err(IdentifyError::Store(format!(
+                "result {result} is {}; only an accepted result can be written to the library",
+                from.as_str()
+            )));
+        }
+        let id = tx
+            .query_row(
+                "INSERT INTO library_writes (result_id, track_id, fields_json, edits_json, written_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
+                params![result, track_id, fields, edits_json, now_unix()],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql("record the library write", &e))?;
+        tx.commit().map_err(|e| sql("commit the library write", &e))?;
+        Ok(id)
+    }
+
+    /// The result's latest library write, undone or not; `None` without one.
+    pub fn library_write(&self, result: ResultId) -> Result<Option<LibraryWrite>> {
+        latest_library_write(&self.conn, result)
+    }
+
+    /// Where the result's latest writes still stand: the library, the
+    /// file, both or neither (each not undone).
+    pub fn written_to(&self, result: ResultId) -> Result<WrittenTo> {
+        let library = latest_library_write(&self.conn, result)?.is_some_and(|w| w.undone_unix.is_none());
+        let file = self
+            .conn
+            .query_row(
+                "SELECT NOT EXISTS (SELECT 1 FROM application_undos u WHERE u.application_id = a.id)
+                 FROM applications a JOIN application_outcomes o ON o.application_id = a.id AND o.outcome = 'written'
+                 WHERE a.result_id = ?1 ORDER BY a.id DESC LIMIT 1",
+                [result],
+                |r| r.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|e| sql("read the applications", &e))?
+            .unwrap_or(false);
+        Ok(WrittenTo { library, file })
+    }
+
+    /// A result whose fields are in the library but not in the file (file
+    /// writes are off, the file write failed, or its waiting write was
+    /// cancelled or dropped) is applied as it stands: `AutoApplied` when
+    /// its decision is `AutoApply` and nothing of it was written or undone
+    /// before, otherwise `Applied`. Undo then puts the library back.
+    ///
+    /// Refused unless the result is current, `Accepted` or `Pending`, its
+    /// latest library write stands, it has no waiting write, and its track
+    /// has no write to the file open. Returns the state it took.
+    pub fn apply_library_only(&self, result: ResultId) -> Result<ReviewState> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let from = current_state(&tx, result)?;
+        if !matches!(from, ReviewState::Accepted | ReviewState::Pending) {
+            return Err(IdentifyError::Store(format!("result {result} is {}, not accepted", from.as_str())));
+        }
+        if latest_library_write(&tx, result)?.is_none_or(|w| w.undone_unix.is_some()) {
+            return Err(IdentifyError::Store(format!("result {result} has no library write standing")));
+        }
+        if open_waiting(&tx, result)?.is_some() {
+            return Err(IdentifyError::Store(format!("result {result} still has a write waiting for its file")));
+        }
+        let (track, decision): (TrackId, String) = tx
+            .query_row("SELECT track_id, decision FROM results WHERE id = ?1", [result], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| sql("read the result", &e))?;
+        if has_open_application(&tx, track)? {
+            return Err(IdentifyError::Store(format!(
+                "result {result}: a write is in progress; it must be completed or abandoned first"
+            )));
+        }
+        let earlier_undo: bool = tx
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM library_undos u JOIN library_writes w ON w.id = u.write_id
+                                WHERE w.result_id = ?1)",
+                [result],
+                |r| r.get(0),
+            )
+            .map_err(|e| sql("read the library undos", &e))?;
+        let auto =
+            parse_decision(&decision)? == Decision::AutoApply && !has_written_application(&tx, result)? && !earlier_undo;
+        let to = if auto { ReviewState::AutoApplied } else { ReviewState::Applied };
+        set_state_unchecked(&tx, result, to)?;
+        tx.commit().map_err(|e| sql("commit the library-only apply", &e))?;
+        Ok(to)
+    }
+
+    /// Records that a library write has been put back. `move_state`: the
+    /// result goes to `Undone` here (a write to the library only); without
+    /// it the file's undo ([`Store::record_undo`]) has moved it already.
+    /// Refused for a write already undone, one that is not its result's
+    /// latest, and (with `move_state`) a result that is not applied.
+    pub fn record_library_undo(&self, write: LibraryWriteId, move_state: bool) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().map_err(|e| sql("begin", &e))?;
+        let result: Option<ResultId> = tx
+            .query_row("SELECT result_id FROM library_writes WHERE id = ?1", [write], |r| r.get(0))
+            .optional()
+            .map_err(|e| sql("read the library write", &e))?;
+        let Some(result) = result else {
+            return Err(IdentifyError::Store(format!("no library write {write}")));
+        };
+        match latest_library_write(&tx, result)? {
+            Some(w) if w.id == write && w.undone_unix.is_none() => {}
+            Some(w) if w.id == write => {
+                return Err(IdentifyError::Store(format!("library write {write} has already been undone")));
+            }
+            _ => return Err(IdentifyError::Store(format!("library write {write} is not its result's latest"))),
+        }
+        if move_state {
+            let from = current_state(&tx, result)?;
+            if !from.may_become(ReviewState::Undone) {
+                return Err(IdentifyError::Store(format!("result {result} is {}, not applied", from.as_str())));
+            }
+            set_state_unchecked(&tx, result, ReviewState::Undone)?;
+        }
+        tx.execute("INSERT INTO library_undos (write_id, undone_unix) VALUES (?1, ?2)", params![write, now_unix()])
+            .map_err(|e| sql("record the library undo", &e))?;
+        tx.commit().map_err(|e| sql("commit the library undo", &e))
+    }
+
     /// The rekordbox record imported with a result; `None` for a result
     /// without one (no library track, or saved before version 3).
     pub fn rekordbox_record(&self, result: ResultId) -> Result<Option<RekordboxRecord>> {
@@ -2134,6 +2347,32 @@ fn open_waiting(conn: &Connection, result: ResultId) -> Result<Option<WaitingWri
         .map_err(|e| sql("read the waiting write", &e))?;
     row.map(|(id, path, fields, reason, since_unix)| {
         Ok(WaitingWrite { id, result, path, fields: from_json(&fields, "waiting fields")?, reason, since_unix })
+    })
+    .transpose()
+}
+
+/// The result's latest library write, undone or not.
+fn latest_library_write(conn: &Connection, result: ResultId) -> Result<Option<LibraryWrite>> {
+    let row: Option<(LibraryWriteId, String, String, String, i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT w.id, w.track_id, w.fields_json, w.edits_json, w.written_unix, u.undone_unix
+             FROM library_writes w LEFT JOIN library_undos u ON u.write_id = w.id
+             WHERE w.result_id = ?1 ORDER BY w.id DESC LIMIT 1",
+            [result],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()
+        .map_err(|e| sql("read the library write", &e))?;
+    row.map(|(id, track_id, fields, edits_json, written_unix, undone_unix)| {
+        Ok(LibraryWrite {
+            id,
+            result,
+            track_id,
+            fields: from_json(&fields, "library fields")?,
+            edits_json,
+            written_unix,
+            undone_unix,
+        })
     })
     .transpose()
 }
@@ -2467,10 +2706,61 @@ mod tests {
     }
 
     #[test]
+    fn a_library_write_is_recorded_applied_and_undone_once() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, result) = reviewed(&store, "a.mp3", 0.8);
+        assert!(store.record_library_write(result, "42", &[Field::Title], "[]").is_err(), "only an accepted result");
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let write = store.record_library_write(result, "42", &[Field::Title], "[\"edits\"]").unwrap();
+        let recorded = store.library_write(result).unwrap().unwrap();
+        assert_eq!((recorded.id, recorded.track_id.as_str(), recorded.fields.as_slice()), (write, "42", [Field::Title].as_slice()));
+        assert_eq!(recorded.edits_json, "[\"edits\"]");
+        assert_eq!(store.written_to(result).unwrap(), WrittenTo { library: true, file: false });
+
+        assert_eq!(store.apply_library_only(result).unwrap(), ReviewState::Applied);
+        assert!(store.apply_library_only(result).is_err(), "once");
+        store.record_library_undo(write, true).unwrap();
+        assert_eq!(store.result(result).unwrap().unwrap().0.state, ReviewState::Undone);
+        assert_eq!(store.written_to(result).unwrap(), WrittenTo::default());
+        assert!(store.record_library_undo(write, true).is_err(), "undone once");
+        assert!(store.library_write(result).unwrap().unwrap().undone_unix.is_some());
+    }
+
+    #[test]
+    fn a_library_only_auto_apply_is_auto_applied() {
+        let store = Store::open_in_memory().unwrap();
+        let track = store.upsert_track(&key("a.mp3"), 360.0, None, &tags("T")).unwrap();
+        let auto = store.save_result(track, Decision::AutoApply, &[], Some(&proposal()), None, &[], false).unwrap();
+        assert!(store.apply_library_only(auto).is_err(), "nothing in the library yet");
+        store.record_library_write(auto, "42", &[Field::Title], "[]").unwrap();
+        assert_eq!(store.apply_library_only(auto).unwrap(), ReviewState::AutoApplied);
+    }
+
+    #[test]
+    fn the_database_itself_refuses_to_change_a_library_write_or_its_undo() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, result) = reviewed(&store, "a.mp3", 0.8);
+        store.set_state(result, ReviewState::Accepted).unwrap();
+        let write = store.record_library_write(result, "42", &[Field::Title], "[]").unwrap();
+        store.apply_library_only(result).unwrap();
+        store.record_library_undo(write, true).unwrap();
+        for statement in [
+            "UPDATE library_writes SET edits_json = '{}'",
+            "DELETE FROM library_writes",
+            "INSERT OR REPLACE INTO library_writes (id, result_id, track_id, fields_json, edits_json, written_unix)
+             SELECT id, result_id, track_id, fields_json, '{}', 0 FROM library_writes",
+            "UPDATE library_undos SET undone_unix = 0",
+            "DELETE FROM library_undos",
+        ] {
+            assert!(store.conn.execute(statement, []).is_err(), "{statement}");
+        }
+    }
+
+    #[test]
     fn a_new_store_has_the_schema() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        for table in ["tracks", "results", "applications", "application_snapshots", "artwork"] {
+        for table in ["tracks", "results", "applications", "application_snapshots", "artwork", "library_writes", "library_undos"] {
             assert!(store.has_table(table).unwrap(), "{table}");
         }
     }
@@ -3587,8 +3877,9 @@ mod tests {
             conn.pragma_update(None, "user_version", 3).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(store.has_table("waiting_writes").unwrap() && store.has_table("waiting_write_ends").unwrap());
+        assert!(store.has_table("library_writes").unwrap() && store.has_table("library_undos").unwrap());
         let (_, result) = reviewed(&store, "a.mp3", 0.8);
         assert_eq!(store.waiting_writes().unwrap(), []);
         assert_eq!(store.result(result).unwrap().unwrap().0.waiting, None);

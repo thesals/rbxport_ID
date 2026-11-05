@@ -36,6 +36,7 @@
 //! ([`settings`]) say only where each comes from.
 
 pub mod import;
+pub mod library;
 mod settings;
 
 pub use settings::{GenrePolicyDto, IdentifySettingsDto, IdentifySettingsUpdateDto, KeySource, SecretUpdate};
@@ -45,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rbl_identify::acoustid::AcoustIdClient;
 use rbl_identify::clock::{Clock, Deadline, SystemClock};
 use rbl_identify::coverart::CoverArtClient;
@@ -84,6 +85,12 @@ pub const FILE_WRITES_OFF: &str =
 /// The warning a job's auto-apply leaves on its result while the
 /// file-writes lock is on.
 pub const AUTO_APPLY_LOCKED: &str = "Not applied automatically: writing to audio files is turned off. It waits for review.";
+/// Library Protection is on: nothing is written, to the library or the file.
+pub const LIBRARY_PROTECTED: &str =
+    "Library Protection is on, so nothing was written. Turn it off in Preferences to apply.";
+/// Said beside a result written to the library but not to its file.
+pub const FILE_NOT_WRITTEN_OFF: &str =
+    "Written to rbxport's library. Not written to the file: writing tags to audio files is turned off.";
 
 /// How long the exit pass may take, in all.
 pub const EXIT_BUDGET: Duration = Duration::from_secs(10);
@@ -211,6 +218,12 @@ pub struct IdentifyState {
     /// No audio file is ever written, whatever the settings say (the
     /// headless import, [`import`]).
     never_write_files: bool,
+    /// rbxport's library, once the app has one open. `None` (the headless
+    /// import, or no library yet): nothing is written to a library.
+    library: RwLock<Option<Arc<dyn library::LibrarySide>>>,
+    /// Library Protection, as the window last said. On until told
+    /// otherwise, so nothing writes the library before the window has said.
+    library_protected: AtomicBool,
 }
 
 impl Default for IdentifyState {
@@ -254,7 +267,30 @@ impl IdentifyState {
             next_job: AtomicU32::new(1),
             exited: AtomicBool::new(false),
             never_write_files: false,
+            library: RwLock::new(None),
+            library_protected: AtomicBool::new(true),
         }
+    }
+
+    /// The library accepted results are written to.
+    pub fn set_library(&self, library: Arc<dyn library::LibrarySide>) {
+        *self.library.write() = Some(library);
+    }
+
+    /// Library Protection, from the window's preferences.
+    pub fn set_library_protected(&self, protected: bool) {
+        self.library_protected.store(protected, Ordering::Release);
+    }
+
+    /// The library to write; `None` when this state has none (the
+    /// headless import, which writes nothing), or why it may not be
+    /// written (Library Protection).
+    fn writable_library(&self) -> Result<Option<Arc<dyn library::LibrarySide>>, String> {
+        let library = self.library.read().clone();
+        if library.is_some() && self.library_protected.load(Ordering::Acquire) {
+            return Err(LIBRARY_PROTECTED.to_owned());
+        }
+        Ok(library)
     }
 
     /// THE file-writes gate: every write to an audio file (apply, undo, a
@@ -447,6 +483,10 @@ impl IdentifyState {
                 // The waiting write ended, whether or not the result's state
                 // changed with it.
                 Some(Ok(Ok(Retried::Dropped { warning, .. }))) => {
+                    let _ = self.with_store_until(deadline, true, |store| {
+                        settle_library_only(store, waiting.result);
+                        Ok(())
+                    });
                     changed.push(waiting.result);
                     IdentifyWriteOutcomeDto::failed(waiting.result, warning)
                 }
@@ -484,6 +524,7 @@ impl IdentifyState {
             store.cancel_waiting(result).map_err(|e| {
                 AppError::new(ErrorKind::Malformed, "This result has no write waiting.").with_detail(e.to_string())
             })?;
+            settle_library_only(store, result);
             current_item(store, result)
         })
     }
@@ -598,9 +639,14 @@ impl IdentifyState {
             let (item, candidates, enrichment, warnings) =
                 store.result(result).map_err(store_error)?.ok_or_else(no_such_result)?;
             let write_in_progress = write_open(store, &item.path)?;
-            let rekordbox = store.rekordbox_record(result).map_err(store_error)?.map(|r| rekordbox_dto(&r));
+            let library = item
+                .library
+                .as_ref()
+                .and_then(|l| Some((self.library.read().clone()?, l.track_id.clone())))
+                .and_then(|(side, track)| side.record(&track).ok())
+                .map(|r| library_dto(&r));
             Ok(IdentifyDetailDto {
-                rekordbox,
+                library,
                 existing: ExistingTagsDto::from(&item.existing),
                 artwork: item.proposal.as_ref().and_then(|p| p.artwork.as_ref()).map(|a| ArtworkDto {
                     source: camel(&a.source),
@@ -863,7 +909,7 @@ fn identify_and_save(state: &IdentifyState, identifier: &dyn Identifier, track: 
             // at or above the threshold that fills empty fields): written now,
             // or left for review with the reason.
             if decision == Decision::AutoApply {
-                match auto_apply(store, id, state.file_writes().ok()) {
+                match auto_apply(store, id, &state.writable_library(), state.file_writes().ok()) {
                     Ok(AutoApplied::Written) => {}
                     Ok(AutoApplied::Waiting) => {
                         tracing::info!(result = id, "identify: an auto-apply waits for its file to be closed");
@@ -890,35 +936,35 @@ enum AutoApplied {
     Waiting,
 }
 
-/// Writes an auto-apply result to its file, every field of its proposal,
-/// through the same recorded path as a user's apply
-/// ([`rbl_identify::write::apply_result`]), so it ends `AutoApplied` and can
-/// be undone. The proposal must still only fill empty fields (never a
-/// sub-genre, never an overwrite; artwork only for a file without any).
-/// A file open in another program keeps it as a waiting write (still
-/// accepted, still decided auto-apply), written once the file is free.
-/// When it is not written otherwise (the file-writes lock among the
-/// reasons: `allowed` is the gate's answer) the result becomes a pending
-/// review carrying the reason; the error is that reason.
-fn auto_apply(store: &Store, result: ResultId, allowed: Option<FileWritesAllowed>) -> Result<AutoApplied, String> {
-    let Some(allowed) = allowed else {
-        if let Err(e) = store.demote_auto_apply(result, AUTO_APPLY_LOCKED) {
-            tracing::warn!(error = %e, "identify: an unwritten auto-apply could not be returned to review");
-        }
-        return Err(AUTO_APPLY_LOCKED.to_owned());
-    };
+/// Writes an auto-apply result, every field of its proposal, through the
+/// same recorded path as a user's apply ([`write_result`]), so it ends
+/// `AutoApplied` and can be undone: rbxport's library first, then the file
+/// when file writes are on. The proposal must still only fill fields empty
+/// in the file (never a sub-genre, never an overwrite; artwork only for a
+/// file without any), and in the library too. A file open in another
+/// program keeps it as a waiting write (still accepted, still decided
+/// auto-apply), written once the file is free. When nothing is written
+/// (the library protected or holding something else, file writes off for a
+/// result with no library field, ...) the result becomes a pending review
+/// carrying the reason; the error is that reason.
+fn auto_apply(
+    store: &Store,
+    result: ResultId,
+    library: &Result<Option<Arc<dyn library::LibrarySide>>, String>,
+    allowed: Option<FileWritesAllowed>,
+) -> Result<AutoApplied, String> {
     let written = (|| {
         let (item, ..) = store.result(result).map_err(|e| e.to_string())?.ok_or("the result is not in the store")?;
         let proposal = item.proposal.as_ref().filter(|p| p.fills_only_empty()).ok_or("the proposal does not only fill empty fields")?;
         let fields: Vec<Field> = proposal.changes.iter().map(|c| c.field).collect();
-        match rbl_identify::write::apply_result(store, result, &fields, allowed) {
+        match write_result(store, library, result, &fields, allowed, true) {
+            Ok(Wrote::Waiting(_)) => Ok(AutoApplied::Waiting),
             Ok(_) => Ok(AutoApplied::Written),
-            Err(IdentifyError::Deferred(_)) => Ok(AutoApplied::Waiting),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e),
         }
     })();
     written.map_err(|e| {
-        let reason = format!("Auto-apply did not write this file: {e}");
+        let reason = if e == FILE_WRITES_OFF { AUTO_APPLY_LOCKED.to_owned() } else { format!("Not applied automatically: {e}") };
         // A write left open (it may have half landed) keeps the result
         // accepted until startup reconciles it.
         if let Err(e) = store.demote_auto_apply(result, &reason) {
@@ -926,6 +972,176 @@ fn auto_apply(store: &Store, result: ResultId, allowed: Option<FileWritesAllowed
         }
         reason
     })
+}
+
+/// What [`write_result`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Wrote {
+    /// The library and the file (or the file alone, for fields the library
+    /// does not keep).
+    Written,
+    /// The library only; says why the file was not written.
+    LibraryOnly(String),
+    /// The library (if it keeps any of the fields), and the file is open in
+    /// another program: kept as a waiting write. Says when it is written.
+    Waiting(String),
+}
+
+/// Writes the ticked `fields` of a result: rbxport's library first,
+/// through the single edit path ([`library::LibrarySide::write`], recorded
+/// with [`Store::record_library_write`]), then the file
+/// ([`rbl_identify::write::apply_result`]) when `allowed`. If the library
+/// write fails nothing is written to the file. If the file is not written
+/// (writes off, refused, failed) the library edit stands and the result is
+/// applied as it is ([`Store::apply_library_only`]); a file open elsewhere
+/// keeps a waiting write.
+///
+/// `auto`: an auto-apply, which may only fill what the library holds empty
+/// (or already holds as proposed); anything else there is refused before
+/// anything is written. `library` is the library to write (`None`: there
+/// is none, and only the file is written), or why it may not be
+/// (protected): a refusal only when a field it keeps is to be written.
+fn write_result(
+    store: &Store,
+    library: &Result<Option<Arc<dyn library::LibrarySide>>, String>,
+    result: ResultId,
+    fields: &[Field],
+    allowed: Option<FileWritesAllowed>,
+    auto: bool,
+) -> Result<Wrote, String> {
+    let (item, ..) = store.result(result).map_err(|e| e.to_string())?.ok_or("That identification result is no longer in the store.")?;
+    if store.waiting_write(result).map_err(|e| e.to_string())?.is_some() {
+        return Err(
+            "This result is already waiting to be written once the file is closed. Retry it, or cancel the waiting write.".to_owned(),
+        );
+    }
+    let accepted_here = match item.state {
+        ReviewState::Accepted => false,
+        ReviewState::Pending => true,
+        other => return Err(format!("A {} result cannot be written.", other.as_str())),
+    };
+    if fields.is_empty() {
+        return Err("Choose at least one field to write.".to_owned());
+    }
+    let proposal = item.proposal.as_ref().ok_or("The result proposes no changes.")?;
+    let mut changes = Vec::with_capacity(fields.len());
+    for field in fields {
+        let change = proposal
+            .changes
+            .iter()
+            .find(|c| c.field == *field)
+            .ok_or_else(|| format!("The proposal has no change to {}.", field.as_str()))?;
+        changes.push(change);
+    }
+    let kept: Vec<&FieldChange> = changes.iter().copied().filter(|c| library::kept(c.field)).collect();
+    if kept.is_empty() && allowed.is_none() {
+        return Err(FILE_WRITES_OFF.to_owned());
+    }
+
+    let mut wrote_library = false;
+    // No library (the headless import, and tests of the file alone): the
+    // file is the only place to write.
+    if let (false, Some(library)) = (kept.is_empty(), library.as_ref().map_err(Clone::clone)?) {
+        let track = item.library.as_ref().map(|l| l.track_id.as_str()).filter(|t| !t.is_empty());
+        let track = track.ok_or("This result is not tied to a track in rbxport's library.")?;
+        let record = library.record(track)?;
+        let mut values = Vec::with_capacity(kept.len());
+        let mut written_fields = Vec::with_capacity(kept.len());
+        for change in &kept {
+            let now = record.value(change.field).unwrap_or("");
+            let value = match change.field {
+                // The styles the review added, appended to the library's own
+                // comment: its text is never replaced.
+                Field::SubGenre => library::LibraryValue::Text(
+                    Field::SubGenre,
+                    rbl_identify::comment::append(now, &rbl_identify::comment::added(&change.current, &change.proposed).join("; ")),
+                ),
+                Field::Artwork => {
+                    let art = proposal.artwork.as_ref().ok_or("The proposed artwork is not in the identify store.")?;
+                    let (bytes, mime) = store
+                        .artwork(&art.sha256)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("The proposed artwork is not in the identify store.")?;
+                    library::LibraryValue::Artwork(bytes, mime)
+                }
+                field => library::LibraryValue::Text(field, change.proposed.clone()),
+            };
+            let same = match &value {
+                library::LibraryValue::Text(field, text) => {
+                    let text = if *field == Field::Year { library::year_of(text) } else { text.trim().to_owned() };
+                    now.trim() == text
+                }
+                library::LibraryValue::Artwork(..) => false,
+            };
+            if same {
+                continue;
+            }
+            if auto && !now.trim().is_empty() {
+                return Err(format!("rbxport's library already holds a different {}. It waits for review.", field_label(change.field)));
+            }
+            values.push(value);
+            written_fields.push(change.field);
+        }
+        if !values.is_empty() {
+            if accepted_here {
+                store.set_state(result, ReviewState::Accepted).map_err(|e| e.to_string())?;
+            }
+            let back_to_pending = || {
+                if accepted_here {
+                    let _ = store.set_state(result, ReviewState::Pending);
+                }
+            };
+            let edits = match library.write(track, &values) {
+                Ok(edits) => edits,
+                Err(e) => {
+                    back_to_pending();
+                    return Err(format!("rbxport's library could not be written, so nothing was written: {e}"));
+                }
+            };
+            if let Err(e) = store.record_library_write(result, track, &written_fields, &edits) {
+                // Unrecorded, it could never be undone: put it back.
+                if let Err(undo) = library.undo(&edits) {
+                    tracing::warn!(error = %undo, "identify: an unrecorded library write could not be put back");
+                }
+                back_to_pending();
+                return Err(e.to_string());
+            }
+            wrote_library = true;
+        }
+    }
+
+    let Some(allowed) = allowed else {
+        return library_only(store, result, wrote_library, FILE_NOT_WRITTEN_OFF.to_owned());
+    };
+    match rbl_identify::write::apply_result(store, result, fields, allowed) {
+        Ok(_) => Ok(Wrote::Written),
+        Err(IdentifyError::Deferred(message)) => Ok(Wrote::Waiting(if wrote_library {
+            format!("Written to rbxport's library. The file is not written yet: {message}")
+        } else {
+            message
+        })),
+        Err(e) if wrote_library => library_only(store, result, true, format!("Written to rbxport's library. The file was not written: {e}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A result whose library write stands but whose file was not written
+/// ends applied as it is; without a library write, `note` is the refusal.
+fn library_only(store: &Store, result: ResultId, wrote_library: bool, note: String) -> Result<Wrote, String> {
+    if !wrote_library {
+        return Err(if note == FILE_NOT_WRITTEN_OFF { FILE_WRITES_OFF.to_owned() } else { note });
+    }
+    store.apply_library_only(result).map_err(|e| e.to_string())?;
+    Ok(Wrote::LibraryOnly(note))
+}
+
+/// A field as the review names it, for a refusal.
+fn field_label(field: Field) -> String {
+    match field {
+        Field::SubGenre => "comment".to_owned(),
+        Field::Isrc => "ISRC".to_owned(),
+        other => other.as_str().to_lowercase(),
+    }
 }
 
 /// Saves a finished track (its cover, row, result and the imported library
@@ -1132,7 +1348,14 @@ pub async fn identify_start<R: tauri::Runtime>(
         announce(&app, identify.retry_waiting(None, &[]).1);
         // The shared reader is taken per batch, so other readers get a turn
         // during a whole-library job.
-        let tracks = job_tracks(&library, track_ids, |batch| state.read_db(|db| read_isrcs(db, batch)));
+        // The review reads rbxport's own library, so no record is imported
+        // with the result any more (`rekordbox_imports` is kept, read-only,
+        // for results made before).
+        let _ = &state;
+        let mut tracks = job_tracks(&library, track_ids, |_| Ok::<_, std::convert::Infallible>(std::collections::HashMap::new()));
+        for track in &mut tracks {
+            track.rekordbox = None;
+        }
         spawn_job(app, &identify, engine, tracks)
     })
     .await
@@ -1217,15 +1440,11 @@ pub async fn identify_save_settings(
 // ---------------------------------------------------------------- writing
 
 impl IdentifyState {
-    /// Writes one result's ticked fields to its file, snapshotted before so
-    /// the write can be undone. The file only: never the library. A file
-    /// open in another program is kept as a waiting write (`deferred`).
+    /// Writes one result's ticked fields: rbxport's library, then the file
+    /// when file writes are on ([`write_result`]). A file open in another
+    /// program is kept as a waiting write (`deferred`); a file not written
+    /// otherwise is said in the outcome's `note`, the library edit standing.
     fn apply_one(&self, item: &ApplyItemDto) -> IdentifyWriteOutcomeDto {
-        // Locked: refused before anything, so no waiting write is made.
-        let allowed = match self.file_writes() {
-            Ok(allowed) => allowed,
-            Err(message) => return IdentifyWriteOutcomeDto::failed(item.result_id, message),
-        };
         let fields = item
             .fields
             .iter()
@@ -1235,21 +1454,81 @@ impl IdentifyState {
             Ok(fields) => fields,
             Err(message) => return IdentifyWriteOutcomeDto::failed(item.result_id, message),
         };
-        let outcome = self.with_store(|store| Ok(rbl_identify::write::apply_result(store, item.result_id, &fields, allowed)));
+        let library = self.writable_library();
+        let allowed = self.file_writes().ok();
+        let outcome = self.with_store(|store| {
+            Ok(write_result(store, &library, item.result_id, &fields, allowed, false))
+        });
         match outcome {
-            Ok(Ok(_)) => IdentifyWriteOutcomeDto::written(item.result_id),
-            Ok(Err(IdentifyError::Deferred(message))) => IdentifyWriteOutcomeDto::deferred(item.result_id, message),
-            Ok(Err(e)) => IdentifyWriteOutcomeDto::failed(item.result_id, e.to_string()),
+            Ok(Ok(Wrote::Written)) => IdentifyWriteOutcomeDto::written(item.result_id),
+            Ok(Ok(Wrote::LibraryOnly(note))) => IdentifyWriteOutcomeDto::written(item.result_id).with_note(note),
+            Ok(Ok(Wrote::Waiting(message))) => IdentifyWriteOutcomeDto::deferred(item.result_id, message),
+            Ok(Err(message)) => IdentifyWriteOutcomeDto::failed(item.result_id, message),
             Err(e) => IdentifyWriteOutcomeDto::failed(item.result_id, message_of(&e)),
         }
     }
 
-    /// Undoes one result's write: the file's exact tags. A library side an
-    /// older build recorded is ignored; the library is never written.
+    /// Undoes one result's write: the file's exact tags, when its write
+    /// landed (file writes must be on for that), and rbxport's library's
+    /// exact values. Both are checked first: a file or a library value
+    /// changed since refuses the undo, and then nothing is put back.
     fn undo_one(&self, result: ResultId) -> Result<(), String> {
-        let allowed = self.file_writes()?;
         let outcome = self.with_store(|store| {
-            Ok(rbl_identify::write::undo_result(store, result, allowed).map(|_| ()).map_err(|e| e.to_string()))
+            let (item, ..) = store.result(result).map_err(store_error)?.ok_or_else(no_such_result)?;
+            if !item.state.is_applied() {
+                return Ok(Err("Only an applied result can be undone.".to_owned()));
+            }
+            let written = store.written_to(result).map_err(store_error)?;
+            let library_write = store.library_write(result).map_err(store_error)?.filter(|w| w.undone_unix.is_none());
+            let allowed = if written.file {
+                match self.file_writes() {
+                    Ok(allowed) => Some(allowed),
+                    // The file's tags must come back too, so nothing is undone.
+                    Err(message) => return Ok(Err(message)),
+                }
+            } else {
+                None
+            };
+            let library = match &library_write {
+                Some(write) => {
+                    let library = match self.writable_library() {
+                        Ok(Some(library)) => library,
+                        Ok(None) => return Ok(Err("rbxport's library is not open.".to_owned())),
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    match library.still_holds(&write.edits_json) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Ok(Err(
+                                "The track was changed in rbxport's library since this was applied, so nothing was undone."
+                                    .to_owned(),
+                            ))
+                        }
+                        Err(e) => return Ok(Err(e)),
+                    }
+                    Some(library)
+                }
+                None => None,
+            };
+            if !written.file && library_write.is_none() {
+                return Ok(Err("Nothing of this result's write stands to be undone.".to_owned()));
+            }
+            if let Some(allowed) = allowed {
+                if let Err(e) = rbl_identify::write::undo_result(store, result, allowed) {
+                    return Ok(Err(e.to_string()));
+                }
+            }
+            if let (Some(write), Some(library)) = (&library_write, library) {
+                if let Err(e) = library.undo(&write.edits_json) {
+                    return Ok(Err(if written.file {
+                        format!("The file's tags were put back, but rbxport's library could not be: {e}")
+                    } else {
+                        e
+                    }));
+                }
+                store.record_library_undo(write.id, !written.file).map_err(store_error)?;
+            }
+            Ok(Ok(()))
         });
         flatten(outcome)
     }
@@ -1291,8 +1570,20 @@ fn message_of(e: &AppError) -> String {
     e.detail.as_ref().map_or_else(|| e.message.clone(), |d| format!("{}: {d}", e.message))
 }
 
-/// Tells the window which results changed. Only `identify:changed`: the
-/// library is never written, so it never changes here.
+/// A result whose file write will not be made (its waiting write
+/// cancelled or dropped) but whose library write stands stays applied,
+/// library only, rather than going back to review with the library edited.
+fn settle_library_only(store: &Store, result: ResultId) {
+    let standing = store.library_write(result).ok().flatten().is_some_and(|w| w.undone_unix.is_none());
+    if standing {
+        if let Err(e) = store.apply_library_only(result) {
+            tracing::warn!(error = %e, result, "identify: a library-only write could not be settled");
+        }
+    }
+}
+
+/// Tells the window which results changed: `identify:changed`. A library
+/// edit announces itself (`library:changed`) as it is made.
 pub(crate) fn announce<R: tauri::Runtime>(app: &tauri::AppHandle<R>, mut result_ids: Vec<ResultId>) {
     result_ids.sort_unstable();
     result_ids.dedup();
@@ -1301,9 +1592,9 @@ pub(crate) fn announce<R: tauri::Runtime>(app: &tauri::AppHandle<R>, mut result_
     }
 }
 
-/// Writes the ticked fields of each result to its file. Each item answers
-/// for itself; refused items change nothing. rekordbox may be running:
-/// its library is not touched.
+/// Writes the ticked fields of each result to rbxport's library and, when
+/// file writes are on, to its file. Each item answers for itself; refused
+/// items change nothing. rekordbox's library is never touched.
 #[tauri::command]
 pub async fn identify_apply<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1342,8 +1633,9 @@ pub async fn identify_cancel_waiting<R: tauri::Runtime>(
     Ok(item)
 }
 
-/// Puts back the file's tags as they were before the result's last write.
-/// Refused (ok: false) when the file changed since.
+/// Puts back the file's tags and rbxport's library values as they were
+/// before the result's last write. Refused (ok: false) when either changed
+/// since.
 #[tauri::command]
 pub async fn identify_undo<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -1354,6 +1646,14 @@ pub async fn identify_undo<R: tauri::Runtime>(
     let outcome = blocking("identify_undo", move || Ok(identify.undo_item(result_id))).await?;
     announce(&app, if outcome.ok { vec![result_id] } else { Vec::new() });
     Ok(outcome)
+}
+
+/// Library Protection as the window's preferences hold it: while it is on,
+/// Identify writes nothing (an auto-apply waits for review).
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value, reason = "Tauri's State extractor is injected by value")]
+pub fn identify_set_library_protected(identify: State<'_, Arc<IdentifyState>>, protected: bool) {
+    identify.set_library_protected(protected);
 }
 
 /// Accepts every pending result scoring at least `threshold`. Writes
@@ -1390,6 +1690,9 @@ pub struct IdentifyWriteOutcomeDto {
     /// Not written because the file is open in another program: kept as a
     /// waiting write (`ok` is false, `error` says when it will be written).
     pub deferred: bool,
+    /// Written to rbxport's library but not to the file (`ok` is true):
+    /// says why.
+    pub note: Option<String>,
 }
 
 impl IdentifyWriteOutcomeDto {
@@ -1401,15 +1704,19 @@ impl IdentifyWriteOutcomeDto {
     }
 
     fn written(result_id: ResultId) -> Self {
-        Self { result_id, ok: true, error: None, deferred: false }
+        Self { result_id, ok: true, error: None, deferred: false, note: None }
+    }
+
+    fn with_note(self, note: String) -> Self {
+        Self { note: Some(note), ..self }
     }
 
     fn failed(result_id: ResultId, error: String) -> Self {
-        Self { result_id, ok: false, error: Some(error), deferred: false }
+        Self { result_id, ok: false, error: Some(error), deferred: false, note: None }
     }
 
     fn deferred(result_id: ResultId, error: String) -> Self {
-        Self { result_id, ok: false, error: Some(error), deferred: true }
+        Self { result_id, ok: false, error: Some(error), deferred: true, note: None }
     }
 }
 
@@ -1583,6 +1890,10 @@ pub struct IdentifyQueueItemDto {
     pub updated_unix: i64,
     /// Applied, so `identify_undo` can put its last write back.
     pub undoable: bool,
+    /// Applied: rbxport's library holds the result's fields.
+    pub in_library: bool,
+    /// Applied: the file holds them.
+    pub in_file: bool,
     /// Where the proposed candidate came from: `fingerprint`, `textSearch`
     /// or `discogsText`; `None` without a proposal.
     pub source: Option<String>,
@@ -1710,19 +2021,16 @@ pub struct IdentifyDetailDto {
     /// A write to the file is open: review changes are refused until it is
     /// reconciled.
     pub write_in_progress: bool,
-    /// The rekordbox library record as imported when the track was
-    /// identified; `None` for a result saved before imports existed.
-    pub rekordbox: Option<IdentifyRekordboxRecordDto>,
+    /// What rbxport's library holds for the track now; `None` when the
+    /// result is tied to no library track, or no library is open.
+    pub library: Option<IdentifyLibraryRecordDto>,
 }
 
-/// A rekordbox library record imported into the identify store. Read from
-/// the library; identification never writes it back. Absent values are "".
+/// What rbxport's library holds for a track, in the fields Identify
+/// writes. Absent values are "".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IdentifyRekordboxRecordDto {
-    pub track_id: String,
-    /// RFC 3339, UTC.
-    pub imported_at: String,
+pub struct IdentifyLibraryRecordDto {
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -1731,12 +2039,11 @@ pub struct IdentifyRekordboxRecordDto {
     pub year: String,
     pub comment: String,
     pub isrc: String,
+    pub artwork: bool,
 }
 
-fn rekordbox_dto(r: &RekordboxRecord) -> IdentifyRekordboxRecordDto {
-    IdentifyRekordboxRecordDto {
-        track_id: r.track_id.clone(),
-        imported_at: rfc3339(r.imported_unix),
+fn library_dto(r: &library::LibraryRecord) -> IdentifyLibraryRecordDto {
+    IdentifyLibraryRecordDto {
         title: r.title.clone(),
         artist: r.artist.clone(),
         album: r.album.clone(),
@@ -1745,16 +2052,10 @@ fn rekordbox_dto(r: &RekordboxRecord) -> IdentifyRekordboxRecordDto {
         year: r.year.clone(),
         comment: r.comment.clone(),
         isrc: r.isrc.clone(),
+        artwork: r.artwork,
     }
 }
 
-/// Seconds since the Unix epoch as RFC 3339 in UTC; "" when out of range.
-fn rfc3339(unix: i64) -> String {
-    time::OffsetDateTime::from_unix_timestamp(unix)
-        .ok()
-        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
-        .unwrap_or_default()
-}
 
 /// A model enum as the frontend spells it: its serde name with the first
 /// letter lowercased (`CatalogNumber` → `catalogNumber`). Derived rather
@@ -1788,13 +2089,17 @@ fn change_dto(change: &FieldChange) -> FieldChangeDto {
 fn item_dto(store: &Store, item: &QueueItem) -> AppResult<IdentifyQueueItemDto> {
     let mut dto = queue_item_dto(item);
     if dto.undoable {
+        let written = store.written_to(item.result).map_err(store_error)?;
         let last = store.last_application(item.result).map_err(store_error)?;
-        dto.undoable = match last {
-            Some(application) if application.undone_unix.is_none() => {
+        let file_undoable = match last {
+            Some(application) if application.undone_unix.is_none() && written.file => {
                 store.application_after_snapshot(application.id).map_err(store_error)?.is_some()
             }
             _ => false,
         };
+        dto.undoable = written.library || file_undoable;
+        dto.in_library = written.library;
+        dto.in_file = written.file;
     }
     Ok(dto)
 }
@@ -1812,6 +2117,8 @@ fn queue_item_dto(item: &QueueItem) -> IdentifyQueueItemDto {
         changes: item.proposal.as_ref().map(|p: &Proposal| p.changes.iter().map(change_dto).collect()).unwrap_or_default(),
         updated_unix: item.updated_unix,
         undoable: item.state.is_applied(),
+        in_library: false,
+        in_file: false,
         source: item.source.as_ref().map(camel),
         waiting: item.waiting.as_ref().map(|w| IdentifyWaitingDto {
             since_unix: w.since_unix,
@@ -2195,7 +2502,7 @@ mod tests {
         assert_eq!(detail.candidates[0].source, "fingerprint");
         assert_eq!(detail.item.source.as_deref(), Some("fingerprint"));
         assert_eq!(unknown.source, None, "no proposal, no source");
-        assert_eq!(detail.rekordbox, None, "the fake job imported no record");
+        assert_eq!(state.imported_record(detail.item.result_id), None, "the fake job imported no record");
         assert_eq!(detail.artwork.as_ref().map(|a| a.source.as_str()), Some("coverArtArchive"));
         assert!(!detail.write_in_progress);
 
@@ -2272,7 +2579,7 @@ mod tests {
     }
 
     fn locked(result: ResultId) -> IdentifyWriteOutcomeDto {
-        IdentifyWriteOutcomeDto { result_id: result, ok: false, error: Some(FILE_WRITES_OFF.to_owned()), deferred: false }
+        IdentifyWriteOutcomeDto { result_id: result, ok: false, error: Some(FILE_WRITES_OFF.to_owned()), deferred: false, note: None }
     }
 
     #[test]
@@ -2368,6 +2675,14 @@ mod tests {
         let next_run = writable(dir.path().join("identify"));
         assert_eq!(next_run.settle_on_start(), [result]);
         assert_eq!(next_run.detail(result).unwrap().item.state, "applied");
+    }
+
+    impl IdentifyState {
+        /// The rekordbox record imported with a result (results made before
+        /// the switch, and the headless import's).
+        pub(crate) fn imported_record(&self, result: ResultId) -> Option<RekordboxRecord> {
+            self.with_store(|store| store.rekordbox_record(result).map_err(store_error)).unwrap()
+        }
     }
 
     /// State in `root` that sees no environment and no developer's file.
@@ -2640,11 +2955,11 @@ mod tests {
         job.rekordbox = Some(record.clone());
         run(&state, &[job], &Fake::new(), &AtomicBool::new(false));
         let item = state.queue(QueueFilter::NeedsReview, 0, 10).unwrap().items.remove(0);
-        let shown = state.detail(item.result_id).unwrap().rekordbox.unwrap();
-        assert_eq!(shown.imported_at, "2027-01-15T08:00:00Z");
+        let shown = state.imported_record(item.result_id).unwrap();
+        assert_eq!(shown.imported_unix, 1_800_000_000);
         assert_eq!((shown.title, shown.isrc, shown.year), (record.title, record.isrc, record.year));
         let json = serde_json::to_value(state.detail(item.result_id).unwrap()).unwrap();
-        assert!(json["rekordbox"]["importedAt"].is_string() && json["item"]["source"] == "fingerprint", "{json}");
+        assert!(json["library"].is_null() && json["item"]["source"] == "fingerprint", "{json}");
     }
 
     #[test]
@@ -3098,5 +3413,384 @@ mod tests {
         assert_eq!(parse_field("catalogNumber"), Some(Field::CatalogNumber));
         assert_eq!(parse_field("bpm"), None);
         assert_eq!(parse_field(""), None);
+    }
+
+    // ------------------------------------------------- rbxport's own library
+
+    /// rbxport's library, in memory: each write is kept (before, after) so
+    /// the tests can check what undo puts back. `fail` refuses every write.
+    #[derive(Default)]
+    struct FakeLibrary {
+        records: Mutex<std::collections::HashMap<String, library::LibraryRecord>>,
+        writes: Mutex<Vec<(String, library::LibraryRecord, library::LibraryRecord)>>,
+        fail: AtomicBool,
+    }
+
+    impl FakeLibrary {
+        fn with(track: &str, record: library::LibraryRecord) -> Arc<Self> {
+            let fake = Self::default();
+            fake.records.lock().insert(track.to_owned(), record);
+            Arc::new(fake)
+        }
+
+        fn get(&self, track: &str) -> library::LibraryRecord {
+            self.records.lock().get(track).cloned().unwrap_or_default()
+        }
+
+        fn set(&self, track: &str, record: library::LibraryRecord) {
+            self.records.lock().insert(track.to_owned(), record);
+        }
+    }
+
+    impl library::LibrarySide for FakeLibrary {
+        fn record(&self, track: &str) -> Result<library::LibraryRecord, String> {
+            self.records.lock().get(track).cloned().ok_or_else(|| "no such track".to_owned())
+        }
+
+        fn write(&self, track: &str, values: &[library::LibraryValue]) -> Result<String, String> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("the disk is full".to_owned());
+            }
+            let before = self.record(track)?;
+            let mut after = before.clone();
+            for value in values {
+                match value {
+                    library::LibraryValue::Text(field, text) => {
+                        let text = text.clone();
+                        match field {
+                            Field::Title => after.title = text,
+                            Field::Artist => after.artist = text,
+                            Field::Album => after.album = text,
+                            Field::Label => after.label = text,
+                            Field::Genre => after.genre = text,
+                            Field::Year => after.year = library::year_of(&text),
+                            Field::SubGenre => after.comment = text,
+                            Field::Isrc => after.isrc = text,
+                            other => return Err(format!("no {other:?}")),
+                        }
+                    }
+                    library::LibraryValue::Artwork(..) => after.artwork = true,
+                }
+            }
+            self.set(track, after.clone());
+            let mut writes = self.writes.lock();
+            writes.push((track.to_owned(), before, after));
+            Ok((writes.len() - 1).to_string())
+        }
+
+        fn still_holds(&self, edits_json: &str) -> Result<bool, String> {
+            let index: usize = edits_json.parse().map_err(|_| "bad edits".to_owned())?;
+            let writes = self.writes.lock();
+            let (track, _, after) = writes.get(index).ok_or("no such write")?;
+            Ok(self.records.lock().get(track) == Some(after))
+        }
+
+        fn undo(&self, edits_json: &str) -> Result<(), String> {
+            if !self.still_holds(edits_json)? {
+                return Err("changed since".to_owned());
+            }
+            let index: usize = edits_json.parse().map_err(|_| "bad edits".to_owned())?;
+            let (track, before, _) = self.writes.lock().get(index).cloned().ok_or("no such write")?;
+            self.set(&track, before);
+            Ok(())
+        }
+    }
+
+    /// State with rbxport's library `fake`, Library Protection off, and
+    /// file writes as `file_writes`.
+    fn with_library(root: impl Into<PathBuf>, fake: &Arc<FakeLibrary>, file_writes: bool) -> IdentifyState {
+        let state = IdentifyState::with_root(root);
+        set_file_writes(&state, file_writes);
+        state.set_library(Arc::clone(fake) as Arc<dyn library::LibrarySide>);
+        state.set_library_protected(false);
+        state
+    }
+
+    fn title_and_catalog() -> Vec<FieldChange> {
+        vec![
+            FieldChange { field: Field::Title, current: String::new(), proposed: "New Title (Extended Mix)".into() },
+            FieldChange { field: Field::CatalogNumber, current: String::new(), proposed: "CAT001".into() },
+        ]
+    }
+
+    #[test]
+    fn with_file_writes_off_accept_writes_the_library_only_and_undo_puts_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let fake = FakeLibrary::with("42", library::LibraryRecord { title: "Old".into(), ..Default::default() });
+        let identify = with_library(dir.path().join("identify"), &fake, false);
+        let result = identified(&identify, &audio, "42", title_and_catalog());
+
+        let detail = identify.detail(result).unwrap();
+        assert_eq!(detail.library.as_ref().map(|l| l.title.as_str()), Some("Old"), "the review shows the library's own value");
+
+        let outcome = identify.apply_items(&ticked(result, &["title", "catalogNumber"])).remove(0);
+        assert!(outcome.ok, "{outcome:?}");
+        assert_eq!(outcome.note.as_deref(), Some(FILE_NOT_WRITTEN_OFF));
+        assert_eq!(fake.get("42").title, "New Title (Extended Mix)");
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "the file is not touched");
+        let item = identify.detail(result).unwrap().item;
+        assert_eq!((item.state.as_str(), item.undoable, item.in_library, item.in_file), ("applied", true, true, false));
+
+        let undone = identify.undo_item(result);
+        assert!(undone.ok, "{undone:?}");
+        assert_eq!(fake.get("42").title, "Old");
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        assert_eq!(identify.detail(result).unwrap().item.state, "undone");
+        assert!(!identify.undo_item(result).ok, "once");
+    }
+
+    #[test]
+    fn with_file_writes_on_accept_writes_both_and_undo_puts_both_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let fake = FakeLibrary::with("42", library::LibraryRecord::default());
+        let identify = with_library(dir.path().join("identify"), &fake, true);
+        let result = identified(&identify, &audio, "42", title_and_catalog());
+
+        let outcome = identify.apply_items(&ticked(result, &["title", "catalogNumber"])).remove(0);
+        assert!(outcome.ok && outcome.note.is_none(), "{outcome:?}");
+        assert_eq!(fake.get("42").title, "New Title (Extended Mix)");
+        let written = tags::read(&audio).unwrap().snapshot;
+        assert_eq!(rbl_identify::pipeline::current(&written, Field::Title), "New Title (Extended Mix)");
+        assert_eq!(rbl_identify::pipeline::current(&written, Field::CatalogNumber), "CAT001");
+        let item = identify.detail(result).unwrap().item;
+        assert_eq!((item.state.as_str(), item.in_library, item.in_file), ("applied", true, true));
+
+        let undone = identify.undo_item(result);
+        assert!(undone.ok, "{undone:?}");
+        assert_eq!(fake.get("42").title, "");
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "the file byte for byte");
+        assert_eq!(identify.detail(result).unwrap().item.state, "undone");
+    }
+
+    #[test]
+    fn undo_with_file_writes_off_is_refused_when_the_file_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let fake = FakeLibrary::with("42", library::LibraryRecord::default());
+        let identify = with_library(dir.path().join("identify"), &fake, true);
+        let result = identified(&identify, &audio, "42", title_and_catalog());
+        assert!(identify.apply_items(&ticked(result, &["title"]))[0].ok);
+        let written = std::fs::read(&audio).unwrap();
+
+        set_file_writes(&identify, false);
+        let refused = identify.undo_item(result);
+        assert_eq!(refused.error.as_deref(), Some(FILE_WRITES_OFF), "{refused:?}");
+        assert_eq!(fake.get("42").title, "New Title (Extended Mix)", "neither is put back");
+        assert_eq!(std::fs::read(&audio).unwrap(), written);
+        assert_eq!(identify.detail(result).unwrap().item.state, "applied");
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_written_stops_the_file_write_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let fake = FakeLibrary::with("42", library::LibraryRecord::default());
+        fake.fail.store(true, Ordering::SeqCst);
+        let identify = with_library(dir.path().join("identify"), &fake, true);
+        let result = identified(&identify, &audio, "42", title_and_catalog());
+
+        let outcome = identify.apply_items(&ticked(result, &["title", "catalogNumber"])).remove(0);
+        assert!(!outcome.ok && outcome.error.as_deref().unwrap_or_default().contains("the disk is full"), "{outcome:?}");
+        assert_eq!(std::fs::read(&audio).unwrap(), original, "nothing was written to the file");
+        assert_eq!(identify.detail(result).unwrap().item.state, "pending", "back in review");
+    }
+
+    #[test]
+    fn library_protection_refuses_the_write_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let original = std::fs::read(&audio).unwrap();
+        let fake = FakeLibrary::with("42", library::LibraryRecord::default());
+        let identify = with_library(dir.path().join("identify"), &fake, true);
+        identify.set_library_protected(true);
+        let result = identified(&identify, &audio, "42", title_and_catalog());
+
+        let outcome = identify.apply_items(&ticked(result, &["title", "catalogNumber"])).remove(0);
+        assert_eq!(outcome.error.as_deref(), Some(LIBRARY_PROTECTED), "{outcome:?}");
+        assert_eq!(fake.get("42"), library::LibraryRecord::default());
+        assert_eq!(std::fs::read(&audio).unwrap(), original);
+        assert_eq!(identify.detail(result).unwrap().item.state, "pending");
+    }
+
+    #[test]
+    fn undo_is_refused_when_the_library_changed_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let fake = FakeLibrary::with("42", library::LibraryRecord::default());
+        let identify = with_library(dir.path().join("identify"), &fake, true);
+        let result = identified(&identify, &audio, "42", title_and_catalog());
+        assert!(identify.apply_items(&ticked(result, &["title"]))[0].ok);
+        let written = std::fs::read(&audio).unwrap();
+        // Edited in rbxport after Identify wrote it.
+        fake.set("42", library::LibraryRecord { title: "Typed by hand".into(), ..Default::default() });
+
+        let refused = identify.undo_item(result);
+        assert!(!refused.ok && refused.error.as_deref().unwrap_or_default().contains("changed in rbxport's library"), "{refused:?}");
+        assert_eq!(fake.get("42").title, "Typed by hand", "the edit is kept");
+        assert_eq!(std::fs::read(&audio).unwrap(), written, "the file is not put back alone");
+        assert_eq!(identify.detail(result).unwrap().item.state, "applied");
+    }
+
+    #[test]
+    fn the_sub_genre_is_appended_to_the_librarys_own_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let fake = FakeLibrary::with("42", library::LibraryRecord { comment: "Played at the club".into(), ..Default::default() });
+        let identify = with_library(dir.path().join("identify"), &fake, false);
+        let changes = vec![FieldChange {
+            field: Field::SubGenre,
+            current: "Purchased at Beatport.com".into(),
+            proposed: "Purchased at Beatport.com; Tech House".into(),
+        }];
+        let result = identified(&identify, &audio, "42", changes);
+        assert!(identify.apply_items(&ticked(result, &["subGenre"]))[0].ok);
+        assert_eq!(fake.get("42").comment, "Played at the club; Tech House", "the library's text is kept");
+    }
+
+    #[test]
+    fn auto_apply_with_file_writes_off_fills_the_library_and_can_be_undone() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let fake = FakeLibrary::with("auto.mp3", library::LibraryRecord::default());
+        let identify = with_library(root.path(), &fake, false);
+        run(&identify, &[track(files.path(), "auto.mp3", true)], &Fake::new(), &AtomicBool::new(false));
+
+        let applied = identify.queue(QueueFilter::Applied, 0, 10).unwrap();
+        assert_eq!(applied.total, 1, "{applied:?}");
+        let item = &applied.items[0];
+        assert_eq!((item.state.as_str(), item.in_library, item.in_file), ("autoApplied", true, false));
+        assert_eq!(fake.get("auto.mp3").title, "The Music (Extended Mix)");
+        assert_eq!(std::fs::read(files.path().join("auto.mp3")).unwrap(), b"x", "the file is not touched");
+
+        assert!(identify.undo_item(item.result_id).ok);
+        assert_eq!(fake.get("auto.mp3").title, "");
+    }
+
+    #[test]
+    fn auto_apply_never_replaces_what_the_library_holds() {
+        let files = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let fake = FakeLibrary::with("auto.mp3", library::LibraryRecord { title: "My own title".into(), ..Default::default() });
+        let identify = with_library(root.path(), &fake, false);
+        run(&identify, &[track(files.path(), "auto.mp3", true)], &Fake::new(), &AtomicBool::new(false));
+
+        assert_eq!(identify.queue(QueueFilter::Applied, 0, 10).unwrap().total, 0);
+        let review = identify.queue(QueueFilter::NeedsReview, 0, 10).unwrap();
+        assert_eq!(review.total, 1);
+        let detail = identify.detail(review.items[0].result_id).unwrap();
+        assert!(detail.warnings.iter().any(|w| w.contains("already holds a different title")), "{:?}", detail.warnings);
+        assert_eq!(fake.get("auto.mp3").title, "My own title");
+    }
+
+    #[test]
+    fn a_cancelled_waiting_write_keeps_the_library_write_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("track.wav");
+        wav(&audio);
+        let fake = FakeLibrary::with("42", library::LibraryRecord::default());
+        let identify = with_library(dir.path().join("identify"), &fake, true);
+        let result = identified(&identify, &audio, "42", title_and_catalog());
+        // A file another program holds: the library is written, the file waits.
+        identify.with_store(|store| {
+            store.set_state(result, ReviewState::Accepted).map_err(store_error)?;
+            Ok(())
+        }).unwrap();
+        let edits = library::LibrarySide::write(fake.as_ref(), "42", &[library::LibraryValue::Text(Field::Title, "New Title (Extended Mix)".into())]).unwrap();
+        identify.with_store(|store| {
+            store.record_library_write(result, "42", &[Field::Title], &edits).map_err(store_error)?;
+            store.defer_write(result, &[Field::Title, Field::CatalogNumber], "open elsewhere").map_err(store_error)?;
+            Ok(())
+        }).unwrap();
+
+        let item = identify.cancel_waiting(result).unwrap();
+        assert_eq!((item.state.as_str(), item.in_library, item.in_file), ("applied", true, false));
+        assert!(identify.undo_item(result).ok);
+        assert_eq!(fake.get("42").title, "");
+    }
+
+    #[test]
+    fn the_app_library_writes_through_the_edit_path_and_undo_checks_it_first() {
+        use library::LibrarySide as _;
+        let dir = tempfile::tempdir().unwrap();
+        let location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (index, _) = rbl_index::load(&db).unwrap();
+        drop(db);
+        let state = Arc::new(AppState::with_backups(dir.path().join("backups")));
+        state.set_library(index, false, None, 0, location.clone());
+        let generations = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&generations);
+        let side = library::AppLibrary::new(Arc::clone(&state), Box::new(move |g| seen.lock().push(g)));
+        let track = rbl_db::fixture::track_id(1);
+        let before = side.record(&track).unwrap();
+
+        let edits = side
+            .write(
+                &track,
+                &[
+                    library::LibraryValue::Text(Field::Title, "Written by Identify".into()),
+                    library::LibraryValue::Text(Field::Year, "2014-05-01".into()),
+                    library::LibraryValue::Text(Field::Isrc, "GBAAA1400001".into()),
+                    library::LibraryValue::Text(Field::SubGenre, "Tech House".into()),
+                ],
+            )
+            .unwrap();
+        let after = side.record(&track).unwrap();
+        assert_eq!((after.title.as_str(), after.year.as_str(), after.isrc.as_str(), after.comment.as_str()),
+            ("Written by Identify", "2014", "GBAAA1400001", "Tech House"));
+        assert_eq!(generations.lock().len(), 1, "announced once, as library:changed");
+        assert!(side.still_holds(&edits).unwrap());
+
+        // Persisted, not only in the index.
+        let reopened = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let isrc: String = reopened.connection().query_row("SELECT ISRC FROM djmdContent WHERE ID = ?1", [&track], |r| r.get(0)).unwrap();
+        assert_eq!(isrc, "GBAAA1400001");
+        drop(reopened);
+
+        side.undo(&edits).unwrap();
+        assert_eq!(side.record(&track).unwrap(), before, "every value exactly as it was");
+        assert!(!side.still_holds(&edits).unwrap(), "undone");
+
+        // A later edit by hand: the undo is refused and the edit stays.
+        let edits = side.write(&track, &[library::LibraryValue::Text(Field::Title, "Again".into())]).unwrap();
+        state
+            .write_then(|w| w.set_field(&track, rbl_db::write::TrackField::Title, "By hand"), |db, _| {
+                crate::commands::refresh_after_edit(&state, db, crate::commands::Touched::Tracks)
+            })
+            .unwrap();
+        assert!(!side.still_holds(&edits).unwrap());
+        assert!(side.undo(&edits).is_err());
+        assert_eq!(side.record(&track).unwrap().title, "By hand");
+    }
+
+    #[test]
+    fn rekordboxs_library_is_never_written_by_identify() {
+        use library::LibrarySide as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut location = rbl_db::fixture::build(dir.path(), rbl_db::fixture::Shape::default()).unwrap();
+        let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly).unwrap();
+        let (index, _) = rbl_index::load(&db).unwrap();
+        drop(db);
+        location.is_rekordbox_install = true;
+        let state = Arc::new(AppState::with_backups(dir.path().join("backups")));
+        state.set_library(index, true, None, 0, location);
+        let side = library::AppLibrary::new(Arc::clone(&state), Box::new(|_| {}));
+        let track = rbl_db::fixture::track_id(1);
+        let before = side.record(&track).unwrap();
+        let refused = side.write(&track, &[library::LibraryValue::Text(Field::Title, "Never".into())]).unwrap_err();
+        assert!(refused.contains("rekordbox's library"), "{refused}");
+        assert_eq!(side.record(&track).unwrap(), before);
     }
 }

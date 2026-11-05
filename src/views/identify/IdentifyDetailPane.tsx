@@ -9,13 +9,14 @@
  * with its ticked fields, says why, and offers Retry now and Cancel write. A
  * deferred write is a notice, not an error.
  *
- * While audio-file writes are off, Accept, Undo and Retry now are disabled
- * with the reason as their tooltip; Reject, Edit and Back to review only
- * change the identify store, so they stay.
+ * Accept writes rbxport's library and, while audio-file writes are on, the
+ * file; Undo puts back both. While the library is locked (Library
+ * Protection, or a read-only library) Accept and Undo are disabled with the
+ * reason as their tooltip; Retry now needs audio-file writes on. Reject,
+ * Edit and Back to review only change the identify store, so they stay.
  *
- * One way: Accept and Undo write the audio file's tags and nothing else.
- * The rekordbox record imported when the track was identified is shown
- * under a field it disagrees with, for reference; it is never written.
+ * What rbxport's library holds is shown under a field it disagrees with:
+ * that value is the one Accept replaces there.
  */
 import { useCallback, useEffect, useState } from "react";
 
@@ -24,8 +25,8 @@ import type { IdentifyDetail, IdentifyField, IdentifyReviewAction } from "@/ipc/
 import { useTranslation } from "@/i18n";
 import { errorMessage } from "@/lib/errorMessage";
 import {
-  canApply, changes, decisionLabel, defaultFields, fieldLabel, formatScore, rekordboxValue, reloadHint, sourceLabel,
-  stateLabel, trackName, waitingLabel, waitingNotice, WRITES_OFF_NOTICE_ID,
+  canApply, changes, decisionLabel, defaultFields, fieldLabel, formatScore, libraryValue, sourceLabel,
+  stateLabel, trackName, waitingLabel, waitingNotice, writeTargetHint, WRITES_OFF_NOTICE_ID,
 } from "./identifyText";
 import styles from "./IdentifyPanel.module.css";
 
@@ -42,6 +43,11 @@ function deferred(outcome: unknown): boolean {
   return !!outcome && typeof outcome === "object" && "deferred" in outcome && outcome.deferred === true;
 }
 
+/** What an answer says beside a write that landed in the library only. */
+function noted(outcome: unknown): string | null {
+  return !!outcome && typeof outcome === "object" && "note" in outcome && typeof outcome.note === "string" ? outcome.note : null;
+}
+
 /** An answer that says it failed, from a call that resolves rather than throws. */
 function refused(outcome: unknown): string | null {
   if (deferred(outcome)) return null;
@@ -55,13 +61,17 @@ export interface IdentifyDetailPaneProps {
   resultId: number;
   /** After a call of this pane's own changed the result. */
   onChanged: () => void;
-  /** Writing to audio files is off, or not yet known to be on: nothing here may write. */
+  /** Writing to audio files is off, or not yet known to be on: no file is written. */
   writesOff?: boolean;
-  /** Why, when writes are known to be off; shown as the write buttons' tooltip. */
+  /** Why, when writes are known to be off; shown as Retry now's tooltip. */
   writesOffReason?: string | null;
+  /** Why rbxport's library cannot be written now (Library Protection, a read-only library); null when it can. */
+  libraryLocked?: string | null;
 }
 
-export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, writesOffReason = null }: IdentifyDetailPaneProps) {
+export function IdentifyDetailPane({
+  resultId, onChanged, writesOff = false, writesOffReason = null, libraryLocked = null,
+}: IdentifyDetailPaneProps) {
   const t = useTranslation();
   const [detail, setDetail] = useState<IdentifyDetail | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -124,7 +134,9 @@ export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, wri
       const why = refused(outcomes.find((o) => refused(o) !== null));
       if (why !== null) setError(why || t("The change could not be made."));
       const waiting = outcomes.filter(deferred).length;
+      const libraryOnly = outcomes.map(noted).find((n) => n !== null);
       if (waiting > 0) setNote(waitingNotice(waiting, t));
+      else if (libraryOnly) setNote(libraryOnly);
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -139,13 +151,14 @@ export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, wri
   }
   if (detail === null) return <div className={styles.detailEmpty}>{t("Loading…")}</div>;
 
-  const { item, rekordbox } = detail;
-  const written = item.state === "applied" || item.state === "autoApplied" || item.state === "undone";
+  const { item, library } = detail;
   // A waiting write is settled by Retry now or Cancel write first.
   const waiting = item.waiting !== null;
   const writable = canApply(item.state) && !detail.writeInProgress && !waiting;
   const lockTitle = writesOff && writesOffReason !== null ? writesOffReason : undefined;
   const lockNote = lockTitle !== undefined ? WRITES_OFF_NOTICE_ID : undefined;
+  // Undo puts the file back too when the write reached it, which needs writes on.
+  const undoLock = libraryLocked ?? (writesOff && item.inFile ? (writesOffReason ?? undefined) : undefined);
   const reviewable = (item.state === "pending" || item.state === "accepted") && !detail.writeInProgress && !waiting;
   const setState = (action: IdentifyReviewAction) =>
     void run(async () => (await getBackend()).identify.setState(item.resultId, action));
@@ -217,7 +230,7 @@ export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, wri
               {item.changes.map((change) => {
                 const label = fieldLabel(change.field, t);
                 const same = !changes(change);
-                const inRekordbox = rekordbox ? rekordboxValue(change.field, rekordbox) : null;
+                const inLibrary = library ? libraryValue(change.field, library) : null;
                 return (
                   <tr key={change.field} data-same={same || undefined}>
                     <td>
@@ -232,9 +245,9 @@ export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, wri
                     <th scope="row" className={styles.fieldName}>{label}</th>
                     <td className={styles.current}>
                       {change.current || <span className={styles.none}>{t("(empty)")}</span>}
-                      {inRekordbox !== null && inRekordbox !== change.current ? (
-                        <span className={styles.rekordbox}>
-                          {t("rekordbox: {value}", { value: inRekordbox || t("(empty)") })}
+                      {inLibrary !== null && inLibrary !== change.current ? (
+                        <span className={styles.library}>
+                          {t("In library: {value}", { value: inLibrary || t("(empty)") })}
                         </span>
                       ) : null}
                     </td>
@@ -300,17 +313,18 @@ export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, wri
       ) : null}
 
       {writable && item.changes.length > 0 ? (
-        <p className={styles.hint}>{t("Only the tags in the audio files are written; the rekordbox library is not changed.")}</p>
+        <p className={styles.hint}>{libraryLocked ?? writeTargetHint(!writesOff, t)}</p>
       ) : null}
-      {written ? <p className={styles.hint} role="note">{reloadHint(t)}</p> : null}
+      {(item.state === "applied" || item.state === "autoApplied") && item.inLibrary && !item.inFile ? (
+        <p className={styles.hint} role="note">{t("Written to rbxport's library only; the audio file was not changed.")}</p>
+      ) : null}
 
       <div className={styles.actions}>
         <button
           type="button"
           className={styles.button}
-          disabled={!writable || busy || writesOff || ticked.size === 0}
-          title={writable ? lockTitle : undefined}
-          aria-describedby={writable ? lockNote : undefined}
+          disabled={!writable || busy || libraryLocked !== null || ticked.size === 0}
+          title={writable ? (libraryLocked ?? undefined) : undefined}
           onClick={accept}
         >
           {t("Accept")}
@@ -324,8 +338,8 @@ export function IdentifyDetailPane({ resultId, onChanged, writesOff = false, wri
           </button>
         ) : null}
         {item.undoable ? (
-          <button type="button" className={styles.button} disabled={busy || writesOff} title={lockTitle}
-            aria-describedby={lockNote} onClick={undo}>
+          <button type="button" className={styles.button} disabled={busy || undoLock !== undefined} title={undoLock}
+            onClick={undo}>
             {t("Undo")}
           </button>
         ) : null}
