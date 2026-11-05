@@ -18,6 +18,7 @@ Commands in these guides run from the repository root unless stated otherwise.
 
 ## Using the app
 
+- [Library and import](user/library-and-import.md): where the library lives, and importing from rekordbox, again and again.
 - [Track analysis settings](user/analysis-settings.md): choosing stages and queuing a batch.
 - [USB export](user/usb-export.md): compatibility conversion and playlist cleanup.
 - [Backups](user/backups.md): backup contents, storage, and restoration.

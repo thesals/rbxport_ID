@@ -1,6 +1,6 @@
 # Own library — specification
 
-Status: Phase 4 complete; waiting for approval to start Phase 5. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
+Status: Phase 5 complete; all phases done. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
 
 ## Goal
 
@@ -224,6 +224,22 @@ Phase 4 (2026-11-04): how Identify writes now.
 - **Waiting writes:** the library is written before the file is found in use. A waiting write that is cancelled or dropped leaves the result applied, library only, rather than back in review with the library already edited.
 - **Library Protection** is passed to the backend (`identify_set_library_protected`) and blocks every Identify write, auto-apply included; the backend assumes it is on until told. The headless import has no library and writes nothing, as before.
 - **Retired:** new results import no `rekordbox_imports` row (the headless import still records its copy's record, for its report). The review's "rekordbox: …" rows are now "In library: …", read live from rbxport's library, and the Reload Tag hint is gone.
+
+Phase 5 (2026-11-05): the repeat import, as built.
+- **Entry point:** File › Import from rekordbox… (`reimport_rekordbox`, `rbl_db::rekordbox_import::import_again`), refused like any other write while the library is read-only or protected. It backs the library up first (`Writer::back_up_now`), makes the same verified copy as the first import (H2) in a staging folder beside the library folder, and reloads the library afterwards. rekordbox's `share/` is read in place, as by the first import.
+- **One transaction:** every row is written in one transaction on rbxport's library. The files a track takes are copied first, each to a path where nothing is yet (never over a file); if the transaction fails, those copies are removed. `import.db` is written after the library commits; its mappings use `INSERT OR REPLACE`, so a rekordbox row that took over an rbxport track from a row rekordbox has since removed is remapped.
+- **Matching:** a mapping is used only if rekordbox's UUID for that ID still matches. A path match never takes a track another mapping holds; a second rekordbox track with the same file is left out (reported) and its playlist entries point at the first. A mapped track deleted in rbxport stays deleted (H4 the other way round).
+- **New tracks:** every column of rekordbox's row that rbxport's table has, under a fresh ID; artists, album (by name and album artist), genre, label, key and My Tags are found again by name, or made. rekordbox's UUID is kept unless rbxport already has it. `MasterDBID`/`DeviceID` are rbxport's own, `rb_file_id` is left unset, as for a file rbxport adds. A track whose analysis files can't be copied comes in unanalysed, and is queued for analysis when that preference is on.
+- **The tag rule:** rbxport's tag fields compared with the baseline, per track. A track matched by path has no baseline: its tags are kept, and when they already equal rekordbox's that becomes its baseline. Skipped tracks are listed with each differing field, rbxport's value and rekordbox's (shown, not applied; Q2 stays open).
+- **Fill only:** memory cues and hot cues separately; the analysis files (every file beside the `.DAT` with its stem) with the BPM and `Analysed` that go with them, when rbxport has no `.DAT` there; the key when rbxport has none; artwork (with its sizes) when rbxport has none.
+- **Playlists:** made in rekordbox's tree order, under the matching rbxport folder (at the top when that folder was deleted in rbxport). An intelligent playlist's rule gets its new ID. Appending needs rbxport's members to equal the baseline exactly; otherwise the playlist is reported with how many tracks rekordbox has that rbxport's lacks.
+- **History:** new sessions are made, in folders of the same names (made when missing). Each play of a track rbxport already had adds one to its `DJPlayCount`, since rekordbox's count for it was taken before.
+- **Report and log:** the report the window shows names every track; `import-log/<time>-import.txt` holds the same with each differing field, and the `imports` row is `kind = 'delta'`.
+- **XML and iTunes import, same rules where a document allows:** a document has no baselines, so a track already in rbxport keeps its tags; it gets the document's memory or hot cues only when it has none of that kind; a folder or playlist of the same name in the same place is reused and gets the tracks it lacks (so a second import no longer doubles the tree); nothing is removed.
+- **Checked on the real library** (2026-11-05), on a fresh copy of `master.db` (SHA-256 `565b7755…b795`, the same as Phase 2's) in a scratch folder, with rekordbox's `share/` read in place:
+  - `examples/import_dry_run.rs --again`: the first import again matched its source row for row (48 tables, 21,280 rows); the repeat import from the unchanged copy took nothing: 1,910 unchanged, no new, updated, skipped or filled tracks, no playlist or history changes, in 3.9 s.
+  - With edits on both scratch copies (a one-off script, not kept): a track retagged in the copy and untouched in rbxport took the new title; a track with its title edited in rbxport kept its title and comment and was reported with both fields; a track whose only hot cue was deleted in rbxport got rekordbox's back (fill only: rbxport had none of that kind); a track added to a playlist in the copy was appended. `PRAGMA integrity_check` was `ok` afterwards.
+  - rekordbox's `master.db` hashed the same before and after, and its `-wal`/`-shm` kept their sizes and times.
 
 ## Phases (stop after each for approval)
 
