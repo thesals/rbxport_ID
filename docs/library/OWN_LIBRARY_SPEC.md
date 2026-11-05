@@ -1,6 +1,6 @@
 # Own library — specification
 
-Status: Phase 5 complete; all phases done. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
+Status: Phase 5 complete; all phases done. Q1–Q3 answered (2026-11-05). Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
 
 ## Goal
 
@@ -230,7 +230,7 @@ Phase 5 (2026-11-05): the repeat import, as built.
 - **One transaction:** every row is written in one transaction on rbxport's library. The files a track takes are copied first, each to a path where nothing is yet (never over a file); if the transaction fails, those copies are removed. `import.db` is written after the library commits; its mappings use `INSERT OR REPLACE`, so a rekordbox row that took over an rbxport track from a row rekordbox has since removed is remapped.
 - **Matching:** a mapping is used only if rekordbox's UUID for that ID still matches. A path match never takes a track another mapping holds; a second rekordbox track with the same file is left out (reported) and its playlist entries point at the first. A mapped track deleted in rbxport stays deleted (H4 the other way round).
 - **New tracks:** every column of rekordbox's row that rbxport's table has, under a fresh ID; artists, album (by name and album artist), genre, label, key and My Tags are found again by name, or made. rekordbox's UUID is kept unless rbxport already has it. `MasterDBID`/`DeviceID` are rbxport's own, `rb_file_id` is left unset, as for a file rbxport adds. A track whose analysis files can't be copied comes in unanalysed, and is queued for analysis when that preference is on.
-- **The tag rule:** rbxport's tag fields compared with the baseline, per track. A track matched by path has no baseline: its tags are kept, and when they already equal rekordbox's that becomes its baseline. Skipped tracks are listed with each differing field, rbxport's value and rekordbox's (shown, not applied; Q2 stays open).
+- **The tag rule:** rbxport's tag fields compared with the baseline, per track. A track matched by path has no baseline: its tags are kept, and when they already equal rekordbox's that becomes its baseline. Skipped tracks are listed with each differing field, rbxport's value and rekordbox's (shown, not applied unless chosen; see Q2).
 - **Fill only:** memory cues and hot cues separately; the analysis files (every file beside the `.DAT` with its stem) with the BPM and `Analysed` that go with them, when rbxport has no `.DAT` there; the key when rbxport has none; artwork (with its sizes) when rbxport has none.
 - **Playlists:** made in rekordbox's tree order, under the matching rbxport folder (at the top when that folder was deleted in rbxport). An intelligent playlist's rule gets its new ID. Appending needs rbxport's members to equal the baseline exactly; otherwise the playlist is reported with how many tracks rekordbox has that rbxport's lacks.
 - **History:** new sessions are made, in folders of the same names (made when missing). Each play of a track rbxport already had adds one to its `DJPlayCount`, since rekordbox's count for it was taken before.
@@ -252,8 +252,8 @@ Phase 5 (2026-11-05): the repeat import, as built.
 | 4 | Identify writes the database and the file; Undo for both; retire `rekordbox_imports`; update the guide | Accept/Undo tested for the database and the file, with the lock on and off |
 | 5 | **Delta import**: matching, the per-track tag rule, fill-only for cues, grids and analysis, playlists, history, report; XML import on the same rules | Fixture scenarios: new track, untouched track updated, edited track skipped, path match, ID collision, playlist append |
 
-## Questions for later (not blocking Phase 1)
+## Questions (answered 2026-11-05: yes to all three)
 
-- **Q1.** Should the tag rule also count a rating or colour change made on a CDJ, written back over LINK, as an "edit in rbxport"? (The spec says yes, since it's in rbxport's database.)
-- **Q2.** Should the delta report let you take rekordbox's tags for some skipped tracks anyway? (Proposed for later; Phase 5 only reports.)
-- **Q3.** Should the database keep rekordbox's passphrase, or get its own key? Keeping it is simplest. It isn't a security boundary, since the passphrase is public in rekordbox's own install.
+- **Q1.** Should the tag rule also count a rating or colour change made on a CDJ, written back over LINK, as an "edit in rbxport"? **Yes.** LINK edits use the same write path as any other, so they are in rbxport's database and differ from the baseline; nothing more was needed. Tested: a rating set as LINK sets it keeps the track's tags.
+- **Q2.** Should the delta report let you take rekordbox's tags for some skipped tracks anyway? **Yes.** Each kept track in the report has a checkbox, with **Select all**, and **Take rekordbox's tags** imports again (`import_again` with a `Take`: rbxport ID → the differences shown). A chosen track takes rekordbox's tag fields and My Tags, by the same code as an untouched one, and its baseline becomes them, so it follows rekordbox again from then on. A choice holds only while the differences are still exactly the ones shown: if either side changed since, nothing is taken, the track is listed again as it is now, and the report says so. It goes through the same checked copy as any import, so rekordbox has to be closed for it too. It writes rbxport's library only; the audio files are not retagged, as with every import. Tested, including the stale choice and following rekordbox afterwards.
+- **Q3.** Should the database keep rekordbox's passphrase, or get its own key? **Keep it.** That's what Phase 2 built: rbxport's library uses the published passphrase rekordbox uses, and a source with any other is rekeyed to it. It isn't a security boundary, since the passphrase is public in rekordbox's own install.
