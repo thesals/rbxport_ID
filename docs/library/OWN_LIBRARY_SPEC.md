@@ -1,6 +1,6 @@
 # Own library — specification
 
-Status: Phase 3 complete; waiting for approval to start Phase 4. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
+Status: Phase 4 complete; waiting for approval to start Phase 5. Fork-only, like [Identify](../identify/IDENTIFY_SPEC.md).
 
 ## Goal
 
@@ -214,6 +214,16 @@ Phase 3 (2026-11-04): what changed, and the two places rekordbox still matters.
   - LINK, which rekordbox really holds the ports for (kept by design).
   - USB sync, whose refusal is in the export command (`commands.rs`, the sync preamble). H8 keeps the export path untouched, and rekordbox can write a stick it sees. Sync Manager reads a separate `rekordboxRunning` field for it, so the iTunes and play-history imports, which write only rbxport's library, no longer wait.
   - The first import's "close rekordbox and try again", when its library changed while being copied (H2).
+
+Phase 4 (2026-11-04): how Identify writes now.
+- **Order:** rbxport's library first, through `AppState::write_then` and `refresh_after_edit` (a full track reload, as the info panel's field edits do, since the quick metadata refresh doesn't re-read title, artist or year), then the file through the existing safe writer when "Write tags to audio files" is on. If the library write fails, nothing is written to the file, and any field that landed before the failure is put back.
+- **What the library takes:** title, artist, album, label, genre, year (`2014-05-01` becomes `2014`), ISRC (`ISRC` is now a writable column), the comment and artwork. The sub-genre's styles are appended to the library's own comment, never copied from the file's. The catalogue number and the MusicBrainz and Discogs IDs go to the file only; a result asking only for those is refused while file writes are off.
+- **File writes off:** the result is applied to the library only, and the outcome says the file was not written. No file write is queued for later, so turning writes on never writes results accepted while they were off. Undo of a result whose file was written is refused while writes are off (both are put back, or neither).
+- **Undo:** checks first that the library still holds exactly what the write left (`track_edits_still_hold`, per column) and that the file can be restored; either changed refuses the whole undo. The exact before and after values are kept as `TrackEditRecord` JSON in the identify store's new `library_writes` table (schema version 5, insert-only like the rest, with `library_undos`).
+- **Auto-apply:** also fills only what the library holds empty (or already holds as proposed); anything else there sends the result to review with the reason. With file writes off it now writes the library (`AutoApplied`, library only) rather than waiting for review.
+- **Waiting writes:** the library is written before the file is found in use. A waiting write that is cancelled or dropped leaves the result applied, library only, rather than back in review with the library already edited.
+- **Library Protection** is passed to the backend (`identify_set_library_protected`) and blocks every Identify write, auto-apply included; the backend assumes it is on until told. The headless import has no library and writes nothing, as before.
+- **Retired:** new results import no `rekordbox_imports` row (the headless import still records its copy's record, for its report). The review's "rekordbox: …" rows are now "In library: …", read live from rbxport's library, and the Reload Tag hint is gone.
 
 ## Phases (stop after each for approval)
 

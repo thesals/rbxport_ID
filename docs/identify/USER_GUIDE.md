@@ -6,17 +6,20 @@ It's a feature of this fork of rbxport only.
 
 ## What it changes, and what it never changes
 
-Identification is **one-way**.
+An accepted result is written in two places, in this order:
 
-- **rekordbox's library is never changed.** When a track is identified, its rekordbox record (title, artist, album, label, genre, year, comment, ISRC) is copied, read-only, into identification's own database. It's used only to show you where rekordbox and the file disagree.
-- **Only the audio file's tags are written.** That happens only when you apply a result, or when auto-apply does.
-- **rekordbox shows the new tags only after you reload them.** In rekordbox, select the tracks, right-click and choose **Reload Tag**. Until then it keeps its old values. That's why the review screen points out where rekordbox's record differs from the file.
+1. **rbxport's own library.** The ticked fields it keeps (title, artist, album, label, genre, year, ISRC, the comment and artwork) are changed there at once, the same way an edit in the information panel is. The browser shows the new values straight away.
+2. **The audio file's tags**, but only while **Write tags to audio files** is on (it's off by default). Fields rbxport's library doesn't keep, such as the catalogue number and the MusicBrainz and Discogs IDs, go to the file only.
 
-> **Before you use Reload Tag:** expect it to replace what rekordbox shows with what the file says, for every tag field. Any edit made only inside rekordbox for those tracks, shown in the review as "rekordbox: …", will most likely be lost. If you want to keep such an edit, untick that field before applying, or make the same edit in the review. We haven't yet confirmed exactly which fields rekordbox re-reads.
+If the library can't be written, nothing is written to the file either. If the file isn't written (writing is off, the file is open in a player, or the write fails), the library change stands, and the result says the file wasn't written.
+
+**rekordbox's library is never changed.** rbxport keeps its own library, imported from rekordbox's. Results identified before that switch still carry the rekordbox record that was copied with them, read-only; the review now shows rbxport's own library instead.
+
+**Library Protection** (Preferences → Advanced) locks Identify too: while it's on, Accept, Apply accepted, Undo and auto-apply write nothing.
 
 These are never changed: rating, colour, cue points, beat grid, BPM, key, or any analysis data. BPM and key always come from analysis, never from the internet. USB exports aren't affected.
 
-**The comment is only added to, never replaced.** Sub-genre styles from Discogs (for example "Minimal Techno; Tech House") are appended to the end of the file's comment, the one rekordbox shows after Reload Tag, after "; ". What the comment already says is kept, and the same styles are never added twice.
+**The comment is only added to, never replaced.** Sub-genre styles from Discogs (for example "Minimal Techno; Tech House") are appended after "; " to the end of the comment: the file's comment in the file, and the library's own comment in the library. What either comment already says is kept, and the same styles are never added twice.
 
 ## Setting up
 
@@ -40,9 +43,9 @@ Each service's rate limit is built in, so a large batch takes a while. MusicBrai
 
 ### Write tags to audio files
 
-**Write tags to audio files** is off by default. While it's off, identification only reads your files: proposals are saved for review, but nothing is written to any file. That includes Accept, Apply accepted, Undo, auto-apply and waiting writes. You can still review, reject and edit results, and mark them accepted with **Accept above**; they wait until writing is turned on.
+**Write tags to audio files** is off by default. While it's off, identification only reads your files. Accept, Apply accepted and auto-apply write rbxport's library only, and a result asking only for fields the library doesn't keep (the catalogue number, say) is refused. Undo puts the library back, but a result whose file was written can't be undone until writing is on again, since its file would have to be put back too.
 
-Turning it on asks you to confirm first. Waiting writes stay queued while it's off and are tried again once you turn it on. The lock is checked at every write, so switching it takes effect at once, even during a run.
+Turning it on asks you to confirm first. Turning it on doesn't write results you accepted while it was off; their files stay as they are. Waiting writes stay queued while it's off and are tried again once you turn it on. The lock is checked at every write, so switching it takes effect at once, even during a run.
 
 ### Genre
 
@@ -54,11 +57,11 @@ Whichever you choose, the styles are also offered for the comment, for review.
 
 ### Auto-apply
 
-Auto-apply is off by default, and works only while **Write tags to audio files** is on. When it's on, a result is written to the file during the run, without review, only if all of these are true:
+Auto-apply is off by default. When it's on, a result is written during the run, without review, to rbxport's library and (while **Write tags to audio files** is on) to the file, only if all of these are true:
 
 - the match came from the audio fingerprint, not a text search or Discogs;
 - the confidence score is at least the level you set, from 90% (the default) to 100%;
-- every change fills an **empty** field.
+- every change fills a field that's **empty** in the file, and in rbxport's library too (or already holds the same value there).
 
 Comment (sub-genre) changes and anything that would overwrite a value are never auto-applied. An auto-applied result appears under **Applied** and can be undone like any other. If the file is open in a player, the write waits until the file is free (see [Files in use](#files-in-use)); it isn't counted as identified until it's written. If its write fails for another reason, for example because the file is read-only, it stays under **Needs review** with the reason as a warning. If the write was interrupted partway, the result waits until the next start, which settles it (see [Safety](#safety)).
 
@@ -92,21 +95,23 @@ Open the review queue with **Review Identified Tracks**. Filter it by **Needs re
 Choose a row to see:
 
 - **Current against proposed** for every field, with a checkbox for each. Untick anything you don't want.
-- **rekordbox's value**, under any field where it differs from the file.
+- **The library's value** ("In library: …"), under any field where rbxport's library differs from the file. That's the value Accept replaces in the library.
 - **Edit**, to correct a proposed text value before it's written. The sub-genre and artwork can't be edited. BPM and key are never proposed.
 - **Candidates:** every release considered, with its score and source.
 - **Artwork**, offered only when the file has none, with its size and source.
 
 Then:
 
-- **Accept** writes the ticked fields to the file.
+- **Accept** writes the ticked fields to rbxport's library and, while writing to audio files is on, to the file.
 - **Reject** dismisses the result; nothing is written.
 - **Accept above** accepts every pending result scoring at least the threshold you choose (0.92 by default). Nothing is written yet.
 - **Apply accepted** writes accepted results after a confirmation, and **only fills empty fields**. A result with any overwrite or comment change is skipped entirely, and the confirmation says how many were skipped. Apply those from their own review.
 
 ## Undo
 
-Results under **Applied** can be undone, but only if the file hasn't changed since identification wrote it. If something else has written to it since, undo is refused rather than overwriting that change.
+Results under **Applied** can be undone. Undo puts back both what the library held and, when the file was written, the file's tags. It's refused, and nothing is put back, if either has changed since: a field you edited in rbxport afterwards, or a file something else has written to. That way undo never overwrites a later change.
+
+A result written to the library only says so in its review ("Written to rbxport's library only").
 
 What undo restores depends on the format:
 
@@ -135,7 +140,7 @@ If rbxport or the computer stops in the middle of a write, the next start checks
 
 ### Files in use
 
-When you apply a result, or auto-apply writes one, while another program has the file open, nothing is written and nothing fails. The result stays accepted and shows under **Waiting for file** with the fields to write. rbxport tries it again when it starts, when it closes (for up to about 10 seconds; a write that can't finish in time is stopped cleanly and waits for the next start), before every identification run and every apply, and when you choose **Retry now**. **Cancel write** drops it and puts the result back under **Needs review**.
+When you apply a result, or auto-apply writes one, while another program has the file open, the library is written but the file isn't, and nothing fails. The result stays accepted and shows under **Waiting for file** with the fields to write. rbxport tries it again when it starts, when it closes (for up to about 10 seconds; a write that can't finish in time is stopped cleanly and waits for the next start), before every identification run and every apply, and when you choose **Retry now**. **Cancel write** drops the file write. The library change stands, so the result stays under **Applied** (library only) and can be undone; a result with nothing in the library goes back to **Needs review**.
 
 Each try goes through the same checks as a normal apply. If the file still holds the tags you reviewed, the write is made and can be undone. If the file has changed meanwhile, the write is dropped and the result goes back to **Needs review** with a warning saying why. While a write waits you can't accept, reject or edit the result, or identify the track again; choose **Cancel write** first.
 
@@ -149,8 +154,8 @@ Everything lives in rbxport's data folder, under `rbxport\identify\` (on Windows
 
 | File | Contents |
 |---|---|
-| `identify.db` | Results, candidates, the copied rekordbox records, the original tags used for undo, and history |
+| `identify.db` | Results, candidates, the original tags and library values used for undo, history, and the rekordbox records copied with results made before the switch |
 | `.env.identify` | Your service keys |
 | `settings.json` | Genre policy, auto-apply and "Write tags to audio files" settings |
 
-Deleting the folder resets identification, without touching rekordbox or your music files. It also deletes your saved keys, and the original tags behind every applied change, so those changes can no longer be undone.
+Deleting the folder resets identification, without touching rekordbox, rbxport's library or your music files. It also deletes your saved keys, and the original values behind every applied change, so those changes can no longer be undone.
