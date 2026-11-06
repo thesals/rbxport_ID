@@ -1,0 +1,95 @@
+name: Fork release
+
+# The fork's own releases, which its installed apps update from. Every push
+# to main builds the Windows installer, signs the update with the fork's key
+# (secret TAURI_SIGNING_PRIVATE_KEY; the public half is in tauri.conf.json)
+# and publishes a GitHub release with latest.json, the feed the updater reads
+# at https://github.com/thesals/rbxport_ID/releases/latest/download/latest.json.
+#
+# Versions are <major>.<minor> from package.json and this workflow's run
+# number as the patch, so each release is newer than the last. Upstream's
+# release workflows (self-hosted runners, upstream's bucket) are not used.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the signing key is set
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::Add the repository secret TAURI_SIGNING_PRIVATE_KEY (the fork's updater key)."
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Use Strawberry Perl for vendored OpenSSL
+        shell: pwsh
+        run: |
+          $perl = "C:\Strawberry\perl\bin\perl.exe"
+          if (-not (Test-Path $perl)) { choco install strawberryperl -y --no-progress }
+          if (-not (Test-Path $perl)) { throw "Strawberry Perl is missing at $perl" }
+          "OPENSSL_SRC_PERL=$perl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Set this release's version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")"
+          version="$base.${{ github.run_number }}"
+          node scripts/sync-version.mjs --version "$version"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build, sign and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          CI: "true"
+        with:
+          tagName: v__VERSION__
+          releaseName: rbxport ID v__VERSION__
+          releaseBody: |
+            Built from ${{ github.sha }}.
+
+            Download the `-setup.exe` below to install. Installed copies update themselves.
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --bundles nsis

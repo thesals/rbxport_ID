@@ -66,13 +66,13 @@
     "resources": {
       "windows/install-update-task.ps1": "install-update-task.ps1"
     },
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM1NzM4N0E0RTUwMEE2RTMKUldUanBnRGxwSWR6eFgyT1A3NTV0SHRMU0JDVkpEeTY0MHhHc0x4RUpxNnNBQmdBZVpmUzJueVkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk2MjY5Mjg1QUM5RTBDNDkKUldSSkRKNnNoWkltbG4xUnhEV2tBZHkreWpndVdmMUM0TFBBSDdGTStYM3BRcXQ4QVZGdUJ6TkgK",
       "endpoints": [
-        "https://download.rbxport.com/latest.json"
+        "https://github.com/thesals/rbxport_ID/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "quiet"

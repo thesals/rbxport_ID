@@ -162,12 +162,11 @@ fn updater_error(message: &str, err: impl std::fmt::Display) -> AppError {
     AppError::new(ErrorKind::Internal, message).with_detail(err.to_string())
 }
 
-/// Whether this build takes updates from the download bucket. It doesn't:
-/// this checkout is a fork, and the bucket (with the key in
-/// `tauri.conf.json`) is upstream's, whose next release would silently
-/// replace the fork, Identify and rbxport's own library included. A fork
-/// release that publishes its own `latest.json` and key can turn this on.
-const TAKES_UPDATES: bool = false;
+/// Whether this build takes updates. The fork's come from its own GitHub
+/// releases (`.github/workflows/fork-release.yml`), signed with the fork's
+/// key in `tauri.conf.json`, never from upstream's bucket, whose releases
+/// would replace the fork. Turn this off for a build that must not update.
+const TAKES_UPDATES: bool = true;
 
 /// Asks the bucket what the newest version is.
 ///
