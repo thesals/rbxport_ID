@@ -162,6 +162,13 @@ fn updater_error(message: &str, err: impl std::fmt::Display) -> AppError {
     AppError::new(ErrorKind::Internal, message).with_detail(err.to_string())
 }
 
+/// Whether this build takes updates from the download bucket. It doesn't:
+/// this checkout is a fork, and the bucket (with the key in
+/// `tauri.conf.json`) is upstream's, whose next release would silently
+/// replace the fork, Identify and rbxport's own library included. A fork
+/// release that publishes its own `latest.json` and key can turn this on.
+const TAKES_UPDATES: bool = false;
+
 /// Asks the bucket what the newest version is.
 ///
 /// Network I/O, so it is awaited on the plugin's own client rather than run
@@ -173,6 +180,10 @@ pub async fn check_for_update(
     updates: tauri::State<'_, std::sync::Arc<Updates>>,
 ) -> AppResult<UpdateCheckDto> {
     let current_version = app.package_info().version.to_string();
+    if !TAKES_UPDATES {
+        *updates.pending.lock() = None;
+        return Ok(UpdateCheckDto { current_version, version: None, date: None, changes: Vec::new(), ready: None });
+    }
     let found = app
         .updater()
         .map_err(|e| updater_error("The updater is not configured.", e))?
