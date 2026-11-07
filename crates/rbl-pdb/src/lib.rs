@@ -179,12 +179,18 @@ impl<'a> Pdb<'a> {
 
             let page_flags = u1(p, 0x1b);
             let is_data_page = page_flags & 0x40 == 0;
-            let num_rows_small = u32::from(u1(p, 0x18));
+            // `0x18`–`0x1a` pack the row slots (low 13 bits) and the rows (11
+            // above); the slots are what the index holds, deleted rows
+            // included. `0x22` is a row count as well, which pages written
+            // before rbxport packed the word correctly need: they capped the
+            // slots at 255 [OBS 2026-11-07].
+            let packed = u32::from(u1(p, 0x18)) | u32::from(u1(p, 0x19)) << 8 | u32::from(u1(p, 0x1a)) << 16;
+            let num_row_offsets = packed & 0x1fff;
             let num_rows_large = u32::from(u2(p, 0x22));
-            let num_rows = if num_rows_large > num_rows_small && num_rows_large != 0x1fff {
+            let num_rows = if num_rows_large > num_row_offsets && num_rows_large != 0x1fff {
                 num_rows_large
             } else {
-                num_rows_small
+                num_row_offsets
             };
 
             if is_data_page && num_rows > 0 {

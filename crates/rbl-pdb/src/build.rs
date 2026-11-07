@@ -117,7 +117,7 @@ impl PageBuilder {
     /// Renders the page. Every row is marked present.
     ///
     /// The header fields follow rekordbox's own data pages [OBS 7.2.11]:
-    /// `0x18` the row count, `0x19` and `0x1a` derived from it, `0x1b` the
+    /// `0x18`–`0x1a` the row counts (see [`packed_row_counts`]), `0x1b` the
     /// flags `0x24`, `0x1c` the free bytes, `0x1e` the used bytes rounded
     /// up to four, `0x20` the row count again. Each row group ends in the
     /// present mask twice.
@@ -137,12 +137,7 @@ impl PageBuilder {
         page[0x0c..0x10].copy_from_slice(&self.next_page.to_le_bytes());
         page[0x10..0x14].copy_from_slice(&sequence.to_le_bytes());
         let rows_u16 = u16::try_from(num_rows).unwrap_or(u16::MAX);
-        page[0x18] = u8::try_from(num_rows.min(0xff)).unwrap_or(0xff);
-        // Two bytes rekordbox derives from the row count [OBS 7.2.11, twelve
-        // pages of 1 to 61 rows]: the count times 32 in its low byte, and
-        // the count over eight.
-        page[0x19] = u8::try_from((num_rows * 32) & 0xff).unwrap_or(0);
-        page[0x1a] = u8::try_from((num_rows / 8).min(0xff)).unwrap_or(0xff);
+        page[0x18..0x1b].copy_from_slice(&packed_row_counts(num_rows));
         page[0x1b] = 0x24; // ordinary data page
         let used = self.heap.len().div_ceil(4) * 4;
         // rekordbox's figure counts two bytes per row and four per group
@@ -188,6 +183,24 @@ impl PageBuilder {
 
         page
     }
+}
+
+/// Bytes `0x18`–`0x1a` of a data page: one 24-bit little-endian word holding
+/// the number of row slots in its low 13 bits and the number of rows in the
+/// 11 above. Every row written here is present, so the two are the same.
+///
+/// [OBS] rekordbox 7.2.14's 284-row playlist-entries page reads `1c 81 23`,
+/// which is 284 in both; pages of 1 to 61 rows [OBS 7.2.11] fit the same
+/// rule. This used to put the count in `0x18` alone, capped at 255, and
+/// derive the next two bytes from it: right up to 255 rows, and past that
+/// a page of 283 rows that said it had 255 slots. An XDJ-1000 (firmware
+/// 1.13) froze reading such a stick, where rekordbox's of the same playlist
+/// read [OBS 2026-11-07].
+fn packed_row_counts(num_rows: usize) -> [u8; 3] {
+    let n = u32::try_from(num_rows).unwrap_or(u32::MAX);
+    let packed = (n & 0x1fff) | ((n & 0x07ff) << 13);
+    let [a, b, c, _] = packed.to_le_bytes();
+    [a, b, c]
 }
 
 /// Row groups a page with this many rows has: sixteen rows to a group.
@@ -311,7 +324,8 @@ impl FileBuilder {
         // with rows keeps the rest of its pages back until it is "written".
         let mut held: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
         for (table_at, (page_type, mut table_pages)) in self.tables.into_iter().enumerate() {
-            let has_rows = table_pages.iter().any(|p| p[0x18] != 0 || p[0x22] != 0 || p[0x23] != 0);
+            // Any of the packed row-count bytes: 256 rows leaves `0x18` zero.
+            let has_rows = table_pages.iter().any(|p| p[0x18] != 0 || p[0x19] != 0 || p[0x1a] != 0 || p[0x22] != 0 || p[0x23] != 0);
             let index_at = next_index;
             next_index += 1;
             if has_rows {
@@ -446,4 +460,28 @@ pub fn replace_single_page_table(file: &[u8], page_type: u32, rows: &[Vec<u8>]) 
     let mut out = file.to_vec();
     out.get_mut(data_at..data_at + page_size)?.copy_from_slice(&page);
     Some(out)
+}
+
+#[cfg(test)]
+mod packed_row_count_tests {
+    use super::packed_row_counts;
+
+    /// rekordbox's own pages [OBS]: 284 rows on a 7.2.14 export, and the
+    /// small pages the old formula was taken from.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn row_counts_pack_as_rekordbox_writes_them() {
+        assert_eq!(packed_row_counts(284), [0x1c, 0x81, 0x23]);
+        assert_eq!(packed_row_counts(8), [0x08, 0x00, 0x01]);
+        assert_eq!(packed_row_counts(129), [0x81, 0x20, 0x10]);
+        assert_eq!(packed_row_counts(23), [0x17, 0xe0, 0x02]);
+        // Past 255 the slot count keeps its high bits; it used to stop at 255.
+        assert_eq!(packed_row_counts(283), [0x1b, 0x61, 0x23]);
+        assert_eq!(packed_row_counts(256), [0x00, 0x01, 0x20]);
+        // And up to 255 it is what the old formula gave.
+        for n in 0..=255_usize {
+            let old = [n as u8, ((n * 32) & 0xff) as u8, (n / 8) as u8];
+            assert_eq!(packed_row_counts(n), old, "{n} rows");
+        }
+    }
 }

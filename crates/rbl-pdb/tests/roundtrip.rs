@@ -422,3 +422,32 @@ fn a_long_ascii_string_reads_and_writes_as_rekordbox_does() {
     assert_eq!(rows[0].name, path);
 }
 
+
+/// A page of more than 255 rows says how many it holds in the packed word at
+/// `0x18`, slots and rows alike, as rekordbox's 284-row page does [OBS
+/// 2026-11-07]. The slots stopped at 255, and an XDJ-1000 froze on it.
+#[test]
+fn a_page_of_more_than_255_rows_counts_them_all_in_its_header() {
+    let rows: Vec<Vec<u8>> = (1..=300_u32).map(|i| rbl_pdb::rows::playlist_entry_row(i, i, 1)).collect();
+    let mut file = FileBuilder::new(PAGE);
+    file.add_table(8, &rows);
+    let bytes = file.finish();
+
+    let mut big = 0;
+    for page in bytes.chunks(PAGE) {
+        if page.len() < 0x28 || page[0x1b] != 0x24 {
+            continue;
+        }
+        let packed = u32::from(page[0x18]) | u32::from(page[0x19]) << 8 | u32::from(page[0x1a]) << 16;
+        let slots = packed & 0x1fff;
+        assert_eq!(slots, packed >> 13, "slots and rows agree on every page");
+        if slots > 255 {
+            big += 1;
+        }
+    }
+    assert!(big > 0, "the test wants a page of more than 255 rows");
+
+    let pdb = Pdb::parse(&bytes).unwrap();
+    let table = pdb.table(PageType::PlaylistEntries).unwrap();
+    assert_eq!(pdb.playlist_entries(table).len(), 300);
+}
