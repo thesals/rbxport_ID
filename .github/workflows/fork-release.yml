@@ -246,6 +246,27 @@ jobs:
             '{version: $v, notes: $notes, pub_date: $date, platforms: $p}' > latest.json
           cat latest.json
 
+      # The same installers under names without the version, so
+      # releases/latest/download/<name> (the README's download links) always
+      # serves the newest.
+      - name: Upload the installers under stable names
+        run: |
+          set -euo pipefail
+          assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate)"
+          copy() {
+            local id
+            id="$(jq -r --arg s "$1" '[.[] | select(.name | endswith($s))][0].id // empty' <<<"$assets")"
+            if [ -z "$id" ]; then
+              echo "::warning::No *$1 in this release, so no $2"
+              return 0
+            fi
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "$2"
+            gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$2" \
+              -H "Content-Type: application/octet-stream" --input "$2" >/dev/null
+          }
+          copy "-setup.exe" rbxport-ID-Windows-setup.exe
+          copy ".dmg" rbxport-ID-Mac.dmg
+
       - name: Upload latest.json and publish
         run: |
           set -euo pipefail

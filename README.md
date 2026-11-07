@@ -1,10 +1,71 @@
 <p align="center">
-  <a href="https://rbxport.com">
-    <img src="docs/assets/brand/combined/rbxport-logo-color-white.png" alt="rbxport" width="360">
-  </a>
+  <img src="docs/assets/brand/combined/rbxport-logo-color-white.png" alt="rbxport" width="360">
 </p>
 
-# rbxport
+# rbxport ID
+
+**rbxport ID** is an unofficial fork of [rbxport](https://github.com/chrisle/rbxport), the open-source DJ library manager inspired by rekordbox. It adds what upstream keeps out on purpose: **its own music library**, so rekordbox becomes something you import from rather than the place your library lives, **track identification and tag correction**, and **intelligent playlists**.
+
+[![Latest release](https://img.shields.io/github/v/release/thesals/rbxport_ID?label=latest%20release)](https://github.com/thesals/rbxport_ID/releases/latest)
+
+## Download
+
+| | Download | Notes |
+|---|---|---|
+| **Windows** 10 / 11 (64-bit) | [**rbxport-ID-Windows-setup.exe**](https://github.com/thesals/rbxport_ID/releases/latest/download/rbxport-ID-Windows-setup.exe) | If SmartScreen warns you, click **More info → Run anyway**. |
+| **macOS** 11 or later (Apple silicon and Intel) | [**rbxport-ID-Mac.dmg**](https://github.com/thesals/rbxport_ID/releases/latest/download/rbxport-ID-Mac.dmg) | Not signed by Apple, so you allow it once. See [Installing on a Mac](docs/user/macos.md). **New: not tested on a Mac yet.** |
+
+These links always download the newest build. Every release, with its notes and older versions, is on the [Releases page](https://github.com/thesals/rbxport_ID/releases).
+
+**Updates are automatic.** Every change to this repository builds a new release. Installed copies check for it when they start, or when you choose **Check for Updates…**, and update themselves.
+
+## What this fork adds
+
+### Its own library; rekordbox is only imported from
+- rbxport ID keeps its library in its own folder (`%APPDATA%
+bxport\library` on Windows, `~/Library/Application Support/rbxport/library` on a Mac), with the same tables as rekordbox, so analysis, USB export and PRO DJ LINK work as before.
+- **rekordbox's library is never written.** rbxport ID imports from a verified copy and checks that the original is unchanged afterwards.
+- **Import again at any time.** New tracks come in whole. Tracks you already have get only what rbxport ID is missing, and tags you changed in rbxport ID are never replaced. The import report lists what was taken and what was kept. For tracks you choose, **Take rekordbox's tags** adopts rekordbox's version instead.
+- Read more in [Library and import](docs/user/library-and-import.md).
+
+### Track identification and tag correction
+- **Identify Tracks** on a selection, a playlist or the whole library. It fingerprints the audio and looks the track up in free services only: **AcoustID**, **MusicBrainz**, **Cover Art Archive** and **Discogs**.
+- It fills in title and mix name, artist, album, label, year, catalogue number, ISRC and artwork. Discogs styles (sub-genres such as Tech House) are added to the comment.
+- **Nothing is changed silently.** Results wait in a review queue with a field-by-field comparison. Auto-apply (off by default) takes only matches scoring 90 % or more, and only into empty fields. Every change can be undone.
+- Writing tags into the audio files themselves stays off until you turn it on.
+- Identify needs a free AcoustID key, and optionally a Discogs personal token, entered in Preferences.
+
+### Intelligent playlists
+- **Create New Intelligent Playlist** (right-click **Playlists**, a folder or a playlist) builds a playlist from rules such as genre, BPM range, key, rating, date added and My Tags. It updates itself as your library changes.
+
+### USB export
+- **Export Playlist** and **Export Folder** list your connected USB drives, so you pick the stick instead of hunting for it in a file browser. **Other location…** still lets you choose any folder.
+
+### Installers and updates
+- A Windows installer and a Mac app are built for every release on GitHub, and each is signed for the built-in updater.
+
+### Coming next
+- **Playlists from a track**: pick a track and get a playlist of tracks that go with it by genre, tempo, key and energy, like iTunes' Genius. The design is drafted and waiting on decisions.
+
+## Status
+
+This fork is developed and tested on Windows. The Mac build is new and waiting for its first test on a real Mac; if you try it, the [Mac guide](docs/user/macos.md#testing-checklist-for-whoever-tries-it-first) has a checklist of what to report.
+
+Problems and suggestions: [open an issue](https://github.com/thesals/rbxport_ID/issues). Please don't report this fork's issues to upstream rbxport.
+
+## For developers
+
+The fork's specs:
+- [Own library](docs/library/OWN_LIBRARY_SPEC.md);
+- [Track identification](docs/identify/IDENTIFY_SPEC.md).
+
+Releases come from [`.github/workflows/fork-release.yml`](.github/workflows/fork-release.yml), which runs on every push to `main`.
+
+Everything below this line is upstream rbxport's own README. It still applies to the code this fork is built on.
+
+---
+
+# About upstream rbxport
 
 rbxport is a music library management app inspired by rekordbox. It keeps its
 feature set deliberately small, aiming for a faster, simpler user experience.
