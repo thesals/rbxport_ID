@@ -9,5 +9,13 @@ export default defineConfig({
     // with a docblock of their own, so everything else stays in node.
     include: ["src/**/*.test.ts", "src/**/*.test.tsx", "design/**/*.test.ts", "scripts/cleanup.test.mjs"],
     reporters: "dot",
+    // Node 25+ has a global `localStorage` of its own, `undefined` without
+    // `--localstorage-file`, which can stand in front of jsdom's. Off, so a
+    // jsdom test gets jsdom's storage on every Node version (Node 24 accepts
+    // the same flag).
+    poolOptions: {
+      forks: { execArgv: ["--no-experimental-webstorage"] },
+      threads: { execArgv: ["--no-experimental-webstorage"] },
+    },
   },
 });

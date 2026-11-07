@@ -141,7 +141,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: needs.changes.outputs.frontend == 'true'
         with:
-          node-version: 24
+          node-version: 26
 
       - name: Add missing locale fallbacks
         if: needs.changes.outputs.frontend == 'true'

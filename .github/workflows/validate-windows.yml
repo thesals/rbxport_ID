@@ -99,7 +99,7 @@ jobs:
       - uses: actions/setup-node@v4
         if: inputs.check_file_drop
         with:
-          node-version: 24
+          node-version: 26
           cache: pnpm
       - if: inputs.check_file_drop
         run: pnpm install --frozen-lockfile

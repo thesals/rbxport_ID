@@ -57,7 +57,7 @@ pnpm install
 pnpm dev:web
 ```
 
-This requires Node 24 and pnpm 10.17.1. It does not open an installed rekordbox
+This requires Node 26 and pnpm 10.17.1. It does not open an installed rekordbox
 library or require a Rust build. For desktop prerequisites and safe library
 setup, read [Getting started](docs/development/getting-started.md).
 

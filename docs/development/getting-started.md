@@ -7,7 +7,7 @@ backend, so you can learn the UI without opening a rekordbox library.
 
 ## Prerequisites
 
-The repository pins pnpm 10.17.1 in `package.json`; CI uses Node 24.
+The repository pins pnpm 10.17.1 in `package.json` and Node 26 in `.node-version`; CI uses the same.
 Desktop development also requires Rust (workspace MSRV 1.89), a C/C++ build
 toolchain for native dependencies, and the Tauri 2 platform prerequisites.
 
@@ -26,6 +26,7 @@ sudo apt-get install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev pat
 ## Install and run the browser UI
 
 ```sh
+npm install -g corepack   # Node 25 and later no longer include Corepack
 corepack enable
 pnpm install
 pnpm dev:web
