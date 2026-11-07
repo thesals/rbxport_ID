@@ -56,7 +56,7 @@ import { useColumns, type ColumnContext } from "@/store/useColumns";
 import { useExplorer } from "@/store/useExplorer";
 import { importLoose, isLooseId } from "@/lib/explorer";
 import { childrenOf, containerOf, parentFor, withSources } from "@/lib/tree";
-import { exportTargets } from "@/lib/contextMenus";
+import { driveLabel, exportTargets } from "@/lib/contextMenus";
 import { JUMP_SIZE_ID } from "@/lib/player";
 import type { Deck as SyncDeck } from "@/lib/sync";
 import { LayoutDualIcon } from "@/components/icons";
@@ -1495,7 +1495,7 @@ function AppBody() {
     (path: string, ids: readonly string[]) => {
       if (ids.length === 0) return;
       const device = devices.find((d) => d.path === path);
-      const name = device?.name ?? "the device";
+      const name = device ? driveLabel(device) : "the device";
       setSyncing(true);
       report(`Writing ${ids.length} track${ids.length === 1 ? "" : "s"} to ${name}…`);
       void (async () => {
@@ -2164,7 +2164,8 @@ function AppBody() {
   const exportPlaylist = useCallback((node: TreeNode, destination?: string) => {
     void (async () => {
       const backend = await getBackend();
-      const drive = destination === undefined ? undefined : devices.find((d) => d.path === destination)?.name;
+      const found = destination === undefined ? undefined : devices.find((d) => d.path === destination);
+      const drive = found === undefined ? undefined : driveLabel(found);
       report(drive === undefined ? `Exporting ${node.name}…` : `Exporting ${node.name} to ${drive}…`);
       try {
         const written = await backend.exportPlaylist(node.id, destination, stickDefaults, deleteUnlistedMusic, compatibilityFormat);

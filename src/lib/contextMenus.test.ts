@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  allTracksMenu, deckMenu, enabled, entriesOf, exportTargets, SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext,
+  allTracksMenu, deckMenu, driveLabel, enabled, entriesOf, exportTargets, SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext,
 } from "./contextMenus";
 
 const OPEN: MenuContext = { inPlaylist: true, hasFile: true, readOnly: false };
@@ -213,6 +213,20 @@ describe("treeMenu", () => {
   });
 });
 
+describe("driveLabel", () => {
+  it("names a Windows drive by label and letter, as Explorer does", () => {
+    expect(driveLabel({ name: "DJ", path: "G:\\" })).toBe("DJ (G:)");
+    expect(driveLabel({ name: "DJ", path: "g:" })).toBe("DJ (G:)");
+  });
+  it("is just the letter for a drive with no label", () => {
+    expect(driveLabel({ name: "", path: "G:\\" })).toBe("G:");
+    expect(driveLabel({ name: "G:\\", path: "G:\\" })).toBe("G:");
+  });
+  it("leaves a Mac volume's name alone", () => {
+    expect(driveLabel({ name: "DJ STICK", path: "/Volumes/DJ STICK" })).toBe("DJ STICK");
+  });
+});
+
 describe("exportTargets", () => {
   const drive = (path: string, removable: boolean, exported: boolean) => ({
     name: path, path, totalBytes: 1, freeBytes: 1, removable, volumeId: path,
@@ -223,7 +237,7 @@ describe("exportTargets", () => {
       drive("G:\\", true, false),
       drive("D:\\", false, false),
       drive("E:\\", false, true),
-    ]).map((d) => d.id)).toEqual(["G:\\", "E:\\"]);
+    ]).map((d) => [d.id, d.name])).toEqual([["G:\\", "G:"], ["E:\\", "E:"]]);
   });
 });
 

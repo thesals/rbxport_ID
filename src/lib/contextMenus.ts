@@ -278,7 +278,21 @@ function exportItems(devices: readonly MenuTarget[]): readonly MenuRow<TreeActio
 export function exportTargets(devices: readonly Device[]): MenuTarget[] {
   return devices
     .filter((d) => d.removable || d.export !== null)
-    .map((d) => ({ id: d.path, name: d.name }));
+    .map((d) => ({ id: d.path, name: driveLabel(d) }));
+}
+
+/**
+ * A drive as the menus name it: its label and, on Windows, its letter, as
+ * Explorer writes them ("DJ (G:)"), so two sticks with the same label can
+ * be told apart. A drive with no label is just its letter. Elsewhere a drive
+ * has no letter, and its name is its mount point's.
+ */
+export function driveLabel(device: Pick<Device, "name" | "path">): string {
+  const letter = /^([A-Za-z]):[\\/]?$/.exec(device.path)?.[1];
+  if (letter === undefined) return device.name;
+  const drive = `${letter.toUpperCase()}:`;
+  const name = device.name.trim();
+  return name === "" || name.replace(/[\\/]$/, "").toUpperCase() === drive ? drive : `${name} (${drive})`;
 }
 
 function rekordboxTreeMenu(
