@@ -55,7 +55,11 @@ fn the_menu_builds_and_carries_the_ids_the_frontend_switches_on() {
         "settings",
         "import",
         "import-folder",
-        "missing",
+        // The fork's File > Import from rekordbox….
+        "import-rekordbox",
+        // Not "missing": Missing File Manager is left out of the menu while
+        // `MISSING_FILE_MANAGER` in menu.rs is off (2c7d297), and this test,
+        // which only runs on macOS, still asked for it.
         "info",
         "sub",
         "fullscreen",
