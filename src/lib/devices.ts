@@ -35,13 +35,39 @@ export function renamedDevice(
 }
 
 /**
+ * Whether a drive is one to show as a device: removable (USB sticks), or
+ * already holding an export. The device list also has the computer's other
+ * internal disks, which are not what a DJ takes to the booth. An external
+ * SSD reports itself as fixed, so it shows once it has had an export, and
+ * through Other location… before that.
+ */
+export function isUsbDrive(device: Pick<Device, "removable" | "export">): boolean {
+  return device.removable || device.export !== null;
+}
+
+/**
+ * A drive as the app names it: its label and, on Windows, its letter, as
+ * Explorer writes them ("DJ (G:)"), so two sticks with the same label can
+ * be told apart. A drive with no label is just its letter. Elsewhere a drive
+ * has no letter, and its name is its mount point's.
+ */
+export function driveLabel(device: Pick<Device, "name" | "path">): string {
+  const letter = /^([A-Za-z]):[\\/]?$/.exec(device.path)?.[1];
+  if (letter === undefined) return device.name;
+  const drive = `${letter.toUpperCase()}:`;
+  const name = device.name.trim();
+  return name === "" || name.replace(/[\\/]$/, "").toUpperCase() === drive ? drive : `${name} (${drive})`;
+}
+
+/**
  * Devices as tree nodes, so the Devices section renders like every other
- * section rather than needing its own list component.
+ * section rather than needing its own list component. USB drives only
+ * ([`isUsbDrive`]), each named by [`driveLabel`].
  */
 export function deviceNodes(devices: readonly Device[]): TreeNode[] {
-  return devices.map((device) => ({
+  return devices.filter(isUsbDrive).map((device) => ({
     id: deviceId(device),
-    name: device.name,
+    name: driveLabel(device),
     kind: "device" as const,
     depth: 0,
   }));

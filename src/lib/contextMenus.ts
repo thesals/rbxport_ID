@@ -9,6 +9,9 @@
  */
 
 import type { Device } from "@/ipc/types";
+import { driveLabel, isUsbDrive } from "@/lib/devices";
+
+export { driveLabel };
 
 /**
  * What an entry does, or `null` for one that is only drawn.
@@ -268,31 +271,11 @@ function exportItems(devices: readonly MenuTarget[]): readonly MenuRow<TreeActio
 }
 
 /**
- * The drives an export menu offers: the ones the system calls removable (USB
- * sticks), and any other that already holds an export. Internal drives
- * besides the system one are in the device list too, and are left out here:
- * they are not what a DJ takes to the booth. An external SSD reports itself
- * as fixed, so it shows here once it has had an export, and through Other
- * location… before that.
+ * The drives an export menu offers: the USB drives the Devices section shows
+ * (`isUsbDrive` in `@/lib/devices`), named as it names them.
  */
 export function exportTargets(devices: readonly Device[]): MenuTarget[] {
-  return devices
-    .filter((d) => d.removable || d.export !== null)
-    .map((d) => ({ id: d.path, name: driveLabel(d) }));
-}
-
-/**
- * A drive as the menus name it: its label and, on Windows, its letter, as
- * Explorer writes them ("DJ (G:)"), so two sticks with the same label can
- * be told apart. A drive with no label is just its letter. Elsewhere a drive
- * has no letter, and its name is its mount point's.
- */
-export function driveLabel(device: Pick<Device, "name" | "path">): string {
-  const letter = /^([A-Za-z]):[\\/]?$/.exec(device.path)?.[1];
-  if (letter === undefined) return device.name;
-  const drive = `${letter.toUpperCase()}:`;
-  const name = device.name.trim();
-  return name === "" || name.replace(/[\\/]$/, "").toUpperCase() === drive ? drive : `${name} (${drive})`;
+  return devices.filter(isUsbDrive).map((d) => ({ id: d.path, name: driveLabel(d) }));
 }
 
 function rekordboxTreeMenu(

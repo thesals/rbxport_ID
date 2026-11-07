@@ -29,6 +29,21 @@ describe("devices", () => {
     ]);
   });
 
+  // Fork-only: the Devices section lists USB drives, by label and letter.
+  it("lists USB drives only, named by label and drive letter", () => {
+    const drive = (name: string, path: string, removable: boolean, exported: boolean): Device => ({
+      ...stick, name, path, removable, volumeId: path,
+      export: exported ? { tracks: 1, playlists: 1, ours: true, written: "" } : null,
+    });
+    const nodes = deviceNodes([
+      drive("DJ", "G:\\", true, false),
+      drive("Hi Speed Storage", "D:\\", false, false),
+      drive("Gig SSD", "E:\\", false, true),
+      drive("", "H:\\", true, false),
+    ]);
+    expect(nodes.map((n) => n.name)).toEqual(["DJ (G:)", "Gig SSD (E:)", "H:"]);
+  });
+
   it("reports capacity in the units a stick is sold in", () => {
     expect(capacityText(stick)).toBe("8.0 GB free of 32.0 GB");
     expect(fullness(stick)).toBeCloseTo(0.75);

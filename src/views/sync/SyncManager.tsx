@@ -19,7 +19,7 @@ import { AlertTriangle, ArrowLeft, ArrowRight, LoaderCircle, Search, X } from "l
 import { EjectIcon, FolderIcon, ListIcon, SmartListIcon } from "@/components/icons";
 import { getBackend } from "@/ipc/client";
 import type { Device, DeviceSyncState, ExportReport, ItunesLibrary, TreeNode } from "@/ipc/types";
-import { formatSpace } from "@/lib/devices";
+import { formatSpace, isUsbDrive } from "@/lib/devices";
 import { errorMessage } from "@/lib/errorMessage";
 import { nodesForSource, subtreeIds, toggle, visibleNodes } from "@/lib/tree";
 import { startWindowDrag, toggleWindowMaximise } from "@/lib/windowDrag";
@@ -243,7 +243,8 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
     setDevicesError("");
     try {
       const backend = await getBackend();
-      const found = await backend.listDevices();
+      // USB drives only, as the Devices section shows them.
+      const found = (await backend.listDevices()).filter(isUsbDrive);
       setDevices(found);
       // A stick that was pulled is not a destination any more.
       const present = new Set(found.map((d) => d.path));

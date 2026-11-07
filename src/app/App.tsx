@@ -33,7 +33,7 @@ import { hasEditHistory, runEditHistory, setLibraryEditHistory } from "@/lib/edi
 import { gainToKnob, KNOB_FULL, knobToGain } from "@/lib/volume";
 import { clampWidth, TREE_BOUNDS } from "@/lib/splitter";
 import { exportSummary } from "@/lib/exportSummary";
-import { deviceId, deviceNodes, devicePath, renamedDevice } from "@/lib/devices";
+import { deviceId, deviceNodes, devicePath, driveLabel, renamedDevice } from "@/lib/devices";
 import { refusal, resolveMenu } from "@/lib/menu";
 import { nextSort, specForNode, type SortState } from "@/lib/viewSpec";
 import {
@@ -56,7 +56,7 @@ import { useColumns, type ColumnContext } from "@/store/useColumns";
 import { useExplorer } from "@/store/useExplorer";
 import { importLoose, isLooseId } from "@/lib/explorer";
 import { childrenOf, containerOf, parentFor, withSources } from "@/lib/tree";
-import { driveLabel, exportTargets } from "@/lib/contextMenus";
+import { exportTargets } from "@/lib/contextMenus";
 import { JUMP_SIZE_ID } from "@/lib/player";
 import type { Deck as SyncDeck } from "@/lib/sync";
 import { LayoutDualIcon } from "@/components/icons";
@@ -2006,7 +2006,7 @@ function AppBody() {
     if (!before.some((device) => device.path === path)) return;
     const moved = renamedDevice(devices, path, before);
     if (moved) {
-      setSelectedNode({ id: deviceId(moved.device), name: moved.device.name, kind: "device", depth: 0 });
+      setSelectedNode({ id: deviceId(moved.device), name: driveLabel(moved.device), kind: "device", depth: 0 });
       report(`${moved.oldName} is now ${moved.device.name}.`);
     } else {
       report(`${selectedNode?.name ?? "The device"} is no longer connected.`);
@@ -2692,7 +2692,7 @@ function AppBody() {
 
       <StatusBar
         exports={(exportRunning ? exportBatch : []).map(job => ({
-          ...job, name: devices.find(device => device.path === job.path)?.name ?? job.path.split(/[\\/]/).filter(Boolean).at(-1) ?? job.path,
+          ...job, name: ((found) => (found ? driveLabel(found) : undefined))(devices.find(device => device.path === job.path)) ?? job.path.split(/[\\/]/).filter(Boolean).at(-1) ?? job.path,
         }))}
         onReportBug={openReport}
         onSupport={SHOW_MAIN_SUPPORT ? openSupport : undefined}

@@ -15,6 +15,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { getBackend } from "@/ipc/client";
 import type { Device, DeviceSettings, TreeNode } from "@/ipc/types";
+import { driveLabel } from "@/lib/devices";
 import { errorMessage } from "@/lib/errorMessage";
 import { usePreferences } from "@/store/usePreferences";
 import { ColorTab } from "./ColorTab";
@@ -108,7 +109,7 @@ export function DevicePanel({
   );
 
   return (
-    <section className={styles.panel} aria-label={`Device ${device.name}`}>
+    <section className={styles.panel} aria-label={`Device ${driveLabel(device)}`}>
       <div className={styles.strip} role="tablist" aria-label="Device settings">
         {TABS.map((t) => (
           <button
