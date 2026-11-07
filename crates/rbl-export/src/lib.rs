@@ -209,10 +209,18 @@ const COLORS: [&str; 8] =
     ["Pink", "Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple"];
 
 /// The longest directory name rekordbox writes under `Contents/`: an artist
-/// or album longer than this is cut, not the file name [OBS 7.2.11, four
-/// albums cut at exactly 48 on the reference export].
+/// or album longer than this is cut [OBS 7.2.11, four albums cut at exactly
+/// 48 on the reference export].
 const DIR_NAME_MAX: usize = 48;
-const FILE_NAME_MAX: usize = 120;
+/// The longest audio file name rekordbox writes, in characters, extension
+/// included: a longer one loses the end of its stem and keeps its extension
+/// [OBS rekordbox 7.2.14 export, 2026-11-07: 120 of 353 names cut to exactly
+/// 48, as `…KoRe_Remi.aiff` and `…Pixie_Origin.mp3`; `…Accès Gratuit
+/// (Original Mix.aiff` is 48 characters and 49 bytes, so characters are what
+/// count]. This was 120 bytes, and an XDJ-1000 (firmware 1.13) froze on
+/// reading a stick whose names ran to 84 characters, while it read
+/// rekordbox's stick of the same 353 tracks [OBS, the same day].
+const FILE_NAME_MAX: usize = 48;
 
 /// A directory component under `Contents/`: FAT-safe and cut to rekordbox's
 /// length, trailing spaces and dots dropped after the cut too.
@@ -249,26 +257,43 @@ fn fat_safe(name: &str) -> String {
     out
 }
 
-/// A rekordbox-style audio filename: FAT-safe and short enough for the player,
-/// while retaining the extension that identifies the audio format [OBS: the
-/// RBX-21 reporter's rekordbox export shortened the stem and kept `.aiff`].
-/// macOS can expose decomposed Unicode names, so `fat_safe` normalizes before
-/// the byte limit is applied and staged and published paths stay identical.
+/// A rekordbox-style audio filename: FAT-safe and no longer than
+/// [`FILE_NAME_MAX`] characters, retaining the extension that identifies the
+/// audio format [OBS: the RBX-21 reporter's rekordbox export shortened the
+/// stem and kept `.aiff`]. macOS can expose decomposed Unicode names, so
+/// `fat_safe` normalizes before the limit is applied and staged and
+/// published paths stay identical.
 fn fat_file_name(name: &str) -> String {
     let safe = fat_safe(name);
-    if safe.len() <= FILE_NAME_MAX {
-        return safe;
+    let (stem, extension) = split_extension(&safe);
+    fit_file_name(stem, "", extension)
+}
+
+/// `name` as stem and extension (with its dot), or the whole as a stem when
+/// there is no usable extension.
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() && name[dot..].chars().count() < FILE_NAME_MAX => {
+            (&name[..dot], &name[dot..])
+        }
+        _ => (name, ""),
     }
-    let (stem, suffix) = safe
-        .rsplit_once('.')
-        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty() && extension.len() < FILE_NAME_MAX)
-        .map_or((safe.as_str(), String::new()), |(stem, extension)| (stem, format!(".{extension}")));
-    let mut end = stem.len().min(FILE_NAME_MAX.saturating_sub(suffix.len()));
-    while !stem.is_char_boundary(end) { end -= 1; }
-    let mut shortened = stem[..end].trim_end_matches(['.', ' ']).to_owned();
-    if shortened.is_empty() { shortened.push_str("Unknown"); }
-    shortened.push_str(&suffix);
-    shortened
+}
+
+/// `stem`, then `tag`, then `extension`, cut from the end of the stem until
+/// the whole is at most [`FILE_NAME_MAX`] characters. The tag (a collision
+/// suffix or the conversion marker) and the extension always survive, so a
+/// suffix added to tell two names apart cannot push one past the limit.
+fn fit_file_name(stem: &str, tag: &str, extension: &str) -> String {
+    let room = FILE_NAME_MAX.saturating_sub(tag.chars().count() + extension.chars().count());
+    let mut cut: String = stem.chars().take(room).collect();
+    while cut.ends_with('.') || cut.ends_with(' ') {
+        cut.pop();
+    }
+    if cut.is_empty() {
+        cut.push_str("Unknown");
+    }
+    format!("{cut}{tag}{extension}")
 }
 
 /// The lookup tables an export builds as it walks the tracks.
@@ -776,7 +801,7 @@ pub fn export_cancellable(
         };
         if let Some(target) = conversion {
             let stem = Path::new(&place.file_name).file_stem().unwrap_or_default().to_string_lossy();
-            let name = fat_file_name(&format!("{stem}-rbx-cdj-{export_id}.{}", target.extension()));
+            let name = fit_file_name(&fat_safe(&stem), &format!("-rbx-cdj-{export_id}"), &format!(".{}", target.extension()));
             let parent = place.audio.rsplit_once('/').map_or("/Contents", |(parent, _)| parent);
             place.audio = format!("{parent}/{name}");
             place.file_name = name;
@@ -791,7 +816,7 @@ pub fn export_cancellable(
             while !written_analysis_paths.insert(path_key(&place.anlz_dir)) {
                 suffix += 1;
                 if suffix > 200_003 { return Err(ExportError::Conflict("Analysis directory space exhausted".into())); }
-                place.file_name = format!("{stem}-{export_id}-{suffix}{ext}");
+                place.file_name = fit_file_name(&stem, &format!("-{export_id}-{suffix}"), &ext);
                 place.audio = format!("{}/{}", parent.display(), place.file_name);
                 place.anlz_dir = analysis_directory(&place.audio, root_name);
             }
@@ -1774,12 +1799,45 @@ mod tests {
     fn long_fat_filenames_keep_their_audio_extension() {
         let original = format!("Relative Progress , Steve Nash , 120 Dance Moves {}.aiff", "extended ".repeat(20));
         let shortened = fat_file_name(&original);
-        assert!(shortened.len() <= FILE_NAME_MAX);
+        assert!(shortened.chars().count() <= FILE_NAME_MAX);
         assert!(Path::new(&shortened)
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("aiff")));
-        assert_eq!(fat_file_name("Omega - The Hidden Beauty Of Dutch House '94-'98 - 04 Le Rève.aiff"),
-            "Omega - The Hidden Beauty Of Dutch House '94-'98 - 04 Le Rève.aiff");
+        // A name at the limit, or under it, is left alone.
+        assert_eq!(fat_file_name("Omega - Dutch House 94-98 - 04 Le Rève.aiff"),
+            "Omega - Dutch House 94-98 - 04 Le Rève.aiff");
+    }
+
+    /// The names rekordbox 7.2.14 wrote for these files [OBS 2026-11-07],
+    /// characters counted, not bytes.
+    #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    fn long_file_names_are_cut_to_rekordboxs_48_characters() {
+        assert_eq!(fat_file_name("10857190_Iron_Groove_Is_Back_AnGy_KoRe_Remix.aiff"),
+            "10857190_Iron_Groove_Is_Back_AnGy_KoRe_Remi.aiff");
+        assert_eq!(fat_file_name("6312298_Chromed_Molecules_feat__Pixie_Original_Mix.mp3"),
+            "6312298_Chromed_Molecules_feat__Pixie_Origin.mp3");
+        assert_eq!(fat_file_name("Jimmy Marques - Accès Gratuit (Original Mix).aiff"),
+            "Jimmy Marques - Accès Gratuit (Original Mix.aiff");
+        assert_eq!(fat_file_name("Max Freegrant - Runaway (Enrico Sangiuliano Remix).aiff"),
+            "Max Freegrant - Runaway (Enrico Sangiuliano.aiff");
+        let long = fat_file_name("Maurizio Benedetta, Andrea Barone - Citylights (Danny Fontana & Lowshape Remix).aiff");
+        assert_eq!(long.chars().count(), FILE_NAME_MAX);
+        assert!(long.ends_with(".aiff"));
+    }
+
+    #[test]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    fn a_suffix_that_tells_two_names_apart_keeps_them_within_the_limit() {
+        let stem = "Maurizio Benedetta, Andrea Barone - Citylights (Danny Fontana";
+        let tagged = fit_file_name(stem, "-412-1", ".aiff");
+        assert_eq!(tagged.chars().count(), FILE_NAME_MAX);
+        assert!(tagged.ends_with("-412-1.aiff"));
+        let converted = fit_file_name(stem, "-rbx-cdj-412", ".wav");
+        assert_eq!(converted.chars().count(), FILE_NAME_MAX);
+        assert!(converted.ends_with("-rbx-cdj-412.wav"));
+        // A trailing space or dot left by the cut is dropped, as on a folder.
+        assert_eq!(fit_file_name("abc. ", "", ".mp3"), "abc.mp3");
     }
 
     #[test]

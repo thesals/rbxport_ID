@@ -110,10 +110,16 @@ pub fn track_row(input: &TrackInput) -> Vec<u8> {
     // CDJ-3000 firmware browse/load tests (../rbxport-private/docs/audits/usb-track-records.md).
     put_u2(&mut row, 0x00, 0x24); // track record with 16-bit string offsets
     put_u2(&mut row, 0x02, 0); // index_shift
-    put_u4(&mut row, 0x04, 0); // bitmask
+    // The same in all 351 rows of a rekordbox 7.2.14 export, the stick an
+    // XDJ-1000 (firmware 1.13) read when it froze on ours [OBS 2026-11-07].
+    // What they mean is [UNKNOWN]; rekordbox writes them for every player.
+    put_u4(&mut row, 0x04, 0x000c_0700); // bitmask
     put_u4(&mut row, 0x08, input.sample_rate);
     put_u4(&mut row, 0x0c, 0); // composer_id
     put_u4(&mut row, 0x10, input.file_size);
+    // 0x14 (u4) differs per track in rekordbox's rows and stays zero here.
+    put_u2(&mut row, 0x18, 0x6a3e); // [OBS 2026-11-07], as the bitmask
+    put_u2(&mut row, 0x1a, 0x7ee9); // [OBS 2026-11-07], as the bitmask
     put_u4(&mut row, 0x1c, input.artwork_id);
     put_u4(&mut row, 0x20, input.key_id);
     put_u4(&mut row, 0x24, 0); // original_artist_id
@@ -281,4 +287,22 @@ pub fn playlist_entry_row(entry_index: u32, track_id: u32, playlist_id: u32) -> 
     row.extend_from_slice(&track_id.to_le_bytes());
     row.extend_from_slice(&playlist_id.to_le_bytes());
     row
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// rekordbox 7.2.14 writes these in every track row; an XDJ-1000 read its
+    /// stick and froze on ours, which had zeros there [OBS 2026-11-07].
+    #[test]
+    fn a_track_row_carries_rekordboxs_constant_header_words() {
+        let row = track_row(&TrackInput { filename: "a.mp3".into(), ..TrackInput::default() });
+        assert_eq!(u32::from_le_bytes(row[0x04..0x08].try_into().unwrap()), 0x000c_0700);
+        assert_eq!(u16::from_le_bytes(row[0x18..0x1a].try_into().unwrap()), 0x6a3e);
+        assert_eq!(u16::from_le_bytes(row[0x1a..0x1c].try_into().unwrap()), 0x7ee9);
+        // The subtype the CDJ-3000 needs is unchanged.
+        assert_eq!(u16::from_le_bytes(row[0x00..0x02].try_into().unwrap()), 0x24);
+    }
 }
