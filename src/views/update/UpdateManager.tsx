@@ -120,14 +120,21 @@ export function UpdateManager({ state, onCheck, onRetry, onRestart, onClose }: U
 
   // Escape closes as the close button does. A download or install runs on
   // behind a closed window: it is the app's work, not the window's.
+  // Focused once, when the window opens. The caller's `onClose` is a new
+  // function on each of its renders, so an effect keyed on it took the focus
+  // back on every redraw of the app, out of a field being typed in.
   useEffect(() => {
     panel.current?.focus();
+  }, []);
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") close.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   return (
     <div className={styles.backdrop} onMouseDown={onClose} role="presentation">

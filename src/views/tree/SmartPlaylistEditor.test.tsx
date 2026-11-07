@@ -99,6 +99,36 @@ afterEach(() => {
   host.remove();
 });
 
+describe("while the app redraws round it", () => {
+  // The app hands the editor a new onCancel on every render of its own.
+  // That once re-ran the editor's focus effect: it selected the name being
+  // typed and took the focus from an open drop-down, which shut it.
+  it("leaves the name and the focus alone", () => {
+    open();
+    set(nameField(), "House 120");
+    nameField().setSelectionRange(9, 9);
+    const property = sel(1, "Property")!;
+    act(() => property.focus());
+    open({ onCancel: () => { onCancel(); } });
+    open({ onCancel: () => { onCancel(); } });
+    expect(document.activeElement).toBe(property);
+    expect(nameField().value).toBe("House 120");
+    expect(nameField().selectionStart).toBe(9);
+    expect(nameField().selectionEnd).toBe(9);
+  });
+
+  it("still cancels on Escape with the latest onCancel", () => {
+    open();
+    const latest = vi.fn();
+    open({ onCancel: latest });
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+    expect(latest).toHaveBeenCalledTimes(1);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+});
+
 describe("what the dialog opens on", () => {
   it("starts a new rule at Artist = (empty), as rekordbox's new row is", () => {
     open();

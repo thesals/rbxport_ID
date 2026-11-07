@@ -280,14 +280,21 @@ export function SyncManager({ windowed = false, onClose, onSynced, onReady }: Sy
     return () => { live = false; stop?.(); };
   }, [refreshDevices]);
 
+  // Focused once, when the window opens. The caller's `onClose` is a new
+  // function on each of its renders, so an effect keyed on it took the focus
+  // back on every redraw of the app, out of a field being typed in.
   useEffect(() => {
     window_.current?.focus();
+  }, []);
+  const close = useRef(onClose);
+  close.current = onClose;
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") close.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   /** Reads what a stick holds and was last given, and ticks that back on. */
   const readDevice = useCallback(async (path: string, restore: boolean) => {

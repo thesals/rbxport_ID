@@ -120,15 +120,25 @@ export function SmartPlaylistEditor({ title, name: initialName, rule: initialRul
   );
   const nameField = useRef<HTMLInputElement>(null);
 
+  // The name is focused and selected once, when the editor opens. The
+  // caller's `onCancel` is a new function on each of its renders, so an
+  // effect keyed on it ran again on every redraw of the app: it selected the
+  // name under the cursor while it was being typed, and took the focus from
+  // an open drop-down, which shut it.
   useEffect(() => {
     nameField.current?.focus();
     nameField.current?.select();
+  }, []);
+
+  const cancel = useRef(onCancel);
+  cancel.current = onCancel;
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape") cancel.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onCancel]);
+  }, []);
 
   const update = (at: number, patch: Partial<SmartCondition>) =>
     setConditions((current) => current.map((c, i) => (i === at ? { ...c, ...patch } : c)));
