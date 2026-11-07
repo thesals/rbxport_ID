@@ -36,7 +36,7 @@ The Mac build is new and has not been tried on a real Mac. Please report what ha
 
 1. The install steps above: which message macOS showed, and whether **Open Anyway** worked.
 2. The first start: **Create a new library**, or **Import from rekordbox** if rekordbox is on the Mac.
-3. Browsing: tracks show, playlists open, search works, and a track plays.
+3. Browsing: tracks show, playlists open, search works, and a track plays. Then play a track on each of two decks at once, both loud, and listen for crackle or distortion. The automated audio test for this is skipped on Mac builds.
 4. Analysis: analyse a few tracks, and check that the waveform and BPM appear.
 5. Intelligent playlists: right-click **Playlists → Create New Intelligent Playlist**, then make one with a genre and a BPM range. It should fill with tracks.
 6. Identify, if it's set up: identify a few tracks and review the results.

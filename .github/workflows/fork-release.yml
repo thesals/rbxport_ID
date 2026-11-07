@@ -196,7 +196,15 @@ jobs:
       - run: pnpm build
 
       # Every crate's tests, not only those before the first that fails.
-      - run: cargo test --workspace --no-fail-fast
+      # Skipped here: rbl-deck's two limiter tests play two decks in real
+      # time and failed on GitHub's shared Mac runners about every other run,
+      # each passing on the run the other failed (timing, not the Mac). They
+      # still run on Windows and Linux. A person listening to two decks on a
+      # real Mac checks the same thing (docs/user/macos.md).
+      - run: >-
+          cargo test --workspace --no-fail-fast --
+          --skip the_limiter_keeps_two_full_decks_under_its_ceiling
+          --skip the_limiter_off_leaves_the_clamp_to_flat_top_the_sum
 
   publish:
     name: Publish the release
