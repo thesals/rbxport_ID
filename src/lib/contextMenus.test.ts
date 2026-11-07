@@ -88,6 +88,7 @@ describe("treeMenu", () => {
   it("offers root creation actions on the Playlists collection", () => {
     expect(entriesOf(treeMenu("collection")).map((e) => e.label)).toEqual([
       "Create New Playlist",
+      "Create New Intelligent Playlist",
       "Create New Folder",
     ]);
   });
@@ -101,6 +102,7 @@ describe("treeMenu", () => {
     expect(entriesOf(treeMenu("playlist")).map((e) => e.label)).toEqual([
       "Export Playlist",
       "Create New Playlist",
+      "Create New Intelligent Playlist",
       "Create New Folder",
       "Playlist display setting",
       "Add Artwork",
@@ -158,6 +160,7 @@ describe("treeMenu", () => {
     expect(entriesOf(treeMenu("folder")).map((e) => e.label)).toEqual([
       "Export Folder",
       "Create New Playlist",
+      "Create New Intelligent Playlist",
       "Create New Folder",
       "Playlist display setting",
       "Rename Folder",

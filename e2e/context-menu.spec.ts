@@ -43,11 +43,10 @@ function rows(menu: Locator) {
 test("the rows are on rekordbox's 25pt pitch in its 12.5px face", async ({ page }) => {
   const menu = await openTreeMenu(page);
   const items = await rows(menu);
-  // Thirteen in the capture, less the three cloud rows, Collaborative
-  // playlist and Create New Intelligent Playlist (unfinished, hidden
-  // 2026-09-20), plus Rename. The fork's two identify rows follow
+  // Thirteen in the capture, less the three cloud rows and Collaborative
+  // playlist, plus Rename. The fork's two identify rows follow
   // rekordbox's, behind a separator of their own.
-  expect(items).toHaveLength(9 + 2);
+  expect(items).toHaveLength(10 + 2);
   expect(items.slice(-2).map((i) => i.label)).toEqual(["Identify Tracks", "Review Identified Tracks"]);
   for (const item of items) {
     expect(item.height, item.label).toBe(25);
@@ -60,7 +59,7 @@ test("the rows are on rekordbox's 25pt pitch in its 12.5px face", async ({ page 
   // Two entries in one group are a row apart; across a separator they are a
   // row and the 11pt separator block apart (1pt rule, 5pt above and below).
   const at = (label: string) => items.find((i) => i.label === label)!.top;
-  expect(at("Create New Folder") - at("Create New Playlist")).toBe(25);
+  expect(at("Create New Intelligent Playlist") - at("Create New Playlist")).toBe(25);
   expect(at("Create New Playlist") - at("Export Playlist")).toBe(36);
   expect(at("Add To Shortcut") - at("Export a playlist to a file")).toBe(36);
 });
@@ -81,11 +80,10 @@ test("the panel is a point of padding inside a one-point hairline", async ({ pag
   expect(panel.paddingBottom).toBe("1px");
   expect(panel.paddingLeft).toBe("0px");
   expect(panel.border).toBe("1px");
-  // Nine rows, six separators, the padding and the hairline. The capture's
-  // panel is 812px tall at 2x: four cloud rows, a separator and Create New
-  // Intelligent Playlist (unfinished, hidden 2026-09-20) shorter, one
+  // Ten rows, six separators, the padding and the hairline. The capture's
+  // panel is 812px tall at 2x: four cloud rows and a separator shorter, one
   // Rename taller. The fork's two identify rows and their separator add to it.
-  expect(panel.height).toBe((9 + 2) * 25 + (6 + 1) * 11 + 2 + 2);
+  expect(panel.height).toBe((10 + 2) * 25 + (6 + 1) * 11 + 2 + 2);
 
   const separators = await menu.evaluate((m) => {
     const box = m.getBoundingClientRect();

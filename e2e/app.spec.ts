@@ -611,11 +611,31 @@ test("the source rail switches which part of the library the tree shows", async 
   await expect(page.getByRole("treeitem").filter({ hasText: "CURRENT" })).toBeVisible();
 });
 
-test("unfinished sources and playlist creation are hidden", async ({ page }) => {
+test("Related Tracks is hidden; intelligent playlists can be created", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("tab", { name: "Related Tracks" })).toHaveCount(0);
   await page.getByRole("treeitem").filter({ hasText: "CURRENT" }).click({ button: "right" });
-  await expect(page.getByRole("menuitem", { name: "Create New Intelligent Playlist" })).toHaveCount(0);
+  await expect(page.getByRole("menuitem", { name: "Create New Intelligent Playlist" })).toBeVisible();
+});
+
+test("Create New Intelligent Playlist makes one from the rule editor", async ({ page }) => {
+  // Fork-only: upstream hid the row as unfinished (e54aa77); the fork has it.
+  await page.goto("/?writable=1");
+  await expect(page.getByTestId("browser-title")).toContainText("Tracks)");
+  await page.getByRole("treeitem").filter({ hasText: "CURRENT" }).click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Create New Intelligent Playlist" }).click();
+  const editor = page.getByRole("dialog", { name: "Create New Intelligent Playlist" });
+  await expect(editor).toBeVisible();
+  await editor.getByLabel("List name").fill("House 120-130");
+  // It opens with one empty condition, which cannot be saved until it has a value.
+  const ok = editor.getByRole("button", { name: "OK", exact: true });
+  await expect(ok).toBeDisabled();
+  const condition = editor.getByRole("group", { name: "Condition 1" });
+  await condition.getByLabel("Property").selectOption({ label: "Genre" });
+  await condition.getByLabel("Value").first().fill("House");
+  await ok.click();
+  await expect(editor).toHaveCount(0);
+  await expect(page.getByRole("treeitem").filter({ hasText: "House 120-130" })).toBeVisible();
 });
 
 test("the Histories section opens on the sessions rekordbox recorded", async ({ page }) => {

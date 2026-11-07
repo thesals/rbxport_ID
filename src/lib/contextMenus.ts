@@ -200,6 +200,11 @@ export const TRACK_MENU: readonly MenuRow<TrackAction>[] = [
  * over a playlist and a folder of the collection [OBS 2026-09-18]. `Edit Intelligent Playlist` is not in the capture, which
  * was taken over a plain playlist; rekordbox opens the rule editor from
  * the intelligent playlist's own menu, and so does this [ASSUME the label].
+ *
+ * Fork-only: `Create New Intelligent Playlist`, which upstream hid as
+ * unfinished on 2026-09-20 (e54aa77), is back so it can be tried out. It
+ * writes rbxport's own library; the rule format is the community's
+ * description, not yet checked against a rule rekordbox saved (`smart.rs`).
  * `Add To Shortcut` stays `Add To Shortcut` on a playlist that is one
  * already [OBS 7.2.11, 2026-09-18: rekordbox even takes it twice]; a
  * shortcut goes away from its own menu, `shortcutMenu` below.
@@ -244,6 +249,7 @@ function rekordboxTreeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "coll
   if (kind === "collection") {
     return [
       { label: "Create New Playlist", action: "createPlaylist" },
+      { label: "Create New Intelligent Playlist", action: "createSmartPlaylist" },
       { label: "Create New Folder", action: "createFolder" },
     ];
   }
@@ -258,6 +264,7 @@ function rekordboxTreeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "coll
       { label: "Export Folder", action: "export", submenu: true },
       SEPARATOR,
       { label: "Create New Playlist", action: "createPlaylist" },
+      { label: "Create New Intelligent Playlist", action: "createSmartPlaylist" },
       { label: "Create New Folder", action: "createFolder" },
       SEPARATOR,
       { label: "Playlist display setting", action: null },
@@ -276,6 +283,7 @@ function rekordboxTreeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "coll
     { label: "Export Playlist", action: "export", submenu: true },
     SEPARATOR,
     { label: "Create New Playlist", action: "createPlaylist" },
+    { label: "Create New Intelligent Playlist", action: "createSmartPlaylist" },
     ...(smart ? [{ label: "Edit Intelligent Playlist", action: "editSmartPlaylist" as const }] : []),
     { label: "Create New Folder", action: "createFolder" },
     SEPARATOR,
