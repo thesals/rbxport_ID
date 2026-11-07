@@ -107,6 +107,33 @@ function tagKey(id: string): number {
   return match?.[1] ? Number(BigInt.asIntN(32, BigInt(match[1]))) : 0;
 }
 
+/**
+ * A BPM as the rule stores it: in hundredths, the units of
+ * `djmdContent.BPM`, which is what rekordbox compares a `bpm` condition in
+ * (see `rbl_index::smart`, ea1be0b). The editor shows and takes BPM as
+ * people write it, so 128 is saved as `12800` and read back as 128. Text
+ * that is not a number is kept as it is.
+ */
+export function bpmToStored(text: string): string {
+  const trimmed = text.trim();
+  const value = Number(trimmed);
+  return trimmed === "" || !Number.isFinite(value) ? trimmed : String(Math.round(value * 100));
+}
+
+/** The other way: a stored `12850` is shown as `128.5`. */
+export function bpmFromStored(text: string): string {
+  const trimmed = text.trim();
+  const value = Number(trimmed);
+  return trimmed === "" || !Number.isFinite(value) ? trimmed : String(Math.round(value) / 100);
+}
+
+/** Each BPM value of a condition through `convert`; other properties as they are. */
+function withBpm(condition: SmartCondition, convert: (text: string) => string): SmartCondition {
+  return condition.property === "bpm"
+    ? { ...condition, left: convert(condition.left), right: convert(condition.right) }
+    : condition;
+}
+
 /** A fresh condition: Artist = (empty), as rekordbox's new row is [OBS 7.2.11]. */
 export function emptyCondition(): SmartCondition {
   return { property: "artist", operator: "1", left: "", right: "", unit: "" };
@@ -116,7 +143,7 @@ export function SmartPlaylistEditor({ title, name: initialName, rule: initialRul
   const [name, setName] = useState(initialName);
   const [logic, setLogic] = useState<"all" | "any">(initialRule.logic === "any" ? "any" : "all");
   const [conditions, setConditions] = useState<SmartCondition[]>(
-    initialRule.conditions.length === 0 ? [emptyCondition()] : initialRule.conditions.map((c) => ({ ...c })),
+    initialRule.conditions.length === 0 ? [emptyCondition()] : initialRule.conditions.map((c) => withBpm({ ...c }, bpmFromStored)),
   );
   const nameField = useRef<HTMLInputElement>(null);
 
@@ -329,7 +356,7 @@ export function SmartPlaylistEditor({ title, name: initialName, rule: initialRul
             type="button"
             className={styles.button}
             disabled={!canSave}
-            onClick={() => onSave(name.trim(), { logic, conditions: conditions.map((c) => ({ ...c, left: c.left.trim(), right: c.right.trim() })) })}
+            onClick={() => onSave(name.trim(), { logic, conditions: conditions.map((c) => withBpm({ ...c, left: c.left.trim(), right: c.right.trim() }, bpmToStored)) })}
           >
             OK
           </button>

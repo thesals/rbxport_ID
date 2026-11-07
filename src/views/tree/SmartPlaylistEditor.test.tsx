@@ -17,7 +17,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SmartRule } from "@/ipc/types";
-import { SmartPlaylistEditor, emptyCondition, type SmartPlaylistEditorProps } from "./SmartPlaylistEditor";
+import { SmartPlaylistEditor, bpmFromStored, bpmToStored, emptyCondition, type SmartPlaylistEditorProps } from "./SmartPlaylistEditor";
 
 declare global {
   var IS_REACT_ACT_ENVIRONMENT: boolean;
@@ -146,7 +146,8 @@ describe("what the dialog opens on", () => {
       rule: {
         logic: "any",
         conditions: [
-          { property: "bpm", operator: "5", left: "126", right: "132", unit: "" },
+          // Stored in hundredths of a BPM, as rekordbox compares them.
+          { property: "bpm", operator: "5", left: "12600", right: "13200", unit: "" },
           { property: "genre", operator: "8", left: "house", right: "", unit: "" },
         ],
       },
@@ -281,7 +282,7 @@ describe("changing a property", () => {
     // been carried over.
     set(inp(1, "Value")!, "128");
     expect(saved().conditions[0]).toEqual({
-      property: "bpm", operator: "1", left: "128", right: "", unit: "",
+      property: "bpm", operator: "1", left: "12800", right: "", unit: "",
     });
   });
 
@@ -455,10 +456,33 @@ describe("saving", () => {
     expect(onSave).toHaveBeenCalledWith("Peak", {
       logic: "any",
       conditions: [
-        { property: "bpm", operator: "5", left: "126", right: "132", unit: "" },
+        { property: "bpm", operator: "5", left: "12600", right: "13200", unit: "" },
         { property: "genre", operator: "8", left: "house", right: "", unit: "" },
       ],
     });
+  });
+
+  // The rule holds BPM in hundredths, the units rbl_index::smart compares in.
+  // A typed 127 that was saved as "127" matched nothing at all.
+  it("saves BPM in hundredths and shows it back as typed", () => {
+    open({ name: "Peak" });
+    set(sel(1, "Property")!, "bpm");
+    set(sel(1, "Operator")!, "5");
+    set(inp(1, "Value")!, "127.5");
+    set(inp(1, "Upper value")!, "132");
+    expect(saved().conditions[0]).toEqual({ property: "bpm", operator: "5", left: "12750", right: "13200", unit: "" });
+  });
+});
+
+describe("BPM units", () => {
+  it("converts both ways and keeps what is not a number", () => {
+    expect(bpmToStored("128")).toBe("12800");
+    expect(bpmToStored("127.25")).toBe("12725");
+    expect(bpmToStored("")).toBe("");
+    expect(bpmToStored("fast")).toBe("fast");
+    expect(bpmFromStored("12850")).toBe("128.5");
+    expect(bpmFromStored("12800")).toBe("128");
+    expect(bpmFromStored("")).toBe("");
   });
 });
 
