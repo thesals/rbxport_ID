@@ -1,10 +1,21 @@
 name: Fork release
 
 # The fork's own releases, which its installed apps update from. Every push
-# to main builds the Windows installer, signs the update with the fork's key
-# (secret TAURI_SIGNING_PRIVATE_KEY; the public half is in tauri.conf.json)
-# and publishes a GitHub release with latest.json, the feed the updater reads
-# at https://github.com/thesals/rbxport_ID/releases/latest/download/latest.json.
+# to main builds the Windows installer and the macOS app, signs the updates
+# with the fork's key (secret TAURI_SIGNING_PRIVATE_KEY; the public half is
+# in tauri.conf.json) and publishes a GitHub release with latest.json, the
+# feed the updater reads at
+# https://github.com/thesals/rbxport_ID/releases/latest/download/latest.json.
+#
+# The release starts as a draft, both builds upload to it, and `publish`
+# writes one latest.json for every platform that built before making it
+# public. The two builds never write the feed themselves, so neither can
+# drop the other's entry. Windows alone is enough to publish: a macOS build
+# that fails leaves the Mac out of that release, not Windows.
+#
+# macOS builds are unsigned by Apple (no Developer ID): ad-hoc signed, so
+# they run on Apple silicon, and opened the first time through System
+# Settings > Privacy & Security > Open Anyway. See docs/user/macos.md.
 #
 # Versions are <major>.<minor> from package.json and this workflow's run
 # number as the patch, so each release is newer than the last. Upstream's
@@ -21,17 +32,20 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  windows:
-    name: Windows installer
-    runs-on: windows-latest
-    env:
-      CARGO_TERM_COLOR: always
+  draft:
+    name: Draft the release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_id: ${{ steps.release.outputs.id }}
     steps:
       - uses: actions/checkout@v7.0.1
 
       - name: Check the signing key is set
-        shell: bash
         env:
           KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
@@ -39,6 +53,33 @@ jobs:
             echo "::error::Add the repository secret TAURI_SIGNING_PRIVATE_KEY (the fork's updater key)."
             exit 1
           fi
+
+      - name: Work out this release's version
+        id: version
+        run: |
+          set -euo pipefail
+          base="$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")"
+          echo "version=$base.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          body="$(printf 'Built from %s.\n\n- **Windows:** download the `-setup.exe` below.\n- **macOS:** download the `.dmg` below. The app is not signed by Apple, so the first time, open it from System Settings > Privacy & Security > Open Anyway.\n\nInstalled copies update themselves.' "$GITHUB_SHA")"
+          id="$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="v$VERSION" -f target_commitish="$GITHUB_SHA" \
+            -f name="rbxport ID v$VERSION" -f body="$body" -F draft=true --jq .id)"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows installer
+    needs: draft
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
 
       - uses: pnpm/action-setup@v6.1.0
 
@@ -67,14 +108,9 @@ jobs:
 
       - name: Set this release's version
         shell: bash
-        run: |
-          set -euo pipefail
-          base="$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")"
-          version="$base.${{ github.run_number }}"
-          node scripts/sync-version.mjs --version "$version"
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+        run: node scripts/sync-version.mjs --version "${{ needs.draft.outputs.version }}"
 
-      - name: Build, sign and publish
+      - name: Build, sign and upload
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -82,14 +118,138 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CI: "true"
         with:
-          tagName: v__VERSION__
-          releaseName: rbxport ID v__VERSION__
-          releaseBody: |
-            Built from ${{ github.sha }}.
-
-            Download the `-setup.exe` below to install. Installed copies update themselves.
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
-          updaterJsonPreferNsis: true
+          releaseId: ${{ needs.draft.outputs.release_id }}
+          includeUpdaterJson: false
           args: --bundles nsis
+
+  macos:
+    name: macOS app
+    needs: draft
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: pnpm/action-setup@v6.1.0
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install the pinned Rust toolchain for both Mac architectures
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Set this release's version
+        run: node scripts/sync-version.mjs --version "${{ needs.draft.outputs.version }}"
+
+      - name: Build, sign the update and upload
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Ad-hoc: no Developer ID, so no notarisation, but signed enough
+          # to run on Apple silicon.
+          APPLE_SIGNING_IDENTITY: "-"
+          CI: "true"
+        with:
+          releaseId: ${{ needs.draft.outputs.release_id }}
+          includeUpdaterJson: false
+          args: --target universal-apple-darwin --bundles app,dmg
+
+  macos-tests:
+    # Nobody runs the fork on a Mac day to day, so its tests run here. They
+    # report; they do not hold back a release.
+    name: macOS Rust tests
+    needs: draft
+    runs-on: macos-latest
+    env:
+      RB_LITE_TEST: "1"
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: pnpm/action-setup@v6.1.0
+
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: tests
+
+      # The Tauri crate embeds the built frontend.
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      - run: cargo test --workspace
+
+  publish:
+    name: Publish the release
+    needs: [draft, windows, macos]
+    if: ${{ !cancelled() && needs.draft.result == 'success' && needs.windows.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.draft.outputs.version }}
+      RELEASE_ID: ${{ needs.draft.outputs.release_id }}
+    steps:
+      - name: Write latest.json for every platform that built
+        run: |
+          set -euo pipefail
+          assets="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate)"
+          # The signature's text and the download URL the asset will have
+          # once the release is public (a draft's own URLs change then).
+          entry() {
+            local name="$1"
+            local sig_id
+            sig_id="$(jq -r --arg n "$name.sig" '.[] | select(.name == $n) | .id' <<<"$assets")"
+            if [ -z "$sig_id" ]; then
+              echo "::error::$name has no .sig beside it"
+              exit 1
+            fi
+            local signature
+            signature="$(gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$sig_id")"
+            jq -n --arg s "$signature" \
+              --arg u "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$(jq -rn --arg n "$name" '$n | @uri')" \
+              '{signature: $s, url: $u}'
+          }
+          windows="$(jq -r '.[] | select(.name | endswith("-setup.exe")) | .name' <<<"$assets" | head -1)"
+          mac="$(jq -r '.[] | select(.name | endswith(".app.tar.gz")) | .name' <<<"$assets" | head -1)"
+          if [ -z "$windows" ]; then
+            echo "::error::No Windows installer in the release"
+            exit 1
+          fi
+          platforms="$(entry "$windows" | jq '{"windows-x86_64": ., "windows-x86_64-nsis": .}')"
+          if [ -n "$mac" ]; then
+            # One universal app serves both architectures.
+            platforms="$(jq -s '.[0] + .[1]' <(echo "$platforms") <(entry "$mac" | jq '{"darwin-aarch64": ., "darwin-x86_64": ., "darwin-aarch64-app": ., "darwin-x86_64-app": .}'))"
+          else
+            echo "::warning::No macOS app in this release; Mac copies are not offered it."
+          fi
+          jq -n --arg v "$VERSION" --arg notes "Built from $GITHUB_SHA." \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson p "$platforms" \
+            '{version: $v, notes: $notes, pub_date: $date, platforms: $p}' > latest.json
+          cat latest.json
+
+      - name: Upload latest.json and publish
+        run: |
+          set -euo pipefail
+          # By the release's id: a draft has no tag yet to find it by.
+          gh api -X POST "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=latest.json" \
+            -H "Content-Type: application/json" --input latest.json >/dev/null
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -f make_latest=true >/dev/null
+          echo "Published v$VERSION"
