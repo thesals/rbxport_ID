@@ -195,7 +195,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
-      - run: cargo test --workspace
+      # Every crate's tests, not only those before the first that fails.
+      - run: cargo test --workspace --no-fail-fast
 
   publish:
     name: Publish the release
