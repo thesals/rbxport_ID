@@ -599,9 +599,16 @@ function AppBody() {
       // Subscribed before the first attempt, not after. The library can become
       // ready in the gap between a failed attempt and a later subscription,
       // and that gap is exactly where the window used to get stuck.
-      stopReady = backend.onLibraryReady(() => {
+      const ready = backend.onLibraryReady(() => {
         void attempt(backend);
       });
+      stopReady = ready;
+      // And listening before the first attempt, not only subscribed: the
+      // listener registers asynchronously, and a ready event sent in between
+      // was missed while the attempt before it had failed, which left the
+      // status bar on "Loading the library…" for good.
+      await ready.registered;
+      if (cancelled) return;
       const applyProblem = (problem: LibraryProblem | null) => {
         if (cancelled || problem === null) return;
         if (problem.kind === "missing") setMissingLibrary({ masterDb: problem.masterDb, rekordbox: problem.rekordbox });

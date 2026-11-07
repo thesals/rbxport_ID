@@ -6,6 +6,7 @@
  */
 import { detectPlatform } from "@/lib/shortcuts";
 import type {
+  Subscription,
   AnalysisResult, AudioDevices, Backend, Backup, BackupProgress, BackupSizes, Cue, DeckEvent, Device, DeviceSettings, DeviceSyncState,
   Diagnostics, Duplicates, GridState, Limiter, PreferencesRequest, SmartRule, SyncDeviceReport, SyncProgress, UpdateCheck,
   UpdateProgress, UpdateReady, XmlImportReport,
@@ -100,18 +101,21 @@ export async function setHistoryMenu(undo: string | null, redo: string | null): 
  * import lands; that case has to be handled or the listener outlives its
  * component.
  */
-function subscribe<T>(event: string, listener: (payload: T) => void): () => void {
+function subscribe<T>(event: string, listener: (payload: T) => void): Subscription {
   let live = true;
   let stop: (() => void) | undefined;
-  void import("@tauri-apps/api/event").then(async ({ listen }) => {
+  const registered = import("@tauri-apps/api/event").then(async ({ listen }) => {
     const unlisten = await listen<T>(event, (e) => listener(e.payload));
     if (live) stop = unlisten;
     else unlisten();
   });
-  return () => {
+  const unsubscribe = () => {
     live = false;
     stop?.();
   };
+  // Settles either way: a caller waiting on it to make its first request
+  // must not wait forever because listening failed.
+  return Object.assign(unsubscribe, { registered: registered.catch(() => undefined) });
 }
 
 async function realBackend(): Promise<Backend> {

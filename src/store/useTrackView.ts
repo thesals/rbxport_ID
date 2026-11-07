@@ -139,9 +139,13 @@ export function useTrackView(
       // `App.tsx` gives about the tree: the library can become ready in the
       // gap between a failed attempt and a later subscription, and that gap is
       // exactly where this used to get stuck.
-      stopReady = backend.onLibraryReady(() => {
+      const ready = backend.onLibraryReady(() => {
         void attempt(backend);
       });
+      stopReady = ready;
+      // Listening, not only subscribed: see App.tsx.
+      await ready.registered;
+      if (cancelled) return;
       await attempt(backend);
     })();
 

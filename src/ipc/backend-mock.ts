@@ -2316,7 +2316,8 @@ export function createMockBackend(options: MockOptions = {}): Backend {
 
     onLibraryReady: (listener) => {
       readyListeners.add(listener);
-      return () => readyListeners.delete(listener);
+      // Listening at once: there is no bridge in between to register with.
+      return Object.assign(() => { readyListeners.delete(listener); }, { registered: Promise.resolve() });
     },
     onLibraryProblem: () => () => undefined,
     libraryProblem: () =>

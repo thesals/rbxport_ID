@@ -366,9 +366,12 @@ export interface Backend {
    * there is anything to answer with. Without this the window sat on
    * "Loading…" forever, because the failed first attempt was never retried.
    *
-   * Returns an unsubscribe function.
+   * Returns an unsubscribe function, whose `registered` settles once the
+   * listener is in place. Wait for it before the first attempt: a `library:ready`
+   * sent before then is not heard, and an attempt that failed just before it
+   * was never tried again, leaving the window on "Loading the library…".
    */
-  onLibraryReady(listener: () => void): () => void;
+  onLibraryReady(listener: () => void): Subscription;
 
   /** Fires when the library could not be loaded, with the reason. */
   onLibraryProblem(listener: (problem: LibraryProblem) => void): () => void;
@@ -2156,3 +2159,10 @@ export interface IdentifySettingsUpdate {
   /** Outside 0.90–1 is refused. */
   autoApplyThreshold?: number;
 }
+
+/**
+ * An unsubscribe function, and when the listener began to listen. Tauri's
+ * `listen` registers asynchronously, so an event sent before `registered`
+ * settles is missed.
+ */
+export type Subscription = (() => void) & { readonly registered: Promise<void> };

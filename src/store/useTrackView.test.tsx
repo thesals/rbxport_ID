@@ -34,6 +34,12 @@ let ready: boolean;
 let readyListeners: Set<() => void>;
 let opens: number;
 let tagListListeners: Set<() => void>;
+/**
+ * When set, `onLibraryReady` listens only once this is called, as Tauri's
+ * `listen` registers asynchronously: an event sent before then is missed.
+ */
+let registerLate: (() => void) | null;
+let lateRegistration: boolean;
 
 const SPEC: ViewSpec = {
   source: { kind: "collection" },
@@ -79,8 +85,17 @@ function makeBackend(): Backend {
         ? Promise.resolve(Array.from({ length: len }, (_, i) => row(offset + i)))
         : Promise.reject(new Error("The library has not finished loading yet.")),
     onLibraryReady: (listener: () => void) => {
-      readyListeners.add(listener);
-      return () => readyListeners.delete(listener);
+      if (!lateRegistration) {
+        readyListeners.add(listener);
+        return Object.assign(() => { readyListeners.delete(listener); }, { registered: Promise.resolve() });
+      }
+      const registered = new Promise<void>((resolve) => {
+        registerLate = () => {
+          readyListeners.add(listener);
+          resolve();
+        };
+      });
+      return Object.assign(() => { readyListeners.delete(listener); }, { registered });
     },
     // The hook also listens for cue edits, to patch a cached row's letters
     // in place. Nothing here edits a cue, so the subscription is inert.
@@ -129,6 +144,8 @@ beforeEach(async () => {
   readyListeners = new Set();
   opens = 0;
   tagListListeners = new Set();
+  registerLate = null;
+  lateRegistration = false;
   spec = SPEC;
   window_ = { start: 0, end: 32 };
   seed = undefined;
@@ -177,6 +194,26 @@ describe("useTrackView, against a library that is not up yet", () => {
 
     // The spec never changed. Nobody clicked anything. The rows must arrive
     // anyway, or the window stays blank until the app is restarted.
+    expect(latest.count).toBe(500);
+    expect(latest.error).toBeNull();
+  });
+
+  // The window stuck on "Loading the library…" (2026-11-07): the first
+  // attempt failed, and the ready event came before the listener had
+  // registered, so nothing asked again.
+  it("waits until it is listening before the first attempt", async () => {
+    lateRegistration = true;
+    act(() => {
+      root.render(<Probe />);
+    });
+    await settle();
+    expect(opens).toBe(0);
+
+    // Ready while the listener is still registering: no one hears it.
+    release();
+    act(() => registerLate?.());
+    await settle();
+
     expect(latest.count).toBe(500);
     expect(latest.error).toBeNull();
   });
