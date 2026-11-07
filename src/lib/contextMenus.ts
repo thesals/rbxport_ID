@@ -8,6 +8,8 @@
  * real one is a menu people have to relearn later.
  */
 
+import type { Device } from "@/ipc/types";
+
 /**
  * What an entry does, or `null` for one that is only drawn.
  *
@@ -38,6 +40,8 @@ export type TrackAction =
 
 export type TreeAction =
   | "export"
+  /** Fork-only: export straight to a connected drive, by its mount point. */
+  | `exportTo:${string}`
   | "exportM3u8"
   | "exportTxt"
   | "createPlaylist"
@@ -217,10 +221,13 @@ export const TRACK_MENU: readonly MenuRow<TrackAction>[] = [
  */
 export function treeMenu(
   kind: "playlist" | "smartPlaylist" | "folder" | "collection",
-  /** Fork-only: end the menu with the identify entries. */
-  options: { identify?: boolean } = {},
+  /**
+   * Fork-only: `identify` ends the menu with the identify entries; `devices`
+   * are the drives Export lists (see `exportTargets`).
+   */
+  options: { identify?: boolean; devices?: readonly MenuTarget[] } = {},
 ): readonly MenuRow<TreeAction>[] {
-  const rows = rekordboxTreeMenu(kind);
+  const rows = rekordboxTreeMenu(kind, options.devices ?? []);
   return options.identify === true && kind !== "collection" ? [...rows, SEPARATOR, ...IDENTIFY_NODE_ROWS] : rows;
 }
 
@@ -245,7 +252,39 @@ export function allTracksMenu(): readonly MenuRow<TreeAction>[] {
   ];
 }
 
-function rekordboxTreeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "collection"): readonly MenuRow<TreeAction>[] {
+/**
+ * Export's submenu: the connected drives, then any other folder.
+ *
+ * Fork-only. rekordbox's arrow had nothing behind it here, so a click went
+ * straight to a folder picker and the drive had to be found by hand. The
+ * drives are the ones `exportTargets` keeps; a drive none of them is, such
+ * as a new external SSD, is still reached through Other location….
+ */
+function exportItems(devices: readonly MenuTarget[]): readonly MenuRow<TreeAction>[] {
+  const drives: MenuRow<TreeAction>[] = devices.length > 0
+    ? devices.map((d) => ({ label: d.name, action: `exportTo:${d.id}` as const }))
+    : [{ label: "No USB drive connected", action: null }];
+  return [...drives, SEPARATOR, { label: "Other location…", action: "export" }];
+}
+
+/**
+ * The drives an export menu offers: the ones the system calls removable (USB
+ * sticks), and any other that already holds an export. Internal drives
+ * besides the system one are in the device list too, and are left out here:
+ * they are not what a DJ takes to the booth. An external SSD reports itself
+ * as fixed, so it shows here once it has had an export, and through Other
+ * location… before that.
+ */
+export function exportTargets(devices: readonly Device[]): MenuTarget[] {
+  return devices
+    .filter((d) => d.removable || d.export !== null)
+    .map((d) => ({ id: d.path, name: d.name }));
+}
+
+function rekordboxTreeMenu(
+  kind: "playlist" | "smartPlaylist" | "folder" | "collection",
+  devices: readonly MenuTarget[],
+): readonly MenuRow<TreeAction>[] {
   if (kind === "collection") {
     return [
       { label: "Create New Playlist", action: "createPlaylist" },
@@ -261,7 +300,7 @@ function rekordboxTreeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "coll
     // name order. Rename is not in it either (a double click on the row);
     // it is kept here beside Delete as on a playlist [ASSUME].
     return [
-      { label: "Export Folder", action: "export", submenu: true },
+      { label: "Export Folder", action: null, submenu: true, items: exportItems(devices) },
       SEPARATOR,
       { label: "Create New Playlist", action: "createPlaylist" },
       { label: "Create New Intelligent Playlist", action: "createSmartPlaylist" },
@@ -280,7 +319,7 @@ function rekordboxTreeMenu(kind: "playlist" | "smartPlaylist" | "folder" | "coll
   // An intelligent playlist is exported, renamed and deleted like any other;
   // what it cannot do is take tracks by hand, which its rows never offer.
   return [
-    { label: "Export Playlist", action: "export", submenu: true },
+    { label: "Export Playlist", action: null, submenu: true, items: exportItems(devices) },
     SEPARATOR,
     { label: "Create New Playlist", action: "createPlaylist" },
     { label: "Create New Intelligent Playlist", action: "createSmartPlaylist" },

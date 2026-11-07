@@ -176,3 +176,16 @@ test("the track menu is the same panel, with rekordbox's entries less the cloud"
     "true",
   );
 });
+
+// Fork-only: Export's arrow lists the connected sticks, as Export Track's
+// does. It had nothing behind it, so a click opened a folder picker.
+test("Export Playlist lists the connected sticks and writes to the one picked", async ({ page }) => {
+  const menu = await openTreeMenu(page);
+  await menu.getByRole("menuitem", { name: "Export Playlist" }).hover();
+  const drives = menu.getByRole("menu", { name: "Export Playlist" });
+  await expect(drives).toBeVisible();
+  await expect(drives.getByRole("menuitem")).toHaveText(["DJ STICK", "TEST", "Other location…"]);
+  await drives.getByRole("menuitem", { name: "DJ STICK" }).click();
+  await expect(menu).toHaveCount(0);
+  await expect(page.getByRole("contentinfo")).toContainText("Melodic Vox: Updated");
+});

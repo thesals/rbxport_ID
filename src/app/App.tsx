@@ -56,6 +56,7 @@ import { useColumns, type ColumnContext } from "@/store/useColumns";
 import { useExplorer } from "@/store/useExplorer";
 import { importLoose, isLooseId } from "@/lib/explorer";
 import { childrenOf, containerOf, parentFor, withSources } from "@/lib/tree";
+import { exportTargets } from "@/lib/contextMenus";
 import { JUMP_SIZE_ID } from "@/lib/player";
 import type { Deck as SyncDeck } from "@/lib/sync";
 import { LayoutDualIcon } from "@/components/icons";
@@ -1547,7 +1548,9 @@ function AppBody() {
     }
     return out;
   }, [tree]);
-  const menuDevices = useMemo(() => devices.map((d) => ({ id: d.path, name: d.name })), [devices]);
+  // USB sticks, and drives that already hold an export: not the internal
+  // disks that are also in `devices` (see `exportTargets`).
+  const menuDevices = useMemo(() => exportTargets(devices), [devices]);
 
   const removeTracksFromPlaylist = useCallback(
     (playlist: string, ids: readonly string[]) => {
@@ -2156,23 +2159,27 @@ function AppBody() {
     })();
   }, [report, refuse]);
 
-  const exportPlaylist = useCallback((node: TreeNode) => {
+  // Export Playlist: to the drive picked from the submenu, or, with none,
+  // to a folder the backend asks for (Other location…).
+  const exportPlaylist = useCallback((node: TreeNode, destination?: string) => {
     void (async () => {
       const backend = await getBackend();
-      report(`Exporting ${node.name}…`);
+      const drive = destination === undefined ? undefined : devices.find((d) => d.path === destination)?.name;
+      report(drive === undefined ? `Exporting ${node.name}…` : `Exporting ${node.name} to ${drive}…`);
       try {
-        const written = await backend.exportPlaylist(node.id, undefined, stickDefaults, deleteUnlistedMusic, compatibilityFormat);
+        const written = await backend.exportPlaylist(node.id, destination, stickDefaults, deleteUnlistedMusic, compatibilityFormat);
         if (written === null) {
           setNote(null);
           return;
         }
         report(exportSummary(node.name, written));
+        if (destination !== undefined) setDevices(await backend.listDevices());
       } catch (e) {
         if (e && typeof e === "object" && "kind" in e && e.kind === "cancelled" || e instanceof Error && e.message === "Export stopped.") report("Export stopped.");
         else refuse(e instanceof Error ? e.message : "That export could not be written.");
       }
     })();
-  }, [report, refuse, stickDefaults, deleteUnlistedMusic, compatibilityFormat]);
+  }, [devices, report, refuse, stickDefaults, deleteUnlistedMusic, compatibilityFormat]);
 
   // The top of the current view, kept only to write the next start's opening
   // screen. The library itself still lives entirely in Rust.
@@ -2253,7 +2260,7 @@ function AppBody() {
   const subTree = useMemo(() => ({
     dragging: draggedTracks !== null, onDropTracks: addDraggedTo,
     onDropFiles: readOnly ? undefined : importDroppedFilesTo,
-    onExport: exportPlaylist, onExportFile: exportPlaylistFile, onCreatePlaylist: createPlaylistIn,
+    onExport: exportPlaylist, exportDevices: menuDevices, onExportFile: exportPlaylistFile, onCreatePlaylist: createPlaylistIn,
     onCreateFolder: createFolderIn, onDeleteNode: deleteNode, onRenameNode: renameNode,
     onMoveNode: readOnly ? undefined : moveNode, onExpand: explorer.expand,
     showCounts: viewPrefs.playlistCounts, onOpenSync: openSyncManager,
@@ -2266,7 +2273,7 @@ function AppBody() {
     createPlaylistIn, createFolderIn, deleteNode, renameNode, moveNode, explorer.expand,
     viewPrefs.playlistCounts, openSyncManager, createSmartPlaylistIn, editSmartPlaylist,
     addPlaylistArtwork, addToShortcut, sortItems, ejectDeviceFromTree, ejectingDeviceId, syncing,
-    exportRunning,
+    exportRunning, menuDevices,
   ]);
   const subList = useMemo(() => ({
     onDragTracks: setDraggedTracks, onDragError: refuse, players: deckCount(layout), onLoadTrack: loadTrack,
@@ -2431,6 +2438,7 @@ function AppBody() {
           onDropTracks={addDraggedTo}
           onDropFiles={readOnly ? undefined : importDroppedFilesTo}
           onExport={exportPlaylist}
+          exportDevices={menuDevices}
           onExportFile={exportPlaylistFile}
           onCreatePlaylist={createPlaylistIn}
           onCreateFolder={createFolderIn}

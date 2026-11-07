@@ -13,7 +13,7 @@ import type { TreeNode } from "@/ipc/types";
 import styles from "./TreeView.module.css";
 import { DeviceIcon, EjectIcon, FolderIcon, HistoryIcon, ListIcon, NoteIcon, SmartListIcon } from "@/components/icons";
 import { ContextMenu } from "@/components/ContextMenu";
-import { allTracksMenu, treeMenu } from "@/lib/contextMenus";
+import { allTracksMenu, treeMenu, type MenuTarget } from "@/lib/contextMenus";
 import {
   branchIds, childrenOf, containerOf, emptySources, newlyClosed, nodesForSource, sourceOf,
   subtreeIds, toggle, visibleNodes, searchTree, type TreeSearchScope, type Source,
@@ -311,8 +311,13 @@ export interface TreeViewProps {
   nodes: readonly TreeNode[];
   selectedId: string | null;
   onSelect: (node: TreeNode) => void;
-  /** Write a playlist to a stick. */
-  onExport?: (node: TreeNode) => void;
+  /**
+   * Write a playlist to a stick: the drive's mount point when one was picked
+   * from Export's submenu, none for Other location…, which asks for a folder.
+   */
+  onExport?: (node: TreeNode, destination?: string) => void;
+  /** The drives Export's submenu lists (`exportTargets`). */
+  exportDevices?: readonly MenuTarget[];
   /** Export a playlist to a file: an m3u8 or rekordbox's tab-separated txt. */
   onExportFile?: (node: TreeNode, format: "m3u8" | "txt") => void;
   /** Create, delete and rename, which the shell owns because they write. */
@@ -379,7 +384,7 @@ export const TreeView = memo(function TreeView({
   onCreateSmartPlaylist, onEditSmartPlaylist, onAddArtwork, onAddToShortcut, onSortItems,
   railShortcuts, onOpenShortcut, onDeleteShortcut,
   onEjectDevice, ejectingDeviceId, deviceBusy = false,
-  onIdentify, onReviewIdentify,
+  onIdentify, onReviewIdentify, exportDevices,
 }: TreeViewProps) {
   const { advanced: { doubleClickToEdit }, view } = usePreferences();
   // Browse › FontSize and Line Space apply to the tree as they do the list.
@@ -610,11 +615,15 @@ export const TreeView = memo(function TreeView({
           y={menu.y}
           rows={menu.node.kind === "allTracks" ? allTracksMenu() : treeMenu(
             menu.node.kind === "collection" ? "collection" : menu.node.kind === "folder" ? "folder" : menu.node.kind === "smartPlaylist" ? "smartPlaylist" : "playlist",
-            { identify: onIdentify !== undefined },
+            { identify: onIdentify !== undefined, devices: exportDevices ?? [] },
           )}
           label={menu.node.kind === "folder" ? "Folder" : menu.node.kind === "collection" ? "Playlists" : menu.node.kind === "allTracks" ? "All Tracks" : "Playlist"}
           context={{ inPlaylist: true, hasFile: true, readOnly }}
           onChoose={(action) => {
+            if (action.startsWith("exportTo:")) {
+              onExport?.(menu.node, action.slice("exportTo:".length));
+              return;
+            }
             switch (action) {
               case "export":
                 onExport?.(menu.node);

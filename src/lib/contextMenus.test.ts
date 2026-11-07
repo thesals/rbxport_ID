@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  allTracksMenu, deckMenu, enabled, entriesOf, SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext,
+  allTracksMenu, deckMenu, enabled, entriesOf, exportTargets, SEPARATOR, shortcutMenu, TRACK_MENU, trackMenuFor, treeMenu, type MenuContext,
 } from "./contextMenus";
 
 const OPEN: MenuContext = { inPlaylist: true, hasFile: true, readOnly: false };
@@ -190,6 +190,40 @@ describe("treeMenu", () => {
     expect(entriesOf(treeMenu("playlist")).map((e) => e.label)).toContain("Rename Playlist");
     expect(entriesOf(treeMenu("folder")).map((e) => e.label)).toContain("Export Folder");
     expect(entriesOf(treeMenu("playlist")).map((e) => e.label)).toContain("Export Playlist");
+  });
+
+  // Fork-only: the arrow had nothing behind it, so a click opened a folder
+  // picker and the stick had to be found by hand.
+  it("lists the connected drives under Export, then Other location…", () => {
+    const sticks = [{ id: "G:\\", name: "DJ" }];
+    for (const [kind, label] of [["playlist", "Export Playlist"], ["folder", "Export Folder"]] as const) {
+      const entry = entriesOf(treeMenu(kind, { devices: sticks })).find((e) => e.label === label);
+      expect(entry?.items?.map((r) => (r === SEPARATOR ? r : [r.label, r.action]))).toEqual([
+        ["DJ", "exportTo:G:\\"],
+        SEPARATOR,
+        ["Other location…", "export"],
+      ]);
+    }
+    const none = entriesOf(treeMenu("playlist")).find((e) => e.label === "Export Playlist");
+    expect(none?.items?.map((r) => (r === SEPARATOR ? r : [r.label, r.action]))).toEqual([
+      ["No USB drive connected", null],
+      SEPARATOR,
+      ["Other location…", "export"],
+    ]);
+  });
+});
+
+describe("exportTargets", () => {
+  const drive = (path: string, removable: boolean, exported: boolean) => ({
+    name: path, path, totalBytes: 1, freeBytes: 1, removable, volumeId: path,
+    export: exported ? { tracks: 1, playlists: 1, ours: true, written: "" } : null,
+  });
+  it("keeps USB sticks and drives with an export, not other internal disks", () => {
+    expect(exportTargets([
+      drive("G:\\", true, false),
+      drive("D:\\", false, false),
+      drive("E:\\", false, true),
+    ]).map((d) => d.id)).toEqual(["G:\\", "E:\\"]);
   });
 });
 
