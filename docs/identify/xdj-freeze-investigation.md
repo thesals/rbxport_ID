@@ -118,6 +118,32 @@ So the player **writes** to the database, not only reads it, and it does so at m
 | **G** | `export.pdb` |
 | **F** | `exportExt.pdb` |
 
+**Result (user, 2026-11-07): G froze; F worked.** The freeze is in **rbxport's `export.pdb`** [OBS]. `exportExt.pdb` is ruled out.
+
+### Page counters, rekordbox against rbxport (`pdb_groups.py`)
+
+On every data page of the tables it writes row by row, rekordbox 7.2.14 writes:
+- `0x20 = 1`;
+- `0x22` = the index of the **last row written**: 283 on a page of 284 rows, 7 on a page of 8, and other values where rows went in out of order;
+- in each row group, the word after the present flags is that row's bit, and 0 in every other group.
+
+rbxport writes `0x20` = rows and the word as a copy of the present flags. It writes `0x22` = 0 unless the page has more than 255 rows, and then it writes **`0x22` = rows**. That rule (`build.rs`, `finish_with`) follows the older "row count when over 255" reading of the field. rekordbox's file says the field is an index.
+
+**On the 283-row `playlist_entries` page, rbxport's `0x22` = 283 names a row that doesn't exist (the last is 282).** A 353-track playlist always fills one page past 255 rows, so every export of it has carried this, before and after v1.2.11. This is now the leading suspect [ASSUME until Round 4].
+
+## Round 4: the last-row index
+
+`pdb_patch.py` writes patched copies (never in place), and `round4.ps1` puts each on rekordbox's export, hash-checked:
+
+| Stick | rekordbox's export, plus rbxport's `export.pdb` patched |
+|---|---|
+| **G** | `last-row`: **one byte**. `0x22` on the 283-row page set to 282 |
+| **F** | `row-style`: all 51 row-by-row data pages in rekordbox's style (`0x20` = 1, `0x22` = rows − 1, row-group word = last row's bit); includes G's change |
+
+- G works: **`0x22` pointing past the last row is the cause.**
+- G freezes, F works: the cause is rekordbox's page style, but more than that one value.
+- Both freeze: the cause is in the file header or the page bookkeeping (header `0x10`, empty candidates past the end, next-unused page), or in row contents. Those come next.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
