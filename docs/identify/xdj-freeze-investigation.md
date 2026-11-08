@@ -645,3 +645,29 @@ Artists tolerate a set index_shift at 144 rows to a page (R20 G works with 4576)
 - **G freezes:** rbxport's index_shift of 0 on tracks is a cause (Round 9's "changed behaviour" fits).
 - **F freezes, especially on Album:** album index_shift on rbxport's full pages is a cause. Next: where the limit is (rows per page or shift value).
 - **Either works:** that clause is wrong.
+
+**Round 21 result (user, 2026-11-08): both worked flawlessly.** Writes: both opened and closed (68 → 70).
+
+- **Track index_shift of 0 is not a cause** [OBS: G21].
+- **Album index_shift set on 98-row pages is not a cause** [OBS: F21]. The Round 20 model's second and third clauses are withdrawn.
+
+### Where that leaves the evidence
+
+- `pdb_rowswap.py 0 --compact --keep-shift` run on R18 G rebuilds rbxport's track pages **byte for byte**. rbxport's own layout is what the repacker produces, so layout is not a variable for R18 G.
+- F20 (froze) and F21 (works) carry the same 21 strings in every track. They differ only in `remixer_id`, string offsets, and the unreferenced bytes left by in-place `isrc-blank`, which both carry in different forms.
+- Every "froze" before Round 18 was a single try, and Round 19 showed a working file can freeze once. **R18 G's file is the only freeze confirmed twice** (R18 on G, R19 on F).
+
+R18 G against the working G21: decoded content is equal except what G21 still carries and Round 18 cleared, plus `0x10` = 1, no seq-ahead or pad, `0x14` = 0, rbxport's ISRC form, and the UTF-16 lengths counting a NUL. R17 F had all of those fixed and froze once; if that freeze was real, no difference found so far explains it.
+
+## Round 22: the content fixes on the confirmed freeze, and a repeat (`round22.ps1`)
+
+| Stick | |
+|---|---|
+| **G** | R18 G (froze twice) + header5, pad, seq-ahead, utf16-nul, `0x14` from rekordbox, ISRCs blanked; its fixed ANLZ files. Decoded content equal to the working G21's. |
+| **F** | **R17 F again, unchanged** (froze once). |
+
+Each stick is tried twice from a fresh power-on.
+
+- **G works, F works:** R17 F's freeze was not reproducible. The content fixes (one or more of `0x10`, `0x14`, ISRC, NUL) fix R18 G; split them next.
+- **G works, F freezes twice:** R17 F has a real cause not yet found; compare it with G22 byte for byte.
+- **G freezes:** the content fixes are not enough for rbxport's own file, so the difference is in something not yet decoded.
