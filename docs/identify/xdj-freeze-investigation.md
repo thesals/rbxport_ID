@@ -66,6 +66,26 @@ Test steps:
 1. Plug **G** into one XDJ-1000 and press USB.
 2. Then plug **F** in and press USB.
 
+**Result (user, 2026-11-07): G loaded fine; F froze as before.** The freeze follows rbxport's export onto a stick that works with rekordbox's. **The stick, its size and the superfloppy layout are ruled out** [OBS]; item 1 of the ranking is closed.
+
+## Export file-by-file diff (`diff_trees.py`, full backups)
+
+- Identical: all 1,304 Artwork files, the My Settings files, 330 of 353 audio files, and the ANLZ folders of the matching tracks (331 files).
+- **23 audio paths differ.** In names cut to 48 characters rekordbox keeps the space before the extension (`… (Original .aiff`), where rbxport trims it. rekordbox numbers duplicate names `-1`, `-2`, `-3`, where rbxport uses the track ID (`-159`). It writes a folder name's trailing dot as `_` (`Anna V_`), where rbxport drops the dot. The 69 ANLZ files of those tracks sit in different folders to match. These are read when a track loads, not as the stick mounts. [OBS] Worth matching later, but they don't cause this freeze.
+- Different bytes on a shared path: `export.pdb`, `exportExt.pdb`, `exportLibrary.db`, `DEVSETTING.DAT` and 660 ANLZ files.
+- Only rekordbox's: `RBFLTR.DAT`, `extracted/gcred.dat`, `exportLibrary.db-shm` and `-wal`. Only rbxport's: `rbxport/manifest.json`, `playlists3.sync`, `playlists3Plus.sync`, `/.rbxport-write.lock`.
+
+## Round 2: databases against everything else
+
+Both sticks start as rekordbox's working export, mirrored from the backup. Each then takes one half of rbxport's mount-time differences (`round2.ps1`, hash-checked):
+
+| Stick | rekordbox's export, plus rbxport's |
+|---|---|
+| **G** | `export.pdb` and `exportExt.pdb` |
+| **F** | `DEVSETTING.DAT`, `exportLibrary.db`, `playlists3*.sync`, `rbxport/manifest.json` and `.rbxport-write.lock`, without `RBFLTR.DAT`, `extracted/` or `exportLibrary.db-shm`/`-wal` |
+
+Audio and ANLZ stay rekordbox's on both, since the freeze comes before a track loads. Whichever stick freezes holds the cause.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
