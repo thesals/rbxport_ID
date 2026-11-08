@@ -7,7 +7,8 @@ Status: open. Round 1 handed to the user (2026-11-07). No release until the root
 - **Player:** Pioneer XDJ-1000 (mk1), firmware 1.13.
 - **Freezes:** an rbxport export of a 353-track playlist (an intelligent playlist, exported as a plain playlist). The player locks up completely as it reads the stick, at or right after "My Settings found, press MENU to load". BACK does nothing, and only power-cycling recovers it.
 - **Works:** rekordbox 7.2.14's export of the same 353 tracks (stick F).
-- **Freeze point:** still to be confirmed exactly (see Round 1).
+- **Freeze point** (user, 2026-11-07, stick G with rbxport v1.2.11's export): the player boots normally with the stick in or out. On pressing **USB**, the "My Settings data" screen appears and the player freezes there completely. **Same on both of the user's XDJ-1000 mk1 units**, so it is not one unit's fault.
+- What that rules in: the player is still at mount and first read. It has found and read the My Settings files (byte-identical on both sticks) and is reading the rest of the stick, `export.pdb` most likely, behind that screen. Track loading (ANLZ, audio) has not started, so the `.EXT` tag order (item 5 below) and the audio formats are unlikely.
 
 ## Sticks
 
@@ -38,7 +39,7 @@ Every rbxport export tested so far went onto G, and every rekordbox export onto 
 4. **Files on the stick.**
    - rekordbox writes and rbxport doesn't: `PIONEER/rekordbox/RBFLTR.DAT` (232 bytes, dated 2014) and `PIONEER/extracted/gcred.dat`.
    - rbxport writes and rekordbox doesn't: `PIONEER/rbxport/manifest.json` (697 KB), `PIONEER/rekordbox/playlists3*.sync` and `/.rbxport-write.lock`.
-5. **ANLZ `.EXT` tag order** (every file). rekordbox: `PPTH PWV3 PCOB PCOB PCO2 PCO2 PQT2 PWV5 PWV4 PSSI`. rbxport: `PPTH PWV3 PQT2 PWV5 PWV4 PSSI PCOB PCOB PCO2 PCO2`. The tag set and lengths are the same. This is **lower for a freeze on reading the stick**, since a player reads ANLZ on loading a track, and **high if the freeze is on track load**. `.DAT` sequences are identical. `.2EX` lacks `PVDI` in 338 files (the mk1 doesn't read `.2EX`).
+5. **ANLZ `.EXT` tag order** (every file; now low, since the freeze comes before any track loads). rekordbox: `PPTH PWV3 PCOB PCOB PCO2 PCO2 PQT2 PWV5 PWV4 PSSI`. rbxport: `PPTH PWV3 PQT2 PWV5 PWV4 PSSI PCOB PCOB PCO2 PCO2`. The tag set and lengths are the same. This is **lower for a freeze on reading the stick**, since a player reads ANLZ on loading a track, and **high if the freeze is on track load**. `.DAT` sequences are identical. `.2EX` lacks `PVDI` in 338 files (the mk1 doesn't read `.2EX`).
 
 Still to do: parse both `export.pdb` files with an independent parser (crate-digger's `rekordbox_pdb.ksy`) and compare every table. So far the comparison used rbxport's own reader plus a raw decode of the page headers.
 
