@@ -368,11 +368,31 @@ Not patchable in place, so left for a page rebuild if these both hang:
 - strings 2 and 3, analyze_date and kuvo_public, which rbxport leaves empty;
 - the artist and remixer numbering.
 
-**Report back:**
-- **Did it freeze?** Yes or no.
-- **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
-- **If no:** open the playlist and load two tracks, including `ElezD - Quatro (Original Mix)`, the 32-bit file, and say what happens.
+**Round 11 result (user, 2026-11-08): both froze at My Settings.** F's writes: `export.pdb` opened (`0x10` 5 → 4, sequence 68 → 69) and never closed (`player-written/round11-F`). G was not plugged back in.
 
-**What each answer means:**
-- **Freezes:** it's the stick or its layout, not rbxport. Next round: G re-laid out with an MBR partition, then rbxport on F.
-- **Works:** it's rbxport's export. Next round: hybrid sticks built from these two exports (rekordbox's `export.pdb` with our ANLZ files and the reverse, then the extra files added or removed), each halving what is left.
+So on rbxport's own, consistent file, **index_shift is not sufficient**, and neither are header5, padding, sequence, the UTF-16 NULs, `0x14` and the ISRC together with it [OBS].
+
+### What else differs (checked 2026-11-08)
+
+- **Index pages:** identical in form in both files for every table except tracks and history, where rekordbox's list its pages with deleted slots. Not a difference for rbxport's own file.
+- **Header and chains:** same 20 tables, same index pages, same first pages; rbxport's data pages sit in a different order and its empty candidates lie past the end of the file (tested with `pad`).
+- **Row order:** rbxport writes tracks in ID order. rekordbox's are shuffled (1, 5, 2, 141, 3, 55, …) and run 7 to 9 to a page, the marks of rows rewritten in place.
+- **Row slack:** every rekordbox track row ends with at least 40 spare bytes (40 to 517); rbxport's end within 3. Album rows also carry 4 to 9 spare bytes. Never tested.
+- **Artists:** rekordbox has 256 (remixers included, and tracks' `remixer_id` set on 50); rbxport 239 with `remixer_id` 0.
+
+## Round 12, revised: row content against page packing (`round12.ps1`)
+
+Round 11 leaves two kinds of difference in tracks, artists and albums: what the rows say, and how rbxport packs them. Round 12 splits those.
+
+| Stick | rbxport's export, its `export.pdb` with |
+|---|---|
+| **G** | as prepared above: tracks rebuilt with strings 2, 3, 4, kuvo_public and analyze_date from rekordbox, index_shift on all three tables |
+| **F** | **rekordbox's own rows** for tracks, artists and albums (`pdb_rowswap.py`: each row's bytes, slack included, in ID order), packed by rbxport's rules into rbxport's page slots, plus header5 and seq-ahead |
+
+Verified: F's 353 track, 256 artist and 239 album rows equal rekordbox's byte for byte apart from index_shift (re-set per slot); every other table is rbxport's. Tracks take 45 pages (8 appended at 98 to 105), artists 3 (one appended at 106). The previous F (G plus header5, seq-ahead, NULs, `0x14`, ISRC) is kept as `round12/F-export.fill-plus.pdb`.
+
+F's track rows name rekordbox's file names, so the 23 renamed files will not load from F; any other track should.
+
+- **F works:** the cause is in the row content. G then says whether the empty strings are it; if G hangs, the rest is numbering, remixers, slack or ISRC, split next.
+- **F hangs:** rbxport's packing hangs the player even with rekordbox's rows: page fill, row order or the page header fields (`0x20`, `0x22`, group word) are next.
+- **Both work:** the empty strings are enough.
