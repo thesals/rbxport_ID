@@ -315,6 +315,55 @@ On Round 9 G's file (`round10.ps1`):
 | **G** | `utf16-nul`: the 9 UTF-16 strings lose the NUL counted in their length (9 bytes) |
 | **F** | `u14-from` rekordbox (each track's `0x14`, by ID) and `isrc-blank` (the 280 ISRCs emptied, as rekordbox writes 73 of its own) |
 
+**Result (user, 2026-11-07): both froze at My Settings.** Writes: `export.pdb` opened (`0x10` 5 → 4, sequence +1) on both, and never closed.
+
+### Correction: the Round 8 to 10 hybrids carried a stale index
+
+rekordbox's tracks **index page** (page 1) is not filler. Its header has `0x26` = 13, its head ends in a count of 5, and its first entries are `(u16, u16)` pairs whose second half is a page number shifted left by 3: 92, 99, 100, 103 and 101, with `0x1fff`/`0xfff8` as filler. **Those are exactly rekordbox's five `0x34` track pages, and each has deleted row slots** (92: slot 8 free; 99: 5 and 9; 100: 5; 101: 1; 103: 1, 3, 5 and 7). The index lists pages with free slots, rekordbox's own leftovers from editing the table [OBS]. rbxport never deletes rows, so its empty index is right for its own file. That matches rekordbox's 61-track export, which `build.rs` cites.
+
+`pdb_transplant.py` kept rekordbox's index page while writing rbxport's pages into those slots, or zeroing them. **In Rounds 8 G, 9 and 10, the index pointed the player at pages that no longer matched it**, which may be enough on its own to hang a reader that follows it. Their results are therefore weaker than recorded:
+- Round 8's split still stands: F, with rekordbox's tracks and consistent index, worked; rbxport's own file, with consistent index, hangs.
+- **The "still hangs" of Rounds 9 and 10 do not rule out index_shift, the NULs, `0x14` or the ISRC.**
+
+From Round 11 on, no more hybrids. Sticks carry **rbxport's own export** (`full\G`: its paths, ANLZ files and index pages consistent) with only its `export.pdb` patched.
+
+## Round 11: rbxport's own export, patched (`round11.ps1`)
+
+| Stick | rbxport's export, its `export.pdb` with |
+|---|---|
+| **G** | `index-shift=0+2+3` only |
+| **F** | `index-shift=0+2+3,header5,pad,seq-ahead,utf16-nul,u14-from,isrc-blank`: every in-place fix found so far |
+
+- G works: **index_shift is the root cause.**
+- G hangs and F works: one of the other in-place fixes is needed as well. Split them next.
+- Both hang: the empty strings or the numbering, which needs a page rebuild.
+
+rekordbox's values for the empty slots, for that rebuild:
+- strings 2 and 3 are small numbers: `4`/`4` on 272 tracks, `2`/`2` on 47, `5`/`4` on 25;
+- string 4 is `1` on 5 tracks;
+- kuvo_public is `ON` on 306 tracks and empty on 47;
+- analyze_date is the analysis date.
+
+### The writer already has the tool
+
+`FileBuilder::add_table_numbered` gives each row its index on the page, and `exportExt.pdb`'s tag table uses it (`ext_pdb.rs`: `row[2..4] = index * 32`). That is rbxport's `exportExt.pdb`, the file that worked in Round 3. `export.pdb`'s tracks, artists and albums go through plain `add_table` (`rbl-export/src/lib.rs`, `export_pdb`), so their index_shift stays 0. If Round 11 confirms it, the fix is to add tables 0, 2 and 3 with `add_table_numbered` and the same closure, plus a test against rekordbox's rule.
+
+### Ready if Round 11 hangs on both: Round 12
+
+`pdb_retrack.py` rebuilds rbxport's tracks pages with chosen string slots filled from rekordbox's file by track ID, using rbxport's own packing rules. **With nothing to fill, its output matches rbxport's file byte for byte**, apart from the padding to next-unused that it adds. Prepared in `round12/`:
+
+| Stick | rbxport's `export.pdb` |
+|---|---|
+| **G** | tracks rebuilt with strings 2, 3 and 4, kuvo_public and analyze_date from rekordbox (1,370 strings; 38 pages, the new one at 98), index_shift on all three tables |
+| **F** | the same, plus header5, seq-ahead, utf16-nul, u14 and isrc-blank |
+
+Round 12 F differs from rekordbox's file only in:
+- artist and remixer numbering;
+- the blanked ISRCs;
+- 25 date_added values;
+- the 23 renamed files' paths, which match rbxport's files on that stick;
+- index_shift values, which follow the same rule over a different packing.
+
 Not patchable in place, so left for a page rebuild if these both hang:
 - strings 2 and 3, analyze_date and kuvo_public, which rbxport leaves empty;
 - the artist and remixer numbering.
