@@ -419,3 +419,24 @@ What each result means:
 - **F works, G hangs:** the empty strings are not it. The cause is in the artist and remixer numbering, the ISRC or date_added; split next.
 - **Both hang:** the empty strings are one cause and something in G's list is another.
 - **Both work:** the empty strings matter only together with something else that G fixes.
+
+**Round 13 result (user, 2026-11-08): G froze at My Settings; F worked and played three tracks.** Writes: G opened `export.pdb` (`0x10` 5 → 4, sequence 68 → 69) and never closed it; F opened and closed it (sequence 68 → 70) (`player-written/round13-*`).
+
+- **The empty strings are not the cause** [OBS]: rekordbox's rows with strings 2, 3, 4, kuvo_public and analyze_date blanked exactly as rbxport writes them, and with no slack, work.
+- Row slack is ruled out with them (F's rows were compacted).
+- G still hangs with those strings filled, so the cause is in what G kept of rbxport's: **the artists table with its numbering and the tracks' `remixer_id`, the albums table, 25 date_added values, or the renamed files' paths**. The blanked ISRC is ruled out too: rekordbox itself writes 73 empty ones, and F14 below carries 280.
+
+## Round 14: artists against the rest (`round14.ps1`)
+
+Both start from Round 13 F (works): rekordbox's rows, compacted, the five strings blanked, header5, seq-ahead.
+
+| Stick | plus, from rbxport's file |
+|---|---|
+| **G** | the artists table (239 rows), and each track's `artist_id` and `remixer_id` (`pdb_rowswap.py 0+3 --fields=artist_id+remixer_id`) |
+| **F** | the albums table, and each track's date_added, filename, file_path and analyze_path (`pdb_rowswap.py 0+2 --strings=…`), with `utf16-nul` and `isrc-blank` |
+
+Checked against rekordbox's file: G's artists are rbxport's 239 rows byte for byte and its tracks differ only in the five blanked strings, artist_id and remixer_id. F's tracks differ only in those strings, the blanked ISRCs, date_added and the 23 renamed files' names and paths; its albums are rbxport's (3 NULs dropped).
+
+- **G hangs, F works:** the cause is rbxport's artists: their numbering, the 17 missing remixer rows, or `remixer_id` = 0. Split next.
+- **F hangs, G works:** albums, date_added or the renamed paths.
+- **Both work:** the cause needs both halves together.
