@@ -591,3 +591,25 @@ Every track gets the same artist name in both files, and rbxport's artists table
 - **G works, F freezes:** results follow the file; the player is deterministic per file. Split R18 G against R18 F next (`0x14`, ISRC form, artists and remixers, header, index_shift).
 - **G freezes, F works:** results follow the stick. Every G result since Round 8 needs re-reading, and each future file must be tested on both sticks.
 - **Both work or both freeze:** the player is not deterministic. Repeat each file to measure it.
+
+**Round 19 result (user, 2026-11-08):**
+- **G (R18 F's file) froze the first time**, when the stick went in with the XDJ already in USB mode. After a restart it **worked without issue**: `export.pdb` opened and closed (68 → 70).
+- **F (R18 G's file) froze at the browser** as soon as scrolling started (no writes; `0x10` = 1).
+
+**Results follow the file, not the stick** [OBS]: R18 F's file works on both sticks and R18 G's freezes on both. The procedure matters, though: a working file froze once when inserted with the player already in USB mode. A single "froze" is therefore weaker evidence than a single "worked". From Round 20 on, every checklist uses one routine: player powered on with no stick, stick in, then USB.
+
+## Round 20: artist content against page layout (`round20.ps1`)
+
+R17 F (froze) and R18 F (worked) differ in the artists table and each track's `artist_id`/`remixer_id`, and in how their track, artist and album pages were packed: R17 F's are rbxport's own pages patched in place, R18 F's were repacked by `pdb_rowswap.py`. The backslash was cleared in Round 18. Round 20 swaps the artist side:
+
+| Stick | |
+|---|---|
+| **G** | R18 F (worked) with rbxport's artists table and rbxport's `artist_id`/`remixer_id` (`pdb_rowswap.py … 2`, `pdb_patch.py ids-from=`). Its tracks equal R17 F's apart from index_shift. |
+| **F** | R17 F (froze) with rekordbox's artists table and rekordbox's `artist_id`/`remixer_id`. Its tracks equal R18 F's apart from index_shift. |
+
+So G is R17 F's content in R18 F's layout, and F the reverse. One more difference rides along: album index_shift (G's albums 0, as R18 F's; F's set, as R17 F's).
+
+- **G freezes, F works:** the cause is in the artist content.
+- **G works, F freezes:** the cause is in how rbxport's pages are laid out, or in the album index_shift.
+- **Both work:** the cause needs the artist content and rbxport's layout together.
+- **Both freeze:** repeat both before reading anything into it.
