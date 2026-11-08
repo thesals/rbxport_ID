@@ -195,6 +195,41 @@ The browser screen where Round 5 G froze is where the player shows the HISTORY f
 - Freezes on the browser screen: history is ruled out. Next are the playlist-tree row, the unk18 row, then tracks, artists and albums.
 - Freezes at My Settings: the copied pages themselves break something.
 
+**Result (user, 2026-11-07): froze at My Settings.** G enumerates again in a different port.
+
+### What the player wrote, Rounds 5 and 6
+
+| Stick | `export.pdb` written by the player | `exportExt.pdb` (rekordbox's) written by the player | froze at |
+|---|---|---|---|
+| Round 5 G: pad | nothing | `0x10` 5 → 4, sequence 14 → 15 | browser screen |
+| Round 6 F: pad + history pages (sequence set to 58) | **page 39's sequence 58 → 0**, nothing else | `0x10` 5 → 4, sequence 14 → 15 | My Settings |
+
+**The player "opens" every database at mount** [OBS]. It lowers header `0x10` (5 → 4) and bumps the header sequence, and on a clean session it later restores both (Round 2: rekordbox's `export.pdb` sequence +2, `0x10` back at 5). On rbxport's `export.pdb`, whose `0x10` is 1, it never writes the header at all.
+
+**Page sequences against the header sequence:**
+
+| File | header seq | highest page seq | pages with seq ≥ header |
+|---|---|---|---|
+| rekordbox `export.pdb` | 2026 | 2016 | none |
+| rekordbox `exportExt.pdb` | 14 | 10 | none |
+| rbxport `export.pdb` | 58 | 58 | **page 38 (unk18)** |
+| rbxport `exportExt.pdb` (worked, Round 3) | 3 | 2 | none |
+
+rekordbox's header sequence is always **ahead** of every page's. rbxport's `finish` writes "the sequence the pages reached", so its last page equals the header. In Round 6 I gave the history pages the header's sequence, and the player zeroed one of them, then froze earlier than Round 5 G. The pattern fits a reader that treats a page **not older than the header** as an unfinished write and tries to roll it back. [ASSUME, now the leading suspect for what is left.] It would also explain why Round 6's result can't clear the history table: that round added two more such pages.
+
+## Round 7: the header sequence ahead of every page
+
+`round7.ps1`, both on rekordbox's export, against Round 5 G's file (`pad`):
+
+| Stick | Round 5 G's padded `export.pdb`, plus |
+|---|---|
+| **G** | `seq-ahead`: header sequence 58 → 68 (one byte) |
+| **F** | `seq-ahead,header5`: the same and header `0x10` 1 → 5 |
+
+- G works: **the header sequence not being ahead of every page is the second cause.**
+- G freezes on the browser screen and F works: `0x10` matters once the sequence is right.
+- Both freeze on the browser screen: the sequence is ruled out; back to the history table (copied with its own sequences) and the remaining rows.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
