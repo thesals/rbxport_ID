@@ -22,8 +22,7 @@ These links always download the newest build. Every release, with its notes and 
 ## What this fork adds
 
 ### Its own library; rekordbox is only imported from
-- rbxport ID keeps its library in its own folder (`%APPDATA%
-bxport\library` on Windows, `~/Library/Application Support/rbxport/library` on a Mac), with the same tables as rekordbox, so analysis, USB export and PRO DJ LINK work as before.
+- rbxport ID keeps its library in its own folder (`%APPDATA%\rbxport\library` on Windows, `~/Library/Application Support/rbxport/library` on a Mac), with the same tables as rekordbox, so analysis, USB export and PRO DJ LINK work as before.
 - **rekordbox's library is never written.** rbxport ID imports from a verified copy and checks that the original is unchanged afterwards.
 - **Import again at any time.** New tracks come in whole. Tracks you already have get only what rbxport ID is missing, and tags you changed in rbxport ID are never replaced. The import report lists what was taken and what was kept. For tracks you choose, **Take rekordbox's tags** adopts rekordbox's version instead.
 - Read more in [Library and import](docs/user/library-and-import.md).
@@ -39,17 +38,32 @@ bxport\library` on Windows, `~/Library/Application Support/rbxport/library` on a
 - **Create New Intelligent Playlist** (right-click **Playlists**, a folder or a playlist) builds a playlist from rules such as genre, BPM range, key, rating, date added and My Tags. It updates itself as your library changes.
 
 ### USB export
-- **Export Playlist** and **Export Folder** list your connected USB drives, so you pick the stick instead of hunting for it in a file browser. **Other location…** still lets you choose any folder.
+- **Export Playlist**, **Export Folder** and **Export Track** list your connected USB drives, so you pick the stick instead of hunting for it in a file browser. **Other location…** still lets you choose any folder.
+- Drives are named as Explorer names them, label and letter (**DJ (G:)**), so two sticks with the same label can be told apart. On a Mac a drive keeps its name.
+- **Devices** and **Sync Manager** list only USB drives and drives that already hold an export, not your internal disks.
+- **Works on older players.** Sticks now load on the XDJ-1000 mk1 (firmware 1.13), which used to freeze at the My Settings screen or on the browse screen. See [Fixed in v1.2.14](#fixed-in-v1214).
 
 ### Installers and updates
 - A Windows installer and a Mac app are built for every release on GitHub, and each is signed for the built-in updater.
+
+### Fixed in v1.2.14
+
+An XDJ-1000 mk1 (firmware 1.13) froze on rbxport ID's USB sticks while it read rekordbox's sticks of the same tracks. Two dozen rounds of test sticks traced it to one cause: **text with accents or symbols (é, Ø, a no-break space) was stored a few bytes off the 4-byte boundary rekordbox always uses**, in album names and in track titles and paths. A single misplaced title was enough to freeze the player. The whole investigation is in [the XDJ freeze record](docs/identify/xdj-freeze-investigation.md).
+
+- Exports now store that text exactly as rekordbox does.
+- **Update sticks you exported before v1.2.14**: sync them once, or export them again, and they load on the XDJ. **Verify** reports an older stick as needing it.
+- Tracks renamed because two shared a file name no longer get a Windows backslash in their path on the stick.
+- Earlier in this run of fixes, each matching what rekordbox writes:
+  - file names are cut to rekordbox's 48 characters;
+  - track records carry the header values rekordbox writes;
+  - playlists of more than 255 tracks record their row count correctly.
 
 ### Coming next
 - **Playlists from a track**: pick a track and get a playlist of tracks that go with it by genre, tempo, key and energy, like iTunes' Genius. The design is drafted and waiting on decisions.
 
 ## Status
 
-This fork is developed and tested on Windows. The Mac build is new and waiting for its first test on a real Mac; if you try it, the [Mac guide](docs/user/macos.md#testing-checklist-for-whoever-tries-it-first) has a checklist of what to report.
+This fork is developed and tested on Windows, and its USB exports are tested on an XDJ-1000 mk1 (firmware 1.13). The Mac build is new and waiting for its first test on a real Mac; if you try it, the [Mac guide](docs/user/macos.md#testing-checklist-for-whoever-tries-it-first) has a checklist of what to report.
 
 Problems and suggestions: [open an issue](https://github.com/thesals/rbxport_ID/issues). Please don't report this fork's issues to upstream rbxport.
 
@@ -57,7 +71,8 @@ Problems and suggestions: [open an issue](https://github.com/thesals/rbxport_ID/
 
 The fork's specs:
 - [Own library](docs/library/OWN_LIBRARY_SPEC.md);
-- [Track identification](docs/identify/IDENTIFY_SPEC.md).
+- [Track identification](docs/identify/IDENTIFY_SPEC.md);
+- [The XDJ-1000 freeze investigation](docs/identify/xdj-freeze-investigation.md): how the USB export fix was proven, round by round.
 
 Releases come from [`.github/workflows/fork-release.yml`](.github/workflows/fork-release.yml), which runs on every push to `main`.
 
