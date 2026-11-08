@@ -86,6 +86,38 @@ Both sticks start as rekordbox's working export, mirrored from the backup. Each 
 
 Audio and ANLZ stay rekordbox's on both, since the freeze comes before a track loads. Whichever stick freezes holds the cause.
 
+**Result (user, 2026-11-07): G froze; F worked.** The freeze is in **rbxport's databases** (`export.pdb` or `exportExt.pdb`) [OBS]. DEVSETTING, OneLibrary, the extra and missing files, ANLZ and audio are all ruled out for this freeze.
+
+### The player writes to `export.pdb`
+
+Building Round 3, the hash check found that F's `export.pdb` no longer matched rekordbox's backup, though its size and date did (robocopy skipped it for that reason; it has been restored and the check now passes). The changed file is saved as `player-written/round2-F-export.pdb`. **The XDJ changed exactly one field:** the file header's sequence at `0x14`, from 2026 to 2028. Nothing else changed, and no history rows were written [OBS, XDJ-1000 fw 1.13].
+
+So the player **writes** to the database, not only reads it, and it does so at mount or while browsing. A freeze in that write path is possible, which makes the file header and the page bookkeeping (empty candidates, next-unused page) more likely suspects than the row contents.
+
+### Independent walk of both `export.pdb` files (`pdb_check.py`)
+
+`pdb_check.py` was written from Deep Symmetry's published format notes, not rbxport's code (installing rekordcrate was blocked by the session's safety check). Both files' page chains run cleanly from first to last page. The type, index and present flags match the header row counts in both. Its free/used arithmetic flags nearly every page in **both** files equally, so that check is my misreading of those fields, not a lead. The differences that remain:
+
+| | rekordbox 7.2.14 | rbxport v1.2.11 |
+|---|---|---|
+| header `0x10` | **5** | **1** (copied from a blank 7.2.11 export) |
+| header sequence `0x14` | 2026 | 58 |
+| pages in file / next unused | 106 / 107 | 94 / 98 |
+| empty candidates past end of file | 1 (tracks: 106) | **4** (artwork 94, columns 95, unk17 96, unk18 97) |
+| tracks data pages | 45; 4 with flags `0x34` and `0x20`/`0x22` = 8191 | 37, all flags `0x24` |
+| history page flags | `0x34`, `0x20` = 2 | `0x24`, `0x20` = rows |
+| data page `0x20`/`0x22` | 1 / rows − 1 (written-row style) | rows / 0 (bulk style) |
+| row group word after the present flags | one bit (last row written) | a copy of the present flags |
+
+## Round 3: `export.pdb` against `exportExt.pdb`
+
+`round3.ps1`: both sticks are rekordbox's export plus exactly one of rbxport's database files, hash-checked (every other non-audio file is rekordbox's).
+
+| Stick | rekordbox's export, plus rbxport's |
+|---|---|
+| **G** | `export.pdb` |
+| **F** | `exportExt.pdb` |
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
