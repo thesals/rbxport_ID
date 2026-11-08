@@ -701,3 +701,31 @@ Decoded content equals R22 G's; the leftover junk is gone with the rebuild. G an
 - **G works, F freezes:** misaligned UTF-16 strings in tracks are the second root cause, and a misaligned title alone is enough. The fix: the writer aligns every `0x90` string to 4 bytes, as rekordbox does.
 - **Both work:** alignment in tracks is a cause, but not the title on its own (track 19's path, most likely).
 - **G freezes:** alignment is not it; re-split R22 G against R21 G.
+
+**Round 23 result (user, 2026-11-08): G worked flawlessly; F froze on the browse screen.** Writes: G opened and closed (68 → 70); F's `0x10` 5 → 1 and 68 → 69, never closed (the same write as R20 F's freeze at Albums).
+
+## Root cause [OBS]
+
+**rbxport writes UTF-16 (`0x90`) strings at offsets that are not a multiple of 4 within the page. rekordbox puts every one on a 4-byte boundary, and the XDJ-1000 mk1 on firmware 1.13 freezes on the export when one it reads is not.**
+
+- **Album names** (`album_row` puts every name at `0x16`): Round 15 F froze, Round 16 F worked; the only change was the 3 UTF-16 album rows.
+- **Track strings** (`track_row` appends strings back to back): Round 23 G worked, Round 23 F froze; the only change was **one string, track 128's title, moved from offset ≡ 0 to ≡ 3** (page 54, 65 bytes).
+
+Rows start on a 4-byte boundary of a heap that starts at `0x28`, so a row offset that is a multiple of 4 is a page offset that is too. Short ASCII strings are never aligned, by rbxport or by rekordbox. The freeze shows at My Settings or on the browse screen, often as the cursor reaches Albums. The player's writes record it as an `export.pdb` opened and never closed.
+
+Ruled out along the way: the stick, settings files, ANLZ, audio, `exportExt.pdb`, page packing and layout, row order and slack, index_shift (tracks, artists, albums), the header value `0x10` and sequence, padding, `0x14`, the empty strings 2–4 / kuvo_public / analyze_date, artist numbering and remixers, ISRC (blanked), date_added, and the backslash. Rounds 8 to 14 also carried the misaligned strings, which is why so many single fixes "did not help".
+
+## The fix (local, `feature/identify`)
+
+- `rbl-pdb` `build::push_located_string`: pads before a UTF-16 string so it starts on a 4-byte boundary. Used by `track_row`, `album_row` (UTF-16 names at `0x18`, as rekordbox writes them) and `artist_row` (`0x0c`; [ASSUME], as no UTF-16 artist name was available to compare). Genres, labels, keys, colours and playlist names already start on a boundary.
+- `long_utf16le`: the length no longer counts the trailing NUL pair, which still follows, as in rekordbox's file. This is what every working stick since Round 13 carried; it is not proven necessary on its own.
+- `rbl-export` `layouts()`: collision renames are joined with `/`, and a `\` from an older manifest is normalised. A real bug (Windows only), but not the freeze.
+- `verify()` reports a UTF-16 track string, album name or artist name off a 4-byte boundary, so a stick written by v1.2.11 shows up as needing a re-sync.
+- Tests: rekordbox's exact album row for `MillÃ©simes #1`; UTF-16 track strings aligned whatever precedes them; artist names; an end-to-end export with every UTF-16 string checked on the page; `verify()` flagging the v1.2.11 album layout; collision paths without a backslash. Clippy clean; the workspace test suite passes (two `rbl-deck` timing tests failed once under load and pass on their own).
+
+## Round 24: the fixed writer's output, on both sticks (`round24.ps1`)
+
+Round 23 G also carried header5, `0x14`, blank ISRCs, seq-ahead and padding. Round 24 drops them: **rbxport's v1.2.11 export with only the three changes the fixed writer makes** (UTF-16 strings aligned, lengths without the NUL, backslashes made `/`). `0x10` = 1, `0x14` = 0, rbxport's ISRCs and index_shift 0 stay. The same file goes on both sticks for two independent tries.
+
+- **Both work:** the fix is sufficient; next is a test build to export a fresh stick from the app.
+- **Either freezes:** one of the dropped changes is also needed; add them back in halves.

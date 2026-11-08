@@ -431,16 +431,20 @@ fn layouts(tracks: &[SourceTrack], ids: &[u32], root: &str, previous: Option<&Ma
                 place.file_name = Path::new(&old.audio).file_name().map_or_else(|| place.file_name.clone(), |f| f.to_string_lossy().into_owned());
             }
         }
+        // A device path separates with '/', never '\': `Path::join` on Windows
+        // put a backslash into collision renames, and older manifests still
+        // carry them. FAT and exFAT names cannot contain one.
+        place.audio = place.audio.replace('\\', "/");
         if !used.insert(path_key(&place.audio)) {
             let original = Path::new(&place.audio);
             let stem = original.file_stem().unwrap_or_default().to_string_lossy();
             let ext = original.extension().map_or(String::new(), |s| format!(".{}", s.to_string_lossy()));
-            let parent = original.parent().unwrap_or(Path::new("/Contents"));
+            let parent = original.parent().map_or_else(|| "/Contents".to_owned(), |p| p.to_string_lossy().replace('\\', "/"));
             let mut serial = 0_u32;
             loop {
                 let suffix = if serial == 0 { format!("-{id}") } else { format!("-{id}-{serial}") };
                 let name = format!("{stem}{suffix}{ext}");
-                let audio = parent.join(&name).to_string_lossy().into_owned();
+                let audio = format!("{parent}/{name}");
                 if used.insert(path_key(&audio)) { place.audio = audio; place.file_name = name; break; }
                 serial += 1;
             }

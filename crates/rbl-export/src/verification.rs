@@ -169,9 +169,34 @@ fn verify_track_records(root: &Path, errors: &mut Vec<String>) -> Result<()> {
             if expected != 0 && pdb.u2_at(row, 0x5a) != expected {
                 errors.push(format!("Track {id}: DeviceSQL audio format does not match {filename}"));
             }
+            if (0..rbl_pdb::rows::TRACK_STRINGS).any(|slot| misaligned_utf16(&pdb, row, usize::from(pdb.u2_at(row, 0x5e + slot * 2)))) {
+                errors.push(format!("Track {id}: UTF-16 text not on a 4-byte boundary"));
+            }
+        }
+    }
+    // Artists and albums of the near-offset subtypes locate their name by a
+    // one-byte offset.
+    for (kind, page, subtype, id_at, name_at) in [
+        ("Artist", rbl_pdb::PageType::Artists, 0x60, 4, 0x09),
+        ("Album", rbl_pdb::PageType::Albums, 0x80, rbl_pdb::rows::ALBUM_ID_AT, 0x15),
+    ] {
+        if let Some(table) = pdb.table(page) {
+            for row in pdb.rows(table) {
+                if pdb.u2_at(row, 0) == subtype && misaligned_utf16(&pdb, row, usize::from(pdb.u1_at(row, name_at))) {
+                    errors.push(format!("{kind} {}: UTF-16 name not on a 4-byte boundary", pdb.u4_at(row, id_at)));
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// A UTF-16 string at `offset` in `row` that does not start on a 4-byte
+/// boundary of its page. rekordbox aligns every one, and an XDJ-1000 on
+/// firmware 1.13 freezes on an album name or track title that is not
+/// (docs/identify/xdj-freeze-investigation.md, Rounds 16 and 23).
+fn misaligned_utf16(pdb: &rbl_pdb::Pdb<'_>, row: rbl_pdb::RowRef, offset: usize) -> bool {
+    offset != 0 && pdb.u1_at(row, offset) == 0x90 && !(row.offset + offset).is_multiple_of(4)
 }
 
 fn verify_assets(

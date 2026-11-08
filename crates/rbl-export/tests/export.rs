@@ -114,6 +114,87 @@ fn metadata_survives_the_round_trip() {
     assert!(artists.iter().any(|a| a.name == "Tiësto"), "{artists:?}");
 }
 
+/// rekordbox puts every UTF-16 string on a 4-byte boundary of its page, and
+/// an XDJ-1000 on firmware 1.13 freezes on an album name or track title that
+/// is not (docs/identify/xdj-freeze-investigation.md, Rounds 16 and 23).
+#[test]
+fn utf16_strings_sit_on_4_byte_boundaries_and_verification_checks_them() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let mut tracks = Vec::new();
+    for (n, title) in [(1, "Accès Gratuit"), (2, "Lua"), (3, "Heretics of Ix")] {
+        let mut t = track(src.path(), n, title, ["Tiësto", "Tawa Girl", "Ixian"][n as usize - 1]);
+        t.album = ["Elements", "Millésimes #1", "RITUALØ3"][n as usize - 1].into();
+        tracks.push(t);
+    }
+    export(dest.path(), &tracks, &[]).unwrap();
+    assert!(verify(dest.path()).unwrap().is_ok());
+
+    let path = dest.path().join("PIONEER/rekordbox/export.pdb");
+    let bytes = std::fs::read(&path).unwrap();
+    let pdb = rbl_pdb::Pdb::parse(&bytes).unwrap();
+    let mut utf16 = 0;
+    for row in pdb.rows(pdb.table(rbl_pdb::PageType::Tracks).unwrap()) {
+        for slot in 0..rbl_pdb::rows::TRACK_STRINGS {
+            let at = row.offset + usize::from(pdb.u2_at(row, 0x5e + slot * 2));
+            if bytes[at] == 0x90 {
+                utf16 += 1;
+                assert_eq!(at % 4, 0, "track string slot {slot}");
+            }
+        }
+    }
+    for (page, name_at) in [(rbl_pdb::PageType::Artists, 0x09), (rbl_pdb::PageType::Albums, 0x15)] {
+        for row in pdb.rows(pdb.table(page).unwrap()) {
+            let at = row.offset + usize::from(pdb.u1_at(row, name_at));
+            if bytes[at] == 0x90 {
+                utf16 += 1;
+                assert_eq!(at % 4, 0, "name located at row byte {name_at:#x}");
+            }
+        }
+    }
+    assert!(utf16 >= 4, "the fixture must exercise UTF-16 strings ({utf16})");
+
+    // The album row as v1.2.11 wrote it: the name straight after the prefix.
+    let album = pdb.rows(pdb.table(rbl_pdb::PageType::Albums).unwrap()).into_iter()
+        .find(|row| pdb.u1_at(*row, 0x15) == 0x18).unwrap();
+    let mut bad = bytes.clone();
+    let name_len = usize::from(pdb.u2_at(album, 0x19)) + 2; // the NUL pair follows the length
+    bad.copy_within(album.offset + 0x18..album.offset + 0x18 + name_len, album.offset + 0x16);
+    bad[album.offset + 0x15] = 0x16;
+    std::fs::write(&path, bad).unwrap();
+    let report = verify(dest.path()).unwrap();
+    assert!(report.errors.iter().any(|e| e.contains("UTF-16 name not on a 4-byte boundary")), "{:?}", report.errors);
+}
+
+/// A collision rename joins its path with '/' on every platform; Windows'
+/// `Path::join` used to put a backslash in.
+#[test]
+fn a_collision_rename_keeps_forward_slashes() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let mut tracks = Vec::new();
+    for n in 1..=2 {
+        let dir = src.path().join(format!("d{n}"));
+        std::fs::create_dir(&dir).unwrap();
+        let mut t = track(&dir, n, "Same", "Artist");
+        let same = dir.join("same.mp3");
+        std::fs::rename(&t.source_path, &same).unwrap();
+        t.source_path = same;
+        tracks.push(t);
+    }
+    export(dest.path(), &tracks, &[]).unwrap();
+    let bytes = std::fs::read(dest.path().join("PIONEER/rekordbox/export.pdb")).unwrap();
+    let pdb = rbl_pdb::Pdb::parse(&bytes).unwrap();
+    let rows = pdb.track_rows(pdb.table(rbl_pdb::PageType::Tracks).unwrap());
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|r| r.filename != "same.mp3"), "one of them is renamed");
+    for row in &rows {
+        assert!(!row.file_path.contains('\\'), "{}", row.file_path);
+        assert!(dest.path().join(row.file_path.trim_start_matches('/')).is_file(), "{}", row.file_path);
+    }
+    assert!(verify(dest.path()).unwrap().is_ok());
+}
+
 #[test]
 fn verification_rejects_player_incompatible_records_and_sync_repairs_them() {
     let src = tempfile::tempdir().unwrap();

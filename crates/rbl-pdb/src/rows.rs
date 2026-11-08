@@ -5,7 +5,7 @@
 //! the same layout, and the layout itself was validated against a real
 //! rekordbox-authored export.
 
-use crate::build::device_sql_string;
+use crate::build::{device_sql_string, push_located_string};
 
 /// Fixed portion of a track row, before the 21 string offsets.
 const TRACK_FIXED_LEN: usize = 0x5e;
@@ -147,14 +147,14 @@ pub fn track_row(input: &TrackInput) -> Vec<u8> {
     put_u2(&mut row, 0x5a, audio_file_type(&input.filename));
     put_u2(&mut row, 0x5c, 3);
 
-    // Append each string, recording where it landed.
+    // Append each string, recording where it landed. UTF-16 strings start on
+    // a 4-byte boundary (see `push_located_string`).
     let mut offsets = [0_u16; TRACK_STRINGS];
     for (slot, text) in strings.iter().enumerate() {
-        let at = u16::try_from(row.len()).unwrap_or(0);
+        let at = u16::try_from(push_located_string(&mut row, text)).unwrap_or(0);
         if let Some(entry) = offsets.get_mut(slot) {
             *entry = at;
         }
-        row.extend_from_slice(&device_sql_string(text));
     }
     for (slot, offset) in offsets.iter().enumerate() {
         put_u2(&mut row, TRACK_FIXED_LEN + slot * 2, *offset);
@@ -213,13 +213,16 @@ pub fn color_row(id: u16, name: &str) -> Vec<u8> {
 }
 
 /// `artists`: the name is located by a one-byte offset from the row start.
+///
+/// An ASCII name follows at `0x0a`. A UTF-16 name starts at `0x0c`, on a
+/// 4-byte boundary, by rekordbox's rule for UTF-16 strings; the reference
+/// export has no UTF-16 artist name to confirm it on [ASSUME].
 pub fn artist_row(id: u32, name: &str) -> Vec<u8> {
     let mut row = vec![0_u8; 10];
     put_u2(&mut row, 0x00, 0x60); // subtype: near offset
     put_u4(&mut row, 0x04, id);
     row[0x08] = 0x03; // constant rekordbox writes
-    row[0x09] = 0x0a; // the name follows immediately
-    row.extend_from_slice(&device_sql_string(name));
+    row[0x09] = u8::try_from(push_located_string(&mut row, name)).unwrap_or(0x0a);
     row
 }
 
@@ -236,18 +239,22 @@ pub fn artist_row(id: u32, name: &str) -> Vec<u8> {
 /// The id is the fourth word and the artist the third; an earlier version
 /// of this writer had them the other way round, which a player reads as
 /// every album having id 0.
+///
+/// A UTF-16 name starts at `0x18` instead, two zero bytes after the prefix,
+/// as rekordbox 7.2.14 writes `Millésimes #1` [OBS 2026-11-08]. At `0x16`
+/// it froze an XDJ-1000 on firmware 1.13 (Round 16 of
+/// docs/identify/xdj-freeze-investigation.md).
 pub fn album_row(id: u32, artist_id: u32, name: &str) -> Vec<u8> {
     let mut row = vec![0_u8; ALBUM_NAME_AT];
     put_u2(&mut row, 0x00, 0x80);
     put_u4(&mut row, 0x08, artist_id);
     put_u4(&mut row, 0x0c, id);
     row[0x14] = 0x03; // constant rekordbox writes
-    row[0x15] = u8::try_from(ALBUM_NAME_AT).unwrap_or(0x16); // the name follows immediately
-    row.extend_from_slice(&device_sql_string(name));
+    row[0x15] = u8::try_from(push_located_string(&mut row, name)).unwrap_or(0x16);
     row
 }
 
-/// Where an `albums` row's id sits, and where its name starts.
+/// Where an `albums` row's id sits, and where an ASCII name starts.
 pub const ALBUM_ID_AT: usize = 0x0c;
 pub const ALBUM_NAME_AT: usize = 0x16;
 
@@ -304,5 +311,59 @@ mod tests {
         assert_eq!(u16::from_le_bytes(row[0x1a..0x1c].try_into().unwrap()), 0x7ee9);
         // The subtype the CDJ-3000 needs is unchanged.
         assert_eq!(u16::from_le_bytes(row[0x00..0x02].try_into().unwrap()), 0x24);
+    }
+
+    /// Every UTF-16 string in a track row starts on a 4-byte boundary, however
+    /// long the strings before it are; an XDJ-1000 on firmware 1.13 froze on a
+    /// title three bytes past one [OBS 2026-11-08, Round 23].
+    #[test]
+    fn utf16_track_strings_start_on_a_4_byte_boundary() {
+        for isrc in ["", "A", "AB", "ABC", "ABCD"] {
+            let row = track_row(&TrackInput {
+                isrc: isrc.into(),
+                title: "Accès Gratuit (Original Mix)".into(),
+                filename: "Jimmy Marques - Accès Gratuit.aiff".into(),
+                file_path: "/Contents/Jimmy Marques/Elements/Jimmy Marques - Accès Gratuit.aiff".into(),
+                comment: "Ø".into(),
+                ..TrackInput::default()
+            });
+            let mut utf16 = 0;
+            for slot in 0..TRACK_STRINGS {
+                let at = usize::from(u16::from_le_bytes(row[TRACK_FIXED_LEN + slot * 2..][..2].try_into().unwrap()));
+                if row[at] == 0x90 {
+                    utf16 += 1;
+                    assert_eq!(at % 4, 0, "slot {slot} at {at:#x} with ISRC {isrc:?}");
+                }
+            }
+            assert_eq!(utf16, 4);
+        }
+    }
+
+    /// rekordbox 7.2.14's row for album 17, `MillÃ©simes #1` (mojibake as in
+    /// the user's tags): the name at 0x18 behind two zero bytes, its length
+    /// not counting the NUL pair that follows [OBS 2026-11-08]. Row bytes
+    /// from offset 4, as `index_shift` (0x02) depends on the row's page slot.
+    #[test]
+    fn a_utf16_album_name_is_laid_out_as_rekordbox_lays_it_out() {
+        let rekordbox: [u8; 0x34] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0x18, 0x00, 0x00, 0x90, 0x20, 0x00, 0x00, 0x4d, 0x00, 0x69, 0x00, 0x6c, 0x00, 0x6c, 0x00,
+            0xc3, 0x00, 0xa9, 0x00, 0x73, 0x00, 0x69, 0x00, 0x6d, 0x00, 0x65, 0x00, 0x73, 0x00, 0x20, 0x00,
+            0x23, 0x00, 0x31, 0x00,
+        ];
+        let row = album_row(17, 0, "Mill\u{c3}\u{a9}simes #1");
+        assert_eq!(&row[..2], &[0x80, 0x00]);
+        assert_eq!(&row[4..4 + rekordbox.len()], &rekordbox);
+        assert_eq!(&row[4 + rekordbox.len()..], &[0, 0], "the NUL pair, outside the length");
+        // An ASCII name still follows the prefix directly.
+        assert_eq!(album_row(1, 0, "Freak EP")[0x15], 0x16);
+    }
+
+    #[test]
+    fn a_utf16_artist_name_starts_on_a_4_byte_boundary() {
+        let row = artist_row(1, "Tiësto");
+        assert_eq!(row[0x09], 0x0c);
+        assert_eq!(row[0x0c], 0x90);
+        assert_eq!(artist_row(2, "TRIODE")[0x09], 0x0a);
     }
 }

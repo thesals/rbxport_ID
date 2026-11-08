@@ -243,7 +243,8 @@ impl<'a> Pdb<'a> {
             }
             0x90 => {
                 let len = u2(b, offset + 1) as usize;
-                // Length counts the header and two trailing NULs.
+                // Length counts the header and the text; files from older
+                // rbxport versions also counted a trailing NUL pair.
                 let start = offset + 4;
                 let take = len.saturating_sub(4);
                 let raw = b.get(start..start + take).unwrap_or(&[]);

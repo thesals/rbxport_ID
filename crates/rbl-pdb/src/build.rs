@@ -40,10 +40,13 @@ pub fn long_ascii(text: &str) -> Vec<u8> {
 }
 
 /// Encodes a string in the long UTF-16LE form, for text ASCII cannot carry.
+///
+/// The length counts the 4-byte header and the text; a NUL pair follows,
+/// outside the length, as in every UTF-16 string rekordbox 7.2.14 writes
+/// [OBS 2026-11-08, docs/identify/xdj-freeze-investigation.md].
 pub fn long_utf16le(text: &str) -> Vec<u8> {
     let units: Vec<u16> = text.encode_utf16().collect();
-    // The length counts the 4-byte header and the two trailing NUL bytes.
-    let len = 4 + units.len() * 2 + 2;
+    let len = 4 + units.len() * 2;
     let mut out = Vec::with_capacity(len);
     out.push(0x90);
     out.extend_from_slice(&u16::try_from(len).unwrap_or(u16::MAX).to_le_bytes());
@@ -63,6 +66,29 @@ pub fn device_sql_string(text: &str) -> Vec<u8> {
     } else {
         long_utf16le(text)
     }
+}
+
+/// Appends `text` to a row whose string the row locates by offset, and
+/// returns that offset.
+///
+/// A UTF-16 string starts on a 4-byte boundary: zero bytes go in front of it
+/// when needed. rekordbox 7.2.14 places every one of its UTF-16 strings this
+/// way (289 in one export), and an XDJ-1000 on firmware 1.13 freezes on a
+/// stick whose album name or track title is not aligned. Rows start on a
+/// 4-byte boundary of a heap that starts at 0x28, so an offset that is a
+/// multiple of 4 within the row is one within the page too [OBS 2026-11-08,
+/// Rounds 16 and 23 of docs/identify/xdj-freeze-investigation.md]. ASCII
+/// strings are not aligned, as rekordbox does not align them.
+pub fn push_located_string(row: &mut Vec<u8>, text: &str) -> usize {
+    let encoded = device_sql_string(text);
+    if encoded.first() == Some(&0x90) {
+        while !row.len().is_multiple_of(4) {
+            row.push(0);
+        }
+    }
+    let at = row.len();
+    row.extend_from_slice(&encoded);
+    at
 }
 
 /// Builds one page of rows.
