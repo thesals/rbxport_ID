@@ -472,3 +472,46 @@ Each stick differs from one that froze by the backslash alone.
 - **Both work:** the backslash is the root cause [then OBS], and on its own. The fix: build the collision path with `/` in `layouts()`, plus a test that no exported path contains `\`.
 - **G hangs, F works:** the backslash is a cause, and rbxport's own file has a second one that rekordbox's rows hid.
 - **F hangs:** it's not the backslash; next are the albums table and date_added.
+
+**Round 15 result (user, 2026-11-08): both hung.** F froze at My Settings: `export.pdb` opened (`0x10` 5 → 4, 68 → 69) and never closed. G showed a "Wait" circle, reached the browser and froze (no writes; its `0x10` is 1). **The backslash is not the cause** [OBS]. It is still a bug (Windows-only, in `layouts()`) and goes in the fix.
+
+### Every stick so far against rekordbox's file
+
+Differences from rekordbox's `export.pdb` (track counts, or row counts for albums and artists), by result:
+
+| Stick | Result | u14 | remixer | artist_id | ISRC | strings 2–4, kuvo, analyze_date | date_added | paths, names | **album rows** | artist rows | `0x10` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| rekordbox | works | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** | 0 | 5 |
+| R12 F | works | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** | 0 | 5 |
+| R13 F | works | 0 | 0 | 0 | 0 | 353 | 0 | 0 | **0** | 0 | 5 |
+| R14 G | works | 0 | 50 | 335 | 0 | 353 | 0 | 0 | **0** | 250 | 5 |
+| rbxport, R11 G, R15 G | hang | 353 | 50 | 335 | 280 | 353 | 25 | 23 | **3** | 250 | 1 |
+| R11 F | hang | 0 | 50 | 335 | 280 | 353 | 25 | 23 | **3** | 250 | 5 |
+| R13 G | hang | 0 | 50 | 335 | 280 | 0 | 25 | 23 | **3** | 250 | 5 |
+| R14 F, R15 F | hang | 0 | 0 | 0 | 280 | 353 | 25 | 23 | **3** | 0 | 5 |
+
+ISRC, date_added, paths and the 3 album rows all split the results perfectly, and those 3 album rows are the only difference with a mechanism:
+
+### UTF-16 strings sit on a 4-byte boundary in rekordbox's file
+
+Three albums have names that need UTF-16 (`Millésimes #1`, `Lost Love EP` with no-break spaces, `RITUALØ3`).
+
+- **rekordbox** writes the name at **`0x18`** (near offset `0x15` = `0x18`), with 2 zero bytes after the `0x16` that ASCII names use.
+- **rbxport** writes it at **`0x16`**, straight after the prefix (`rows.rs`, `album_row`, `ALBUM_NAME_AT = 0x16`).
+
+Rows start on 4-byte boundaries, so rbxport's UTF-16 album names start 2 bytes past one. Across rekordbox's whole file, **every** `0x90` string is on a 4-byte page offset: 286 in tracks, 3 in albums. Short ASCII strings are not aligned (all 236 ASCII album names sit at ≡ 2). rbxport aligns 2 of its 6 UTF-16 track strings and 0 of its 3 album names [OBS]. A firmware reading the UTF-16 header's u16 length or its code units with aligned loads would fault or misread on an odd-halfword address.
+
+Track UTF-16 strings seem not to matter on their own: the working R13 F and R14 G each carry 4 unaligned ones (compacting moved them). Artist rows put ASCII names at `0x0a`; this library has no UTF-16 artist name, so artists are untested.
+
+## Round 16: the three album rows alone (`round16.ps1`, `pdb_rowswap.py --align-album --keep-shift`)
+
+| Stick | |
+|---|---|
+| **G** | **rbxport's v1.2.11 export exactly as written**, except the 3 UTF-16 album names moved from `0x16` to `0x18` (2 zero bytes inserted, near offset changed). Pages 8 and 82 only; same length; no other patch; ANLZ files as rbxport wrote them. |
+| **F** | Round 15 F (hung) with only the same 3 album rows changed. |
+
+`pdb_rows.py`: 236 of 239 album rows and every other table byte-identical to the stick each one came from.
+
+- **Both work:** the misaligned UTF-16 album name is the root cause [then OBS]. The fix: `album_row` pads before a UTF-16 name so it starts on a 4-byte boundary (`0x18`), the same rule applied wherever a row places a `0x90` string (tracks, artists), and a test against rekordbox's rule.
+- **G hangs, F works:** the album rows are a cause, and rbxport's own track rows carry a second one (ISRC, date_added or paths).
+- **Both hang:** not the album rows; ISRC, date_added and paths are next.
