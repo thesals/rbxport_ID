@@ -173,6 +173,28 @@ rbxport's header names empty-candidate pages 94 to 97 and next-unused page 98, i
 
 `0x10` is not a page count: both files account for every page in their chains or empty candidates, with none loose. The pattern fits a **use counter or "stick open" marker**: the player lowers it when it starts using the database and restores it (with a second sequence bump) when it is done. [ASSUME, from three samples.] On F it froze between the two writes. rbxport writes 1 there, so the player would lower it to 0.
 
+The user confirmed that F froze at the My Settings screen. **With the padding in, F still froze early, so `header5` or `row-style` brings back an early freeze** on the XDJ, although rekordbox's own file carries both. Not explained yet; neither goes into a fix until it is.
+
+**Stick G stopped enumerating after Round 5:** Windows lists it as "Unknown USB Device (Port Reset Failed)". The stick's USB controller isn't answering, which no file on it can cause; it is likely hung after the player was power-cycled with it in. Until it comes back, rounds run on F alone.
+
+### Row by row (`pdb_rows.py`)
+
+Byte-identical rows in both files: genres, labels, keys, colors, **playlist entries**, artwork, **columns**, **unk17**, and 16 of 17 unk18 rows. Different: tracks (all), artists and albums (nearly all), the one playlist-tree row, one unk18 row (`15 00 07 00 01 …`, where rbxport writes `… 03 …`) and the **history** table.
+
+**The history table (type 19)**, on pages 39 and 40 in both files:
+- **rekordbox** fills its data page: **96 row slots of 40 bytes**, 3,840 bytes used and 0 free, flags `0x34`, one row present (slot 1) and 95 set aside. The player left it unchanged in Round 2.
+- **rbxport** writes one slot and one row, with 4,010 bytes free.
+
+The browser screen where Round 5 G froze is where the player shows the HISTORY folder. It's also where it would begin recording the session's history, into space rekordbox had reserved and rbxport hadn't.
+
+## Round 6: the history table (stick F only)
+
+`round6.ps1`: rekordbox's export, plus Round 5 G's padded `export.pdb` with **rekordbox's history pages 39 and 40 copied verbatim** (`history-from`). The pages' sequence numbers are set to the header's 58, so no page is newer than the file. Nothing else differs from Round 5 G.
+
+- Gets past the browser screen: **the history table's layout is the second cause.** The fix is to pad the file to its empty candidates and lay out history as rekordbox does.
+- Freezes on the browser screen: history is ruled out. Next are the playlist-tree row, the unk18 row, then tracks, artists and albums.
+- Freezes at My Settings: the copied pages themselves break something.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
