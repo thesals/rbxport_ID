@@ -440,3 +440,35 @@ Checked against rekordbox's file: G's artists are rbxport's 239 rows byte for by
 - **G hangs, F works:** the cause is rbxport's artists: their numbering, the 17 missing remixer rows, or `remixer_id` = 0. Split next.
 - **F hangs, G works:** albums, date_added or the renamed paths.
 - **Both work:** the cause needs both halves together.
+
+**Round 14 result (user, 2026-11-08): G worked and played tracks; F froze at My Settings.** Writes: G opened and closed `export.pdb` (sequence 68 → 70); F opened it (`0x10` 5 → 4, 68 → 69) and never closed it (`player-written/round14-*`).
+
+- **rbxport's artists, their numbering, the 17 missing remixers and `remixer_id` = 0 are ruled out** [OBS].
+- The cause is in F's half: rbxport's albums table, its date_added on 25 tracks, or its names and paths for the 23 renamed files.
+
+### The backslash
+
+Listing F's path differences track by track (2026-11-08) shows three tracks whose rbxport `file_path` contains a **backslash as a directory separator**:
+
+```
+159  /Contents/Abstract Division/UnknownAlbum\Abstract Division - Contemporary Spaces EP-159.aiff
+160  /Contents/Abstract Division/UnknownAlbum\Abstract Division - Contemporary Spaces EP-160.aiff
+161  /Contents/Abstract Division/UnknownAlbum\Abstract Division - Contemporary Spaces EP-161.aiff
+```
+
+These are the three tracks whose names collided with another track's, so rbxport gave them a `-<id>` suffix. The code that does it, `layouts()` in `crates/rbl-export/src/lib.rs`, builds the new path with `parent.join(&name)`, and on Windows `Path::join` inserts `\` [OBS: code and file]. Every other path is built with `format!` and `/`. The same backslash is in those tracks' ANLZ files (the UTF-16 path in `ANLZ0000.DAT`, `.EXT`, `.2EX`) and in `PIONEER/rbxport/manifest.json`. rekordbox names the same files `E-1`, `E-2`, `E-3` with `/` throughout. A macOS export would get `/`, because `Path::join` there uses `/`.
+
+The other differences in F's half look harmless: the other 20 renames only drop a space before the extension, date_added is a day off on 25 tracks, and the album rows match rekordbox's by name.
+
+## Round 15: the backslash alone (`round15.ps1`, `round15_fix.py`)
+
+| Stick | |
+|---|---|
+| **G** | **rbxport's v1.2.11 export exactly as it wrote it**, with only those backslashes made `/`: 3 bytes in `export.pdb` and 1 byte in each of the 9 ANLZ files. No index_shift, header or any other patch. |
+| **F** | Round 14 F (froze) with only its 3 backslashes made `/`, in place. |
+
+Each stick differs from one that froze by the backslash alone.
+
+- **Both work:** the backslash is the root cause [then OBS], and on its own. The fix: build the collision path with `/` in `layouts()`, plus a test that no exported path contains `\`.
+- **G hangs, F works:** the backslash is a cause, and rbxport's own file has a second one that rekordbox's rows hid.
+- **F hangs:** it's not the backslash; next are the albums table and date_added.
