@@ -537,3 +537,30 @@ Track UTF-16 strings seem not to matter on their own: the working R13 F and R14 
 - **F works:** the fix set is sufficient on rbxport's own output. G says whether `0x10` is the second cause on its own.
 - **G works:** `0x10` = 1 is the second cause.
 - **F hangs:** something not patchable in place is left; rebuild and split next.
+
+**Round 17 result (user, 2026-11-08): both froze at the browser** (G let the user start scrolling first). The in-place fixes are not the second cause [OBS].
+
+### The second cause: the backslash, masked in Round 15
+
+Working Round 16 F and hanging Round 17 F differ, in tracks, only in artist numbering (cleared by Round 14 G), index_shift (same rule, different packing) and **the 3 backslash paths**. F16's tracks came from Round 15, where the backslashes had been fixed; F17's came from rbxport's original file. Round 15 could not show the backslash, because both its sticks still carried the misaligned album names.
+
+Model: **rbxport's file hangs the XDJ-1000 mk1 if a UTF-16 album name is misaligned *or* a track path contains a backslash.** Checked against every stick tested from Round 4 on (28 files):
+
+| Sticks | Backslash paths | Misaligned UTF-16 albums | Result |
+|---|---|---|---|
+| rekordbox, R8 F, R12 F, R13 F, R14 G, R16 F | 0 | 0 | all work |
+| rbxport, R4–R11 (all), R8 G, R13 G, R14 F | 3 | 3 | all hang |
+| R15 F, R15 G | 0 | 3 | hang |
+| R16 G, R17 G, R17 F | 3 | 0 | hang |
+
+No stick contradicts it.
+
+## Round 18: both causes, from both sides (`round18.ps1`)
+
+| Stick | |
+|---|---|
+| **G** | **rbxport's v1.2.11 export with only the two fixes**: the 3 UTF-16 album names aligned and the 3 backslashes made `/` (in `export.pdb` and the 9 ANLZ files). No other patch. Predicted: works. |
+| **F** | Round 16 F (worked) with **only the 3 backslashes put back** (3 bytes). Predicted: hangs. |
+
+- **G works, F hangs:** both root causes proven; G shows the two fixes are sufficient for rbxport's own output and F shows the backslash is necessary on its own. Then fix the writer.
+- **Anything else:** the model is wrong; re-split from the closest pair.
