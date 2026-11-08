@@ -671,3 +671,33 @@ Each stick is tried twice from a fresh power-on.
 - **G works, F works:** R17 F's freeze was not reproducible. The content fixes (one or more of `0x10`, `0x14`, ISRC, NUL) fix R18 G; split them next.
 - **G works, F freezes twice:** R17 F has a real cause not yet found; compare it with G22 byte for byte.
 - **G freezes:** the content fixes are not enough for rbxport's own file, so the difference is in something not yet decoded.
+
+**Round 22 result (user, 2026-11-08): both froze while scrolling the browse menu, as soon as the cursor reached Albums.** (The player's writes were not saved before the sticks were rewritten.) R17 F's freeze repeats [OBS], and the content fixes do not fix R18 G [OBS].
+
+### The album pages are not it; aligned UTF-16 track strings are
+
+- G21 (works) and G22 (froze at Albums) have **byte-identical album pages**, and so do F21 and F22. The freeze on the Album entry therefore comes from what the player reads alongside the albums.
+- G21 against G22: the same strings in every track row except the 3 backslash paths (G22 has them fixed). The artists differ only in index_shift, and the track rows in where each string sits, since the in-place `isrc-blank` left junk of different lengths.
+
+Position (page offset mod 4) of every UTF-16 track string, ISRCs aside:
+
+| | 19 file_path | **128 title** | 128 filename | 128 file_path | 129 file_path | 233 file_path |
+|---|---|---|---|---|---|---|
+| rekordbox | 0 | **0** | 0 | 0 | 0 | 0 |
+| every working stick since R13 | 0 | **0** | 3 | 1 or 3 | 3 | 1 |
+| every stick with rbxport's own track pages (all froze) | 3 | **3** | 0 | 2 | 2 | 0 |
+
+**On every working stick, track 19's file_path and track 128's title sit on a 4-byte boundary. On every frozen stick with the album names fixed, both sit 3 bytes past one.** The other UTF-16 strings vary on working sticks, so they are not needed. Track 19 is on Millésimes #1; track 128 is `Jimmy Marques - Accès Gratuit`. This is the same mechanism as the album names, and rekordbox aligns every one.
+
+## Round 23: track 128's title alone (`round23.ps1`, `pdb_rowswap.py --align-utf16 / --misalign`)
+
+| Stick | R22 G (froze twice), tracks rebuilt with |
+|---|---|
+| **G** | **every UTF-16 track string on a 4-byte boundary** |
+| **F** | the same, but **track 128's title at offset 3 mod 4**, where rbxport puts it |
+
+Decoded content equals R22 G's; the leftover junk is gone with the rebuild. G and F differ on page 54 only (65 bytes: one string moved).
+
+- **G works, F freezes:** misaligned UTF-16 strings in tracks are the second root cause, and a misaligned title alone is enough. The fix: the writer aligns every `0x90` string to 4 bytes, as rekordbox does.
+- **Both work:** alignment in tracks is a cause, but not the title on its own (track 19's path, most likely).
+- **G freezes:** alignment is not it; re-split R22 G against R21 G.
