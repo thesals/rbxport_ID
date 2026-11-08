@@ -613,3 +613,35 @@ So G is R17 F's content in R18 F's layout, and F the reverse. One more differenc
 - **G works, F freezes:** the cause is in how rbxport's pages are laid out, or in the album index_shift.
 - **Both work:** the cause needs the artist content and rbxport's layout together.
 - **Both freeze:** repeat both before reading anything into it.
+
+**Round 20 result (user, 2026-11-08): G worked flawlessly; F froze at the browse screen, "specifically when the cursor hit the Album field".** Writes: G opened and closed (68 → 70). F's `0x10` went 5 → **1** (not 4 as in every earlier hang) and its sequence 68 → 69, never closed (`player-written/round20-*`).
+
+- **The artist content is cleared** [OBS]: G carries rbxport's artists and numbering and works.
+- **F's album pages are byte-identical to G's except each row's index_shift** (checked over every byte of pages 8, 82 and 83). F's are `0x20` × slot (from Round 17's `index-shift=0+2+3`), G's are 0. The tracks' pages also differ in layout.
+
+### Rows per page and index_shift, every stick
+
+| | track index_shift | album rows per page | album index_shift |
+|---|---|---|---|
+| rekordbox | set | ≤ 87 | set (max 2752) |
+| R12 F, R13 F, R14 G (rekordbox's album rows) | set | ≤ 86 | set (max 2720) |
+| R16 F, R18 F, R20 G | set | 98 | **0** |
+| rbxport, R16 G, R17 G, R18 G | **0** | 98 | 0 |
+| R11 G/F, R13 G, R17 F, R20 F | set | **98** | **set (max 3104)** |
+
+The working sticks always have the track index_shift set, and either album index_shift 0 or album pages of at most 87 rows. rekordbox's album rows carry 4 to 9 spare bytes each, so they never reach 98 to a page; rbxport's compact rows do. A model that fits all 30 files:
+
+> hang = misaligned UTF-16 album name **or** track index_shift all 0 **or** (album index_shift set **and** album pages beyond rekordbox's ~87 rows)
+
+Artists tolerate a set index_shift at 144 rows to a page (R20 G works with 4576), so the third clause is album-specific, or this is a different mechanism.
+
+## Round 21: the two index_shift clauses, each alone (`round21.ps1`)
+
+| Stick | Round 20 G (worked), plus |
+|---|---|
+| **G** | track index_shift zeroed (`index-zero=0`; 340 bytes on the track pages only) |
+| **F** | album index_shift set, `0x20` × slot on pages of up to 98 rows (`index-shift=3`; 423 bytes on pages 8, 82, 83 only) |
+
+- **G freezes:** rbxport's index_shift of 0 on tracks is a cause (Round 9's "changed behaviour" fits).
+- **F freezes, especially on Album:** album index_shift on rbxport's full pages is a cause. Next: where the limit is (rows per page or shift value).
+- **Either works:** that clause is wrong.
