@@ -159,6 +159,20 @@ rbxport's header names empty-candidate pages 94 to 97 and next-unused page 98, i
 - G freezes, F works: the cause is header `0x10` (the page style is already ruled out).
 - Both freeze: every structural difference between the files is ruled out. **The cause is in the rows' contents** (track-row fields, strings, the ISRC encoding, table sizes and rows per page) or in the table layout. That is next.
 
+**Result (user, 2026-11-07): both froze, but G got further.**
+- **G** (`pad` only) went **past the My Settings screen** and froze on the next screen, the browser for folders and playlists.
+- **F** froze at My Settings as before.
+
+**Padding the file to cover every empty candidate moves the freeze** [OBS]. rbxport's file stopping short of the pages its header names is **a real cause, the first of at least two.** (`build.rs` `finish` drops trailing zeroed pages on purpose, from an [OBS 7.2.11] blank export. That observation still holds, but the XDJ-1000 does not cope with it.)
+
+### What the player wrote (`pdb_diff.py`, `player-written/`)
+
+- rekordbox's file, Round 2, worked: sequence +2 and `0x10` unchanged at 5.
+- Round 5 F, froze at My Settings: **`0x10` 5 → 4, sequence +1**, and nothing else.
+- rbxport's unpatched file, Round 2 G, froze at My Settings: **nothing written** (hash unchanged).
+
+`0x10` is not a page count: both files account for every page in their chains or empty candidates, with none loose. The pattern fits a **use counter or "stick open" marker**: the player lowers it when it starts using the database and restores it (with a second sequence bump) when it is done. [ASSUME, from three samples.] On F it froze between the two writes. rbxport writes 1 there, so the player would lower it to 0.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
