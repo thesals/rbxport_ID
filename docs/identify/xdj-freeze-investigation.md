@@ -564,3 +564,30 @@ No stick contradicts it.
 
 - **G works, F hangs:** both root causes proven; G shows the two fixes are sufficient for rbxport's own output and F shows the backslash is necessary on its own. Then fix the writer.
 - **Anything else:** the model is wrong; re-split from the closest pair.
+
+**Round 18 result (user, 2026-11-08): G froze at the browser; F worked without issue.** The opposite of the prediction. Writes: F opened and closed `export.pdb` (68 → 70); G none (`0x10` = 1).
+
+- **The backslash is not a cause** [OBS]: F16 worked, and F16 plus the backslash still works. It stays in the fix as a Windows-only bug.
+- **The album fix and the backslash fix together do not fix rbxport's own file** [OBS: G18].
+- The two-cause model is withdrawn.
+
+### Feature search over every stick
+
+`feat.py` (scratch) measured 15 candidate features on all 28 tested files and searched for boolean models that fit every result. No single feature fits, and no OR of up to three. Only two models fit, and they say the same thing:
+
+> hang = misaligned UTF-16 album name **or** (rbxport's artists, i.e. its numbering with the 17 remixers missing and `remixer_id` 0, **and** rbxport's date_added/names/paths, which have always moved together)
+
+Every track gets the same artist name in both files, and rbxport's artists table has no duplicates, empty names or dangling references. No mechanism links the two halves of that conjunction, so it may be overfitted.
+
+**A hidden variable is possible.** From Round 8 on, stick F worked 6 times and stick G once (Round 14 G). Every file has been tested once, on one stick. Round 1 showed the stick itself is not to blame for the original hang, but not that results never depend on the stick.
+
+## Round 19: swap Round 18's files between the sticks (`round19.ps1`)
+
+| Stick | |
+|---|---|
+| **G** | Round 18 F's `export.pdb` (worked on F) |
+| **F** | Round 18 G's `export.pdb` (froze on G), with its 9 fixed ANLZ files |
+
+- **G works, F freezes:** results follow the file; the player is deterministic per file. Split R18 G against R18 F next (`0x14`, ISRC form, artists and remixers, header, index_shift).
+- **G freezes, F works:** results follow the stick. Every G result since Round 8 needs re-reading, and each future file must be tested on both sticks.
+- **Both work or both freeze:** the player is not deterministic. Repeat each file to measure it.
