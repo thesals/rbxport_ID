@@ -396,3 +396,26 @@ F's track rows name rekordbox's file names, so the 23 renamed files will not loa
 - **F works:** the cause is in the row content. G then says whether the empty strings are it; if G hangs, the rest is numbering, remixers, slack or ISRC, split next.
 - **F hangs:** rbxport's packing hangs the player even with rekordbox's rows: page fill, row order or the page header fields (`0x20`, `0x22`, group word) are next.
 - **Both work:** the empty strings are enough.
+
+**Round 12 result (user, 2026-11-08): F worked (playlist loaded, two tracks played). G froze at the browser.**
+- **F:** `export.pdb` opened and closed (sequence 68 → 70, `0x10` back at 5). `exportExt.pdb` opened and closed too, and the player set its `0x10` from 1 to 5 (`player-written/round12-F`).
+- **G was never rewritten for Round 12.** It still carried Round 11 G's file byte for byte, which the player did not write to (`0x10` = 1). So G repeated Round 11 G: the same file froze at My Settings last time and at the browser this time. The screen it freezes on is not a reliable measure; the writes are.
+
+**rekordbox's rows for tracks, artists and albums, packed by rbxport's writer into rbxport's file, work** [OBS]. Page packing, row order, page header fields (`0x20`, `0x22`, group word), page placement, and every other table as rbxport writes them are ruled out. **The cause is in the content of rbxport's track, artist or album rows.**
+
+## Round 13: the empty strings, from both sides (`round13.ps1`)
+
+| Stick | rbxport's export, its `export.pdb` with |
+|---|---|
+| **G** | rbxport's rows, with strings 2, 3, 4, kuvo_public and analyze_date filled from rekordbox; index_shift, header5, seq-ahead, UTF-16 NULs, `0x14`, ISRCs blanked (`round12/F-export.fill-plus.pdb`) |
+| **F** | Round 12 F's rekordbox rows, compacted (no slack), with **strings 2, 3, 4, kuvo_public and analyze_date blanked** as rbxport writes them; header5, seq-ahead |
+
+Checked with `pdb_tracks.py` against rekordbox's file:
+- F differs only in those five slots (and index_shift).
+- G differs only in artist and remixer numbering (rbxport's 239 artists), the blanked ISRCs, 25 date_added values and the renamed files' paths.
+
+What each result means:
+- **F hangs, G works:** the empty strings are the root cause, seen from both sides.
+- **F works, G hangs:** the empty strings are not it. The cause is in the artist and remixer numbering, the ISRC or date_added; split next.
+- **Both hang:** the empty strings are one cause and something in G's list is another.
+- **Both work:** the empty strings matter only together with something else that G fixes.
