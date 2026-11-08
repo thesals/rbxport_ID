@@ -515,3 +515,25 @@ Track UTF-16 strings seem not to matter on their own: the working R13 F and R14 
 - **Both work:** the misaligned UTF-16 album name is the root cause [then OBS]. The fix: `album_row` pads before a UTF-16 name so it starts on a 4-byte boundary (`0x18`), the same rule applied wherever a row places a `0x90` string (tracks, artists), and a test against rekordbox's rule.
 - **G hangs, F works:** the album rows are a cause, and rbxport's own track rows carry a second one (ISRC, date_added or paths).
 - **Both hang:** not the album rows; ISRC, date_added and paths are next.
+
+**Round 16 result (user, 2026-11-08): F worked without issue; G froze at the browser.** Writes: F opened and closed `export.pdb` (68 → 70); G none (`0x10` = 1) (`player-written/round16-*`).
+
+**First root cause, proven [OBS]: rbxport writes UTF-16 album names 2 bytes off a 4-byte boundary.** Round 15 F hung and Round 16 F worked, and the only difference between them is those 3 album rows (`pdb_rows.py`: every other row byte-identical). rekordbox always aligns `0x90` strings.
+
+**A second cause remains in rbxport's own file**, since G16 (rbxport's file, albums fixed) still hangs. F16 works with blanked ISRCs, rbxport's date_added and rbxport's names and paths, and earlier rounds cleared the artists, numbering, remixers, empty strings, slack and packing. What G16 still has that F16 does not:
+- `0x10` = 1 (every working stick had 5; with 1 the player never writes the file);
+- index_shift 0 on tracks and artists;
+- `0x14` = 0 on every track;
+- rbxport's own ISRC form (short ASCII; F16's were blank);
+- the UTF-16 lengths that count a NUL (6 track strings, 3 album names).
+
+## Round 17: the header against the rest (`round17.ps1`)
+
+| Stick | Round 16 G's `export.pdb` (rbxport's, albums aligned), plus |
+|---|---|
+| **G** | `header5` only: 1 byte |
+| **F** | every in-place fix: index-shift on 0, 2, 3; header5; pad; seq-ahead; utf16-nul; `0x14` from rekordbox; ISRCs blanked |
+
+- **F works:** the fix set is sufficient on rbxport's own output. G says whether `0x10` is the second cause on its own.
+- **G works:** `0x10` = 1 is the second cause.
+- **F hangs:** something not patchable in place is left; rebuild and split next.
