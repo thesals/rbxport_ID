@@ -47,11 +47,24 @@ Still to do: parse both `export.pdb` files with an independent parser (crate-dig
 
 One test, one variable. It decides whether item 1 above is the cause.
 
-**Stick G, with a rekordbox export:**
+**Built by copying (2026-11-07, user approved wiping both sticks).** Both sticks were first backed up in full to `C:\dev\xdj-investigation\full\F` and `full\G` (2,729 files and 22.57 GB each). `swap.ps1` then mirrored the backups across with robocopy `/MIR`; neither stick was reformatted, and `PIONEER` was hash-checked after the copy.
 
-1. On the PC, delete **everything** on G (select all, delete). Don't reformat it: the layout under test must stay as it is.
-2. In rekordbox, export the **same playlist** to G.
-3. Plug G into the XDJ-1000.
+| Stick | Layout (unchanged) | Now holds |
+|---|---|---|
+| **G** | Samsung 256 GB, superfloppy | **rekordbox 7.2.14's export**, byte for byte from F |
+| **F** | SanDisk 128 GB, MBR | **rbxport v1.2.11's export**, byte for byte from G |
+
+The only thing a copy does not reproduce is the order the files were written in on the FAT. Both swaps give an answer in one trip, tested one stick at a time:
+
+- G freezes and F works: **the stick or its layout.**
+- G works and F freezes: **rbxport's export.**
+- Both work: the write order or file timing of a real export matters (unlikely, but it would itself be the lead).
+- Both freeze: more than one cause, or the players' state.
+
+Test steps:
+
+1. Plug **G** into one XDJ-1000 and press USB.
+2. Then plug **F** in and press USB.
 
 **Report back:**
 - **Did it freeze?** Yes or no.
