@@ -295,6 +295,30 @@ On Round 8 G's hybrid (rekordbox's file, rbxport's tracks, artists and albums; f
 - G works: **index_shift is the cause.** F then says whether tracks alone is enough.
 - Both freeze: index_shift is ruled out; next are `0x14`, the empty strings, the ISRC and UTF-16 encodings.
 
+**Result (user, 2026-11-07): both still hang, but the behaviour changed.**
+- **G** "lagged through My Settings", reached the browser, then froze.
+- **F** "acted like it loaded a track with no data" when USB was pressed, then reached the browser and froze.
+- **Writes, both sticks:** `export.pdb` and `exportExt.pdb` opened (`0x10` 5 → 4, sequence +1) and never closed.
+
+**index_shift is necessary but not sufficient** [OBS: it changes what the player does, and it still hangs]. Keep it in the fix.
+
+### Artists and albums against rekordbox's, matched by name
+
+Apart from index_shift (and the order the rows come in), every artist and album row is identical to rekordbox's, except **3 album names in UTF-16 whose stored length counts a trailing NUL**. The same NUL turns up in 6 track strings. rekordbox never counts one (`utf16-nul` changes 0 bytes in its file).
+
+## Round 10: the remaining track-row differences that can be patched in place
+
+On Round 9 G's file (`round10.ps1`):
+
+| Stick | Round 9 G's `export.pdb`, plus |
+|---|---|
+| **G** | `utf16-nul`: the 9 UTF-16 strings lose the NUL counted in their length (9 bytes) |
+| **F** | `u14-from` rekordbox (each track's `0x14`, by ID) and `isrc-blank` (the 280 ISRCs emptied, as rekordbox writes 73 of its own) |
+
+Not patchable in place, so left for a page rebuild if these both hang:
+- strings 2 and 3, analyze_date and kuvo_public, which rbxport leaves empty;
+- the artist and remixer numbering.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
