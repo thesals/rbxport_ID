@@ -257,6 +257,44 @@ The six tables whose rows differ, split in two (`round8.ps1`):
 
 Whichever hangs holds the cause. The measure is the player's writes, read back from the stick (closed means it worked), together with what the user sees.
 
+**Result (user, 2026-11-07):**
+- **G froze at My Settings.** The player opened `export.pdb` (`0x10` 5 → 4, sequence +1) and never closed it.
+- **F loaded the playlist and played two tracks.** `export.pdb` was opened and closed (sequence +2, `0x10` back at 5).
+
+**The cause is in rbxport's tracks, artists or albums table** [OBS]. Playlist tree, unk18 and history are ruled out. So are page layout, padding and the header: F carried rbxport's pages for its three tables in rekordbox's file, and it worked.
+
+### Track rows field by field (`pdb_tracks.py`, decoded from the published layout)
+
+| Field | rekordbox | rbxport | tracks |
+|---|---|---|---|
+| `0x02` **index_shift** | **0x20 × the row's slot in its page** | **0** | 308 (all 353 rows are 0) |
+| `0x14` | a per-track number | 0 | 353 |
+| strings 2, 3 | `4`, `4` etc. | empty | 353 |
+| analyze_date | `2025-06-29` etc. | empty | 353 |
+| kuvo_public | `ON` | empty | 306 |
+| ISRC | `0x90` form | short ASCII | 280 |
+| artist_id, remixer_id | | numbered differently, all resolve in their own file | 335, 50 |
+| UTF-16 strings | | length includes a trailing NUL | 6 |
+| file name, path, ANLZ path | | the 23 renamed files | 21 to 27 |
+
+**index_shift, all three failing tables:**
+- rekordbox: 0, 32, 64… per page in tracks, artists and albums, and 32 for history's one row (slot 1).
+- rbxport: **0 on every row of all three.**
+
+The tables that worked are either rowless in this sense (genres, labels, keys, artwork and playlist entries have no such field) or hold one row in slot 0, where 0 is right (playlist tree, history). That lines up with the failing group exactly. The rule (`pdb_patch.py index-shift`) **changes 0 bytes when run on rekordbox's own file** across tracks, artists, albums and history, so it reproduces rekordbox exactly [OBS].
+
+## Round 9: index_shift
+
+On Round 8 G's hybrid (rekordbox's file, rbxport's tracks, artists and albums; froze), `round9.ps1`:
+
+| Stick | Round 8 G's `export.pdb`, plus |
+|---|---|
+| **G** | index_shift = 0x20 × slot on tracks, artists and albums (1,196 bytes) |
+| **F** | the same on tracks only (341 bytes) |
+
+- G works: **index_shift is the cause.** F then says whether tracks alone is enough.
+- Both freeze: index_shift is ruled out; next are `0x14`, the empty strings, the ISRC and UTF-16 encodings.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
