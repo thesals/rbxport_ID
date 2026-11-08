@@ -729,3 +729,9 @@ Round 23 G also carried header5, `0x14`, blank ISRCs, seq-ahead and padding. Rou
 
 - **Both work:** the fix is sufficient; next is a test build to export a fresh stick from the app.
 - **Either freezes:** one of the dropped changes is also needed; add them back in halves.
+
+**Round 24 result (user, 2026-11-08): both sticks worked without issue and played the suggested tracks** (Millésimes #1, `Jimmy Marques - Accès Gratuit`). Writes: `export.pdb` opened and closed on both; at close the player set `0x10` from 1 to 5.
+
+**The fix is sufficient** [OBS]: rbxport's own export with only the three changes the fixed writer makes works on the XDJ-1000 mk1 (firmware 1.13). `0x10` = 1, `0x14` = 0, rbxport's ISRC form and index_shift 0 do not need changing.
+
+Next: a local test build (`1.2.12-test.1`, NSIS, no updater artifacts) for the user to export a fresh stick from the app. No push or release until that stick is confirmed.
