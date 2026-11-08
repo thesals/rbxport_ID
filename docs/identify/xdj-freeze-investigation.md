@@ -144,6 +144,21 @@ rbxport writes `0x20` = rows and the word as a copy of the present flags. It wri
 - G freezes, F works: the cause is rekordbox's page style, but more than that one value.
 - Both freeze: the cause is in the file header or the page bookkeeping (header `0x10`, empty candidates past the end, next-unused page), or in row contents. Those come next.
 
+**Result (user, 2026-11-07): both froze.** Rekordbox's page style is ruled out, the last-row index included [OBS]. rbxport's `0x22` = rows is still wrong against rekordbox, but it does not cause this freeze; fix it anyway when the writer is next changed.
+
+## Round 5: the file's bookkeeping
+
+rbxport's header names empty-candidate pages 94 to 97 and next-unused page 98, in a file of 94 pages. Four pages the header relies on are past the end of the file. rekordbox's names one, page 106, the page right after its file ends. The player writes to the file at mount, so it may read or write a page that isn't there.
+
+| Stick | rekordbox's export, plus rbxport's `export.pdb` patched (`round5.ps1`) |
+|---|---|
+| **G** | `pad`: four zeroed pages appended, so the file holds every page through 97 |
+| **F** | `pad,header5,row-style`: the same, plus header `0x10` = 5 and rekordbox's page style |
+
+- G works: the **empty candidates past the end of the file** are the cause.
+- G freezes, F works: the cause is header `0x10` (the page style is already ruled out).
+- Both freeze: every structural difference between the files is ruled out. **The cause is in the rows' contents** (track-row fields, strings, the ISRC encoding, table sizes and rows per page) or in the table layout. That is next.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
