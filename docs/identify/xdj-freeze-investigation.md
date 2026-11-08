@@ -230,6 +230,33 @@ rekordbox's header sequence is always **ahead** of every page's. rbxport's `fini
 - G freezes on the browser screen and F works: `0x10` matters once the sequence is right.
 - Both freeze on the browser screen: the sequence is ruled out; back to the history table (copied with its own sequences) and the remaining rows.
 
+**Result (user, 2026-11-07): both froze at My Settings.** The player's writes:
+- **G** (`pad,seq-ahead`): `export.pdb` untouched, `exportExt.pdb` opened (`0x10` 5 → 4). That is exactly Round 5 G's pattern, though Round 5 G froze a screen later.
+- **F** (`pad,seq-ahead,header5`): both files opened (`0x10` 5 → 4, sequence +1), and neither closed.
+
+**Correction: the screen a stick freezes on is not a reliable progress measure.** Round 5 G and Round 7 G left identical writes. Most likely a button press moved the screen on just before the hang. The player's writes are the objective measure, so the Round 5 claim that padding "moves the freeze" is withdrawn; padding alone is not shown to help [OBS]. Across Rounds 5 to 7:
+
+| Write pattern | Files |
+|---|---|
+| `export.pdb` never opened | every file with rbxport's `0x10` = 1 |
+| opened and never closed (hang) | rbxport's file with `0x10` = 5, padded, with or without the page style or sequence change |
+| opened and closed (works) | rekordbox's file |
+
+So the hang comes **after the player opens `export.pdb`**, while it reads the tables. The structural patches (page style, padding, sequence, header) each leave it hanging, so the cause is in the **tables' contents**.
+
+## Round 8: whole tables, rekordbox's file with rbxport's tables in
+
+`pdb_transplant.py` takes rekordbox's working `export.pdb` and writes rbxport's data pages for the chosen tables into the page slots rekordbox's own chain uses. It rewrites each page's index and next pointer, keeps rekordbox's index pages, empty candidates and header (`0x10` = 5, sequence 2026, ahead of every page), and zeroes leftover slots (8 in tracks and 1 in artists). Rows checked with `pdb_rows.py`: the transplanted tables match rbxport's row for row, and every other table matches rekordbox's. Track, playlist and artwork IDs agree between the two files (playlist entries and artwork are byte-identical), so the cross-references hold.
+
+The six tables whose rows differ, split in two (`round8.ps1`):
+
+| Stick | rekordbox's `export.pdb`, with rbxport's |
+|---|---|
+| **G** | tracks, artists, albums (types 0, 2, 3) |
+| **F** | playlist tree, unk18, history (types 7, 18, 19) |
+
+Whichever hangs holds the cause. The measure is the player's writes, read back from the stick (closed means it worked), together with what the user sees.
+
 **Report back:**
 - **Did it freeze?** Yes or no.
 - **If yes, exactly when:** as the stick is inserted, on pressing the USB source button, at the My Settings prompt, on opening a playlist, or on loading a track. What the screen shows, and whether pulling the stick recovers it or it needs a power cycle.
