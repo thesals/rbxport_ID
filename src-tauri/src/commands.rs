@@ -939,8 +939,9 @@ pub async fn export_playlist<R: tauri::Runtime>(
     let state = Arc::clone(&state);
     let progress_app = app.clone();
     let report = blocking("export_playlist", move || {
-        let selection = ExportSelection::from_playlists(&state, &library, &share, std::slice::from_ref(&playlist), false)?;
         let destination = std::path::Path::new(&destination);
+        let playlists = with_stick_playlists(&state, &library, destination, playlist)?;
+        let selection = ExportSelection::from_playlists(&state, &library, &share, &playlists, false)?;
         let selection = selection.for_stick(&state, &library, &share, destination, delete_unlisted_music.unwrap_or(false))?;
         write_export_with_progress(&progress_app, destination, &selection, defaults.as_ref(), compatibility_format)
     })
@@ -948,6 +949,41 @@ pub async fn export_playlist<R: tauri::Runtime>(
 
     let _ = tauri::Emitter::emit(&app, "export:done", &report);
     Ok(report)
+}
+
+/// Export Playlist adds to a stick, as rekordbox's does: the playlists the
+/// stick's record says this library put there go along again, so `playlist`
+/// joins them instead of replacing them. Choosing a stick's whole selection,
+/// removals included, is the Sync Manager's job.
+///
+/// A recorded playlist the library no longer has is left off, and a record
+/// written from another library is not this library's to name.
+fn with_stick_playlists(
+    state: &AppState,
+    library: &rbl_index::Library,
+    destination: &std::path::Path,
+    playlist: String,
+) -> AppResult<Vec<String>> {
+    let mut ids = Vec::new();
+    if destination.is_dir() {
+        rbl_export::recover(destination).map_err(|e| AppError::internal(e.to_string()))?;
+    }
+    if let Some(record) = rbl_export::Manifest::load(destination) {
+        let db_id = state.read_db(|db| rbl_db::export_info::db_id(db.connection())).map_err(write_error)?;
+        let ours = record.db_id == db_id
+            || record.db_id == 0 && rbl_export::sync_record::read(destination).is_some_and(|r| r.db_id == db_id);
+        if ours {
+            let tree = library.playlists();
+            for p in record.playlists.iter().filter(|p| !p.folder && !p.device_only) {
+                let id = p.library_id.to_string();
+                if tree.index_of(p.library_id).is_some() && id != playlist && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids.push(playlist);
+    Ok(ids)
 }
 
 /// Writes the same playlists to every destination, and says how each fared.

@@ -1893,7 +1893,9 @@ export function createMockBackend(options: MockOptions = {}): Backend {
           reused: 0, removed: 0, playlistsAdded: 1, playlistsRemoved: 0, skipped: [], verified: true,
         });
       }
-      return mockExport(destination, () => writeTo(device, [playlistId], defaults, deleteUnlistedMusic));
+      // Export Playlist adds to what the stick holds, as the real command does.
+      const onStick = (syncSelections.get(device.path) ?? []).map((p) => p.libraryId).filter((id) => id !== playlistId && findNode(id) !== undefined);
+      return mockExport(destination, () => writeTo(device, [...onStick, playlistId], defaults, deleteUnlistedMusic));
     },
     exportTracksToDevice: (tracks, destination, defaults) => {
       const device = devices.find((d) => d.path === destination);

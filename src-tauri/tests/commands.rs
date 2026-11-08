@@ -1279,6 +1279,66 @@ fn export_track_puts_a_track_on_a_stick_by_itself_and_a_sync_keeps_it_there() {
 }
 
 #[test]
+fn export_playlist_adds_to_a_stick_and_keeps_the_playlists_already_there() {
+    let s = shell();
+    let one = s._dir.path().join("One.wav");
+    let two = s._dir.path().join("Two.wav");
+    write_wav(&one, 2);
+    write_wav(&two, 2);
+    let report = run(commands::import_files(
+        s.handle(),
+        s.state(),
+        vec![one.display().to_string(), two.display().to_string()],
+    ))
+    .unwrap();
+    let (first, second) = (report.tracks[0].id.clone(), report.tracks[1].id.clone());
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), vec![first])).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(2), vec![second])).unwrap();
+
+    let stick = tempfile::tempdir().unwrap();
+    let path = stick.path().display().to_string();
+    let export = |playlist: String| {
+        run(commands::export_playlist(s.handle(), s.state(), playlist, path.clone(), None, None, None)).unwrap()
+    };
+    let recorded = || {
+        let mut ids: Vec<String> = rbl_export::Manifest::load(stick.path())
+            .expect("a record")
+            .playlists
+            .iter()
+            .filter(|p| !p.folder)
+            .map(|p| p.library_id.to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let first_export = export(playlist_id(1));
+    assert_eq!((first_export.tracks, first_export.playlists), (1, 1));
+    assert_eq!(recorded(), vec![playlist_id(1)]);
+
+    // A second playlist joins the first; nothing is removed.
+    let second_export = export(playlist_id(2));
+    assert_eq!((second_export.tracks, second_export.playlists, second_export.removed), (2, 2, 0));
+    assert_eq!(recorded(), vec![playlist_id(1), playlist_id(2)]);
+
+    // Exporting one of them again changes nothing about the other.
+    let again = export(playlist_id(1));
+    assert_eq!((again.tracks, again.playlists, again.removed), (2, 2, 0));
+    assert_eq!(recorded(), vec![playlist_id(1), playlist_id(2)]);
+
+    // The Sync Manager still chooses the stick's whole selection.
+    let synced = run(commands::sync_devices(
+        s.handle(), s.state(), vec![playlist_id(2)], vec![path.clone()], None, None, None, None, None,
+    ))
+    .unwrap()
+    .remove(0)
+    .report
+    .expect("written");
+    assert_eq!((synced.tracks, synced.playlists), (1, 1));
+    assert_eq!(recorded(), vec![playlist_id(2)]);
+}
+
+#[test]
 fn a_sync_writes_the_same_playlists_to_every_stick_and_each_stick_remembers_them() {
     let s = shell();
     // One real file in playlist 1, so there is something to copy; the
