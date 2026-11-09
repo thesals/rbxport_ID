@@ -12,10 +12,30 @@
 
 | | Download | Notes |
 |---|---|---|
-| **Windows** 10 / 11 (64-bit) | [**rbxport-ID-Windows-setup.exe**](https://github.com/thesals/rbxport_ID/releases/latest/download/rbxport-ID-Windows-setup.exe) | If SmartScreen warns you, click **More info → Run anyway**. |
-| **macOS** 11 or later (Apple silicon and Intel) | [**rbxport-ID-Mac.dmg**](https://github.com/thesals/rbxport_ID/releases/latest/download/rbxport-ID-Mac.dmg) | Not signed by Apple, so you allow it once. See [Installing on a Mac](docs/user/macos.md). **New: not tested on a Mac yet.** |
+| **Windows** 10 / 11 (64-bit) | [**rbxport-ID-Windows-setup.exe**](https://github.com/thesals/rbxport_ID/releases/latest/download/rbxport-ID-Windows-setup.exe) | See [Install on Windows](#install-on-windows). |
+| **macOS** 11 or later (Apple silicon and Intel) | [**rbxport-ID-Mac.dmg**](https://github.com/thesals/rbxport_ID/releases/latest/download/rbxport-ID-Mac.dmg) | See [Install on a Mac](#install-on-a-mac). **New: not tested on a Mac yet.** |
 
 These links always download the newest build. Every release, with its notes and older versions, is on the [Releases page](https://github.com/thesals/rbxport_ID/releases).
+
+### Install on Windows
+
+1. Download **rbxport-ID-Windows-setup.exe** from the table above and open it.
+2. If Windows shows **"Windows protected your PC"** (SmartScreen), click **More info**, then **Run anyway**. The installer isn't signed with a paid certificate, so Windows doesn't recognise it yet.
+3. Click **Yes** when Windows asks whether the app may make changes. rbxport ID installs for everyone on the PC.
+4. Follow the installer, then open **rbxport** from the Start menu.
+5. On first start, choose **Create a new library** or **Import from rekordbox**. Importing only reads rekordbox's library and never changes it.
+
+### Install on a Mac
+
+The app isn't signed by Apple, which needs a paid developer account, so macOS blocks it the first time and you allow it once.
+
+1. Download **rbxport-ID-Mac.dmg** from the table above. The same file works on Apple silicon and Intel Macs.
+2. Open the `.dmg` and drag **rbxport** onto **Applications**.
+3. Open **rbxport** from Applications. macOS says it can't verify the app: click **Done** (or **OK**), **not Move to Trash**.
+4. Open **System Settings → Privacy & Security**, scroll down to the message about rbxport, and click **Open Anyway**. Enter your password or use Touch ID.
+5. Open rbxport again and click **Open**. From now on it opens normally.
+
+On macOS 11 to 14 you can instead **Control-click rbxport → Open → Open**; macOS 15 and later allow only the System Settings route. If macOS says rbxport **"is damaged and can't be opened"**, it is the same block: open **Terminal**, run `xattr -cr /Applications/rbxport.app`, and open the app again. More detail is in [Installing on a Mac](docs/user/macos.md).
 
 **Updates are automatic.** Every change to this repository builds a new release. Installed copies check for it when they start, or when you choose **Check for Updates…**, and update themselves.
 
@@ -41,10 +61,18 @@ These links always download the newest build. Every release, with its notes and 
 - **Export Playlist**, **Export Folder** and **Export Track** list your connected USB drives, so you pick the stick instead of hunting for it in a file browser. **Other location…** still lets you choose any folder.
 - Drives are named as Explorer names them, label and letter (**DJ (G:)**), so two sticks with the same label can be told apart. On a Mac a drive keeps its name.
 - **Devices** and **Sync Manager** list only USB drives and drives that already hold an export, not your internal disks.
+- **Export as many playlists as the stick holds.** Each **Export Playlist** adds to the stick and keeps the playlists already on it; exporting one again updates just that one. Use the **Sync Manager** to choose a stick's whole selection, including removing playlists.
+- **Exports queue.** Start another export while one is writing and it waits its turn instead of failing, in the order you started them. Its tracks join the same progress bar, which finishes once the last export is done. **Stop** stops the running export and the ones waiting behind it.
 - **Works on older players.** Sticks now load on the XDJ-1000 mk1 (firmware 1.13), which used to freeze at the My Settings screen or on the browse screen. See [Fixed in v1.2.14](#fixed-in-v1214).
 
 ### Installers and updates
 - A Windows installer and a Mac app are built for every release on GitHub, and each is signed for the built-in updater.
+
+### Recent changes
+
+- **Export queue** (the release after v1.2.15): a second export to a stick that is being written waits its turn and joins the progress bar, instead of failing with "An export to this device is already running."
+- **v1.2.15**: exporting a second playlist to a stick no longer removes the first.
+- **v1.2.14**: sticks load on the XDJ-1000 mk1; details below.
 
 ### Fixed in v1.2.14
 
