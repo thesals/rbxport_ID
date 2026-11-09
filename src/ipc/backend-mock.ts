@@ -740,7 +740,14 @@ export function createMockBackend(options: MockOptions = {}): Backend {
     exportJobs.set(path, progress);
     for (const listener of exportListeners) listener(progress);
   };
-  const mockExport = async (path: string, write: () => ExportReport) => {
+  // Exports to one stick wait for each other, as the real backend queues them.
+  const exportQueues = new Map<string, Promise<unknown>>();
+  const mockExport = (path: string, write: () => ExportReport): Promise<ExportReport> => {
+    const run = (exportQueues.get(path) ?? Promise.resolve()).catch(() => undefined).then(() => mockExportNow(path, write));
+    exportQueues.set(path, run);
+    return run;
+  };
+  const mockExportNow = async (path: string, write: () => ExportReport) => {
     cancelledExports.delete(path);
     tellExport(path, "copying");
     await wait(undefined);
@@ -1893,9 +1900,12 @@ export function createMockBackend(options: MockOptions = {}): Backend {
           reused: 0, removed: 0, playlistsAdded: 1, playlistsRemoved: 0, skipped: [], verified: true,
         });
       }
-      // Export Playlist adds to what the stick holds, as the real command does.
-      const onStick = (syncSelections.get(device.path) ?? []).map((p) => p.libraryId).filter((id) => id !== playlistId && findNode(id) !== undefined);
-      return mockExport(destination, () => writeTo(device, [...onStick, playlistId], defaults, deleteUnlistedMusic));
+      // Export Playlist adds to what the stick holds when its turn comes, as
+      // the real command does.
+      return mockExport(destination, () => {
+        const onStick = (syncSelections.get(device.path) ?? []).map((p) => p.libraryId).filter((id) => id !== playlistId && findNode(id) !== undefined);
+        return writeTo(device, [...onStick, playlistId], defaults, deleteUnlistedMusic);
+      });
     },
     exportTracksToDevice: (tracks, destination, defaults) => {
       const device = devices.find((d) => d.path === destination);

@@ -166,6 +166,24 @@ describe("the mock's Explorer", () => {
 });
 
 describe("USB music cleanup", () => {
+  it("queues a second Export Playlist to a busy stick and keeps both playlists", async () => {
+    const backend = createMockBackend({ trackCount: 20 });
+    await backend.edits.createPlaylist("Queue A", TREE_ROOT);
+    await backend.edits.createPlaylist("Queue B", TREE_ROOT);
+    const tree = await backend.playlistTree();
+    const a = tree.find(n => n.name === "Queue A")!.id;
+    const b = tree.find(n => n.name === "Queue B")!.id;
+    await backend.edits.addTracksToPlaylist(a, ["100000"]);
+    await backend.edits.addTracksToPlaylist(b, ["100001"]);
+    const destination = (await backend.listDevices()).find(d => !d.export)?.path;
+    const [first, second] = await Promise.all([
+      backend.exportPlaylist(a, destination),
+      backend.exportPlaylist(b, destination),
+    ]);
+    expect(first).toMatchObject({ playlists: 1 });
+    expect(second).toMatchObject({ tracks: 2, playlists: 2, removed: 0 });
+  });
+
   it("keeps individually exported music by default, then removes only music outside all synced playlists", async () => {
     const backend = createMockBackend({ trackCount: 20 });
     await backend.edits.createPlaylist("Cleanup A", TREE_ROOT);

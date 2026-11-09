@@ -1339,6 +1339,54 @@ fn export_playlist_adds_to_a_stick_and_keeps_the_playlists_already_there() {
 }
 
 #[test]
+fn two_exports_to_one_stick_at_once_both_land() {
+    let s = shell();
+    let files: Vec<_> = (0..6).map(|i| s._dir.path().join(format!("Queued {i}.wav"))).collect();
+    for file in &files {
+        write_wav(file, 2);
+    }
+    let report = run(commands::import_files(
+        s.handle(),
+        s.state(),
+        files.iter().map(|f| f.display().to_string()).collect(),
+    ))
+    .unwrap();
+    let ids: Vec<String> = report.tracks.iter().map(|t| t.id.clone()).collect();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(1), ids[..3].to_vec())).unwrap();
+    run(commands::add_tracks_to_playlist(s.handle(), s.state(), playlist_id(2), ids[3..].to_vec())).unwrap();
+
+    let stick = tempfile::tempdir().unwrap();
+    let path = stick.path().display().to_string();
+    // The second is asked for while the first may still be writing: it
+    // waits its turn instead of being refused, and then keeps the first's
+    // playlist on the stick.
+    let reports: Vec<_> = std::thread::scope(|scope| {
+        let workers: Vec<_> = [playlist_id(1), playlist_id(2)]
+            .into_iter()
+            .map(|playlist| {
+                let path = path.clone();
+                let (handle, state) = (s.handle(), s.state());
+                scope.spawn(move || run(commands::export_playlist(handle, state, playlist, path, None, None, None)))
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    for report in &reports {
+        assert!(report.is_ok(), "{report:?}");
+    }
+    let mut on_stick: Vec<String> = rbl_export::Manifest::load(stick.path())
+        .expect("a record")
+        .playlists
+        .iter()
+        .filter(|p| !p.folder)
+        .map(|p| p.library_id.to_string())
+        .collect();
+    on_stick.sort();
+    assert_eq!(on_stick, vec![playlist_id(1), playlist_id(2)]);
+    assert_eq!(rbl_export::Manifest::load(stick.path()).unwrap().tracks.len(), 6);
+}
+
+#[test]
 fn a_sync_writes_the_same_playlists_to_every_stick_and_each_stick_remembers_them() {
     let s = shell();
     // One real file in playlist 1, so there is something to copy; the

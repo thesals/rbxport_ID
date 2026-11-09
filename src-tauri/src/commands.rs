@@ -940,15 +940,45 @@ pub async fn export_playlist<R: tauri::Runtime>(
     let progress_app = app.clone();
     let report = blocking("export_playlist", move || {
         let destination = std::path::Path::new(&destination);
-        let playlists = with_stick_playlists(&state, &library, destination, playlist)?;
-        let selection = ExportSelection::from_playlists(&state, &library, &share, &playlists, false)?;
-        let selection = selection.for_stick(&state, &library, &share, destination, delete_unlisted_music.unwrap_or(false))?;
-        write_export_with_progress(&progress_app, destination, &selection, defaults.as_ref(), compatibility_format)
+        let estimate = selection_estimate(&library, &with_stick_playlists(&state, &library, destination, playlist.clone())?, &[]);
+        // Read the stick's record when this export's turn comes, not now: an
+        // export still running to the stick may be adding a playlist to it.
+        let prepare = || {
+            let playlists = with_stick_playlists(&state, &library, destination, playlist)?;
+            ExportSelection::from_playlists(&state, &library, &share, &playlists, false)?
+                .into_for_stick(&state, &library, &share, destination, delete_unlisted_music.unwrap_or(false))
+                .map(Box::new)
+        };
+        write_export_with_progress(&progress_app, destination, estimate, prepare, defaults.as_ref(), compatibility_format)
     })
     .await?;
 
     let _ = tauri::Emitter::emit(&app, "export:done", &report);
     Ok(report)
+}
+
+/// How many tracks an export of these playlists and loose tracks will take,
+/// each counted once, for the progress bar while it waits its turn. Cheap: it
+/// reads only the index.
+fn selection_estimate(library: &rbl_index::Library, playlist_ids: &[String], loose: &[u64]) -> u32 {
+    let sources: Vec<rbl_index::TrackSource> = {
+        let playlists = library.playlists();
+        playlist_ids
+            .iter()
+            .filter_map(|id| id.parse::<u64>().ok().and_then(|numeric| playlists.index_of(numeric)))
+            .map(|index| if playlists.is_smart(index) {
+                rbl_index::TrackSource::SmartPlaylist(index)
+            } else {
+                rbl_index::TrackSource::Playlist(index)
+            })
+            .collect()
+    };
+    let rows: std::collections::HashSet<u32> = sources
+        .iter()
+        .flat_map(|source| library.source_rows(source))
+        .chain(loose.iter().filter_map(|&id| library.row_of_id(id)))
+        .collect();
+    u32::try_from(rows.len()).unwrap_or(u32::MAX)
 }
 
 /// Export Playlist adds to a stick, as rekordbox's does: the playlists the
@@ -1086,8 +1116,12 @@ fn sync_one_device<R: tauri::Runtime>(
     };
     progress("writing");
     let stick = std::path::Path::new(&destination);
-    let written = selection.for_stick(state, library, share, stick, delete_unlisted_music)
-        .and_then(|selection| write_export_with_progress(app, stick, &selection, defaults, compatibility_format));
+    let estimate = u32::try_from(selection.tracks.len()).unwrap_or(u32::MAX);
+    let written = write_export_with_progress(
+        app, stick, estimate,
+        || selection.for_stick(state, library, share, stick, delete_unlisted_music),
+        defaults, compatibility_format,
+    );
     match written {
         Ok(report) => {
             let mut result = SyncDeviceReportDto { path: destination.clone(), report: Some(report), error: None, ejected: false, eject_error: None };
@@ -1137,21 +1171,33 @@ pub async fn export_tracks_to_device<R: tauri::Runtime>(
         if !stick.is_dir() {
             return Err(AppError::new(ErrorKind::NotFound, "That device is no longer connected."));
         }
-        let record = rbl_export::Manifest::load(stick);
-        let (playlists, mut loose, automatic) = match record {
-            Some(m) => {
-                let ids: Vec<String> = m.playlists.iter().filter(|p| !p.folder).map(|p| p.library_id.to_string()).collect();
-                (ids, m.loose, rbl_export::sync_record::read(stick).is_some_and(|r| r.automatic))
+        // What the stick holds, read again when this export's turn comes: an
+        // export still running to it may change it.
+        let on_stick = || {
+            let record = rbl_export::Manifest::load(stick);
+            let (playlists, mut loose, automatic) = match record {
+                Some(m) => {
+                    let ids: Vec<String> = m.playlists.iter().filter(|p| !p.folder).map(|p| p.library_id.to_string()).collect();
+                    (ids, m.loose, rbl_export::sync_record::read(stick).is_some_and(|r| r.automatic))
+                }
+                None => (Vec::new(), Vec::new(), false),
+            };
+            for id in tracks.iter().filter_map(|t| t.parse::<u64>().ok()) {
+                if !loose.contains(&id) {
+                    loose.push(id);
+                }
             }
-            None => (Vec::new(), Vec::new(), false),
+            (playlists, loose, automatic)
         };
-        for id in tracks.iter().filter_map(|t| t.parse::<u64>().ok()) {
-            if !loose.contains(&id) {
-                loose.push(id);
-            }
-        }
-        let selection = ExportSelection::from_playlists_and_tracks(&state, &library, &share, &playlists, &loose, automatic)?;
-        write_export_with_progress(&progress_app, stick, &selection, defaults.as_ref(), compatibility_format)
+        let estimate = {
+            let (playlists, loose, _) = on_stick();
+            selection_estimate(&library, &playlists, &loose)
+        };
+        let prepare = || {
+            let (playlists, loose, automatic) = on_stick();
+            ExportSelection::from_playlists_and_tracks(&state, &library, &share, &playlists, &loose, automatic).map(Box::new)
+        };
+        write_export_with_progress(&progress_app, stick, estimate, prepare, defaults.as_ref(), compatibility_format)
     })
     .await?;
     let _ = tauri::Emitter::emit(&app, "export:done", &report);
@@ -1396,6 +1442,23 @@ impl ExportSelection {
         Ok(Self { tracks, playlists: source_playlists, my_tags, sync })
     }
 
+    /// [`for_stick`](Self::for_stick), keeping this selection when it needs
+    /// nothing added rather than copying it.
+    pub(crate) fn into_for_stick(
+        self,
+        state: &AppState,
+        library: &rbl_index::Library,
+        share: &std::path::Path,
+        destination: &std::path::Path,
+        delete_unlisted_music: bool,
+    ) -> AppResult<Self> {
+        let extended = match self.for_stick(state, library, share, destination, delete_unlisted_music)? {
+            std::borrow::Cow::Owned(extended) => Some(extended),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
+        Ok(extended.unwrap_or(self))
+    }
+
     /// This selection with the loose tracks a stick's record names added,
     /// so a sync keeps what Export Track put there unless cleanup is enabled.
     /// Cleanup uses the playlist selection alone; the exporter removes only
@@ -1488,8 +1551,170 @@ fn source_track(
 /// Runs inside a `blocking` closure: it copies audio over USB.
 static EXPORT_PROGRESS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, ExportProgressDto>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-static EXPORT_CANCEL: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// One destination's exports, which run one at a time in the order they were
+/// asked for. A second export to a stick that is being written waits here
+/// instead of being refused, and its tracks join the stick's progress bar
+/// while it waits: done counts the finished exports' tracks, and the total
+/// adds the waiting exports' tracks.
+#[derive(Default)]
+struct ExportLane {
+    /// An export holds this destination's turn.
+    busy: bool,
+    /// Exports waiting for the turn, by ticket, first asked first.
+    queue: std::collections::VecDeque<u64>,
+    /// The next waiting export's ticket.
+    next_ticket: u64,
+    /// The tracks those waiting exports are expected to bring.
+    pending: u32,
+    /// The tracks of this run's finished exports.
+    finished: u32,
+    /// The tracks of the export holding the turn.
+    current: u32,
+    /// Stop: shared by the running export and those waiting behind it, and
+    /// replaced once set, so an export asked for after Stop still runs.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExportLane {
+    fn total(&self) -> u32 {
+        self.finished.saturating_add(self.current).saturating_add(self.pending)
+    }
+}
+
+static EXPORT_LANES: std::sync::LazyLock<(std::sync::Mutex<std::collections::HashMap<String, ExportLane>>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(|| (std::sync::Mutex::new(std::collections::HashMap::new()), std::sync::Condvar::new()));
+
+fn lanes() -> AppResult<std::sync::MutexGuard<'static, std::collections::HashMap<String, ExportLane>>> {
+    EXPORT_LANES.0.lock().map_err(|e| AppError::internal(e.to_string()))
+}
+
+/// Holding a destination's turn; dropping it hands the turn on.
+struct ExportTurn {
+    path: String,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    released: bool,
+}
+
+impl ExportTurn {
+    /// Waits for the exports already running or waiting for `path`.
+    /// `estimate` is what this export's tracks count on the bar until its
+    /// selection is built. Errors with `Cancelled` if Stop is pressed
+    /// while it waits. `grown` is told the bar's new done and total when
+    /// this export joins a queue.
+    fn take(path: &str, estimate: u32, grown: impl FnOnce(u32, u32)) -> AppResult<Self> {
+        let mut all = lanes()?;
+        // A new batch replaces terminal progress from the previous one. When
+        // another job is active this export belongs to that same batch, so a
+        // stick that finishes early remains in the aggregate denominator.
+        if all.is_empty() {
+            if let Ok(mut progress) = EXPORT_PROGRESS.lock() {
+                progress.clear();
+            }
+        }
+        let lane = all.entry(path.to_owned()).or_default();
+        let cancel = Arc::clone(&lane.cancel);
+        if lane.busy || !lane.queue.is_empty() {
+            let ticket = lane.next_ticket;
+            lane.next_ticket += 1;
+            lane.queue.push_back(ticket);
+            lane.pending = lane.pending.saturating_add(estimate);
+            grown(lane.finished, lane.total());
+            let my_turn = |l: &ExportLane| !l.busy && l.queue.front() == Some(&ticket);
+            while !all.get(path).is_some_and(my_turn) && !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                all = EXPORT_LANES.1.wait(all).map_err(|e| AppError::internal(e.to_string()))?;
+            }
+            let Some(lane) = all.get_mut(path) else {
+                return Err(AppError::internal("The export queue for this device was lost."));
+            };
+            lane.queue.retain(|t| *t != ticket);
+            lane.pending = lane.pending.saturating_sub(estimate);
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                if !lane.busy && lane.queue.is_empty() {
+                    all.remove(path);
+                }
+                EXPORT_LANES.1.notify_all();
+                return Err(AppError::new(ErrorKind::Cancelled, "Export stopped."));
+            }
+        }
+        let Some(lane) = all.get_mut(path) else {
+            return Err(AppError::internal("The export queue for this device was lost."));
+        };
+        lane.busy = true;
+        lane.current = estimate;
+        Ok(Self { path: path.to_owned(), cancel, released: false })
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// This export's real track count, once its selection is built.
+    fn set_tracks(&self, tracks: u32) {
+        if let Ok(mut all) = lanes() {
+            if let Some(lane) = all.get_mut(&self.path) {
+                lane.current = tracks;
+            }
+        }
+    }
+
+    /// Where `done` tracks of this export put the destination's bar.
+    fn progress(&self, done: u32) -> (u32, u32) {
+        lanes().ok().and_then(|all| all.get(&self.path).map(|l| (l.finished.saturating_add(done), l.total()))).unwrap_or((done, done))
+    }
+
+    /// Whether exports wait behind this one, and where the bar stands once it
+    /// is finished: its tracks done, and the total.
+    fn finishing(&self) -> (bool, u32, u32) {
+        lanes().ok().and_then(|all| all.get(&self.path).map(|l| {
+            (!l.queue.is_empty(), l.finished.saturating_add(l.current), l.total())
+        })).unwrap_or((false, 0, 0))
+    }
+
+    /// Hands the turn on to the next export queued for this destination.
+    fn release(&mut self, succeeded: bool) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Ok(mut all) = lanes() {
+            if let Some(lane) = all.get_mut(&self.path) {
+                lane.busy = false;
+                lane.finished = lane.finished.saturating_add(lane.current);
+                lane.current = 0;
+                if lane.queue.is_empty() {
+                    all.remove(&self.path);
+                } else if !succeeded {
+                    // A failure is reported on its own; the exports behind
+                    // it start a fresh bar.
+                    lane.finished = 0;
+                }
+            }
+        }
+        EXPORT_LANES.1.notify_all();
+    }
+}
+
+impl Drop for ExportTurn {
+    fn drop(&mut self) {
+        self.release(false);
+    }
+}
+
+/// Re-sends a destination's progress with the bar grown by an export that
+/// has joined the queue.
+fn grow_export_total<R: tauri::Runtime>(app: &tauri::AppHandle<R>, path: &str, done: u32, total: u32) {
+    let progress = EXPORT_PROGRESS.lock().ok().and_then(|mut jobs| {
+        jobs.get_mut(path).map(|job| {
+            job.done = job.done.max(done);
+            job.total = total;
+            job.clone()
+        })
+    });
+    if let Some(progress) = progress {
+        let _ = tauri::Emitter::emit(app, "export:progress", progress);
+    }
+}
 
 fn set_export_stage<R: tauri::Runtime>(app: &tauri::AppHandle<R>, destination: &std::path::Path, state: &'static str) {
     let path = destination.to_string_lossy().into_owned();
@@ -1532,11 +1757,14 @@ fn set_export_failure<R: tauri::Runtime>(
 
 #[tauri::command]
 pub fn cancel_export(path: &str) {
-    if let Ok(jobs) = EXPORT_CANCEL.lock() {
-        if let Some(cancel) = jobs.get(path) {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Stops the running export and every one queued behind it.
+    if let Ok(mut all) = lanes() {
+        if let Some(lane) = all.get_mut(path) {
+            lane.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            lane.cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         }
     }
+    EXPORT_LANES.1.notify_all();
 }
 
 #[tauri::command]
@@ -1559,55 +1787,63 @@ pub async fn eject_device(path: String) -> AppResult<()> {
     }).await
 }
 
-fn write_export_with_progress<R: tauri::Runtime>(
+/// Writes to one destination once the exports queued for it before this one
+/// have finished, and reads the result back.
+///
+/// `prepare` builds the selection only when this export's turn comes, so it
+/// reads the stick's record as the export ahead of it left it: Export
+/// Playlist keeps the playlist that export added. `estimate` is how many
+/// tracks this export adds to the stick's bar while it waits.
+fn write_export_with_progress<R: tauri::Runtime, S: std::ops::Deref<Target = ExportSelection>>(
     app: &tauri::AppHandle<R>,
     destination: &std::path::Path,
-    selection: &ExportSelection,
+    estimate: u32,
+    prepare: impl FnOnce() -> AppResult<S>,
     defaults: Option<&crate::device_settings::StickDefaultsDto>,
     compatibility_format: Option<rbl_export::CompatibilityFormat>,
 ) -> AppResult<ExportReportDto> {
-    let total = u32::try_from(selection.tracks.len()).unwrap_or(u32::MAX);
     let path = destination.to_string_lossy().into_owned();
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let mut jobs = EXPORT_CANCEL.lock().map_err(|e| AppError::internal(e.to_string()))?;
-        if jobs.contains_key(&path) {
-            return Err(AppError::internal("An export to this device is already running."));
-        }
-        // A new batch replaces terminal progress from the previous one. When
-        // another job is active this export belongs to that same batch, so a
-        // stick that finishes early remains in the aggregate denominator.
-        if jobs.is_empty() {
-            if let Ok(mut progress) = EXPORT_PROGRESS.lock() {
-                progress.clear();
-            }
-        }
-        jobs.insert(path.clone(), Arc::clone(&cancel));
-    }
-    let emit = |state, done, title: String| {
-        let progress = ExportProgressDto {
-            path: destination.to_string_lossy().into_owned(), state, done, total, title,
-        };
+    let mut turn = ExportTurn::take(&path, estimate, |done, total| grow_export_total(app, &path, done, total))?;
+    let emit = |state, done: u32, title: String, turn: &ExportTurn| {
+        let (done, total) = turn.progress(done);
+        let progress = ExportProgressDto { path: path.clone(), state, done, total, title };
         if let Ok(mut jobs) = EXPORT_PROGRESS.lock() {
             jobs.insert(progress.path.clone(), progress.clone());
         }
         let _ = tauri::Emitter::emit(app, "export:progress", progress);
     };
-    emit("preparing", 0, String::new());
+    emit("preparing", 0, String::new(), &turn);
     let done = std::cell::Cell::new(0);
-    let result = write_export_with_phase(
-        destination, selection, defaults, compatibility_format,
-        &mut |p| {
-            done.set(u32::try_from(p.done).unwrap_or(u32::MAX));
-            emit(p.stage, done.get(), p.title.clone());
-        },
-        &mut |phase| emit(phase, if phase == "verifying" { total } else { done.get() }, String::new()),
-        &|| cancel.load(std::sync::atomic::Ordering::Relaxed),
-    );
+    let total = std::cell::Cell::new(estimate);
+    let result = prepare().and_then(|selection| {
+        total.set(u32::try_from(selection.tracks.len()).unwrap_or(u32::MAX));
+        turn.set_tracks(total.get());
+        write_export_with_phase(
+            destination, &selection, defaults, compatibility_format,
+            &mut |p| {
+                done.set(u32::try_from(p.done).unwrap_or(u32::MAX));
+                emit(p.stage, done.get(), p.title.clone(), &turn);
+            },
+            &mut |phase| emit(phase, if phase == "verifying" { total.get() } else { done.get() }, String::new(), &turn),
+            &|| turn.cancelled(),
+        )
+    });
     let cancelled = result.as_ref().err().is_some_and(|e| matches!(e.kind, ErrorKind::Cancelled));
-    emit(if result.is_ok() { "done" } else if cancelled { "cancelled" } else { "failed" }, if result.is_ok() { total } else { done.get() },
-        result.as_ref().err().map_or_else(String::new, |e| e.message.clone()));
-    if let Ok(mut jobs) = EXPORT_CANCEL.lock() { jobs.remove(&path); }
+    // With exports still queued the bar carries on; only the last one
+    // finishes it. A failure or Stop is always reported. Said before the
+    // turn passes on, so it never lands after the next export's progress.
+    let (more, finished, overall) = turn.finishing();
+    let state = if result.is_ok() { if more { "preparing" } else { "done" } } else if cancelled { "cancelled" } else { "failed" };
+    let (done, all) = if result.is_ok() { (finished, overall.max(finished)) } else { (done.get(), total.get()) };
+    let progress = ExportProgressDto {
+        path: path.clone(), state, done, total: all,
+        title: result.as_ref().err().map_or_else(String::new, |e| e.message.clone()),
+    };
+    if let Ok(mut jobs) = EXPORT_PROGRESS.lock() {
+        jobs.insert(progress.path.clone(), progress.clone());
+    }
+    let _ = tauri::Emitter::emit(app, "export:progress", progress);
+    turn.release(result.is_ok());
     result
 }
 
@@ -3568,9 +3804,70 @@ pub async fn filter_values(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::expand_import_paths;
+
+    /// Waits, bounded, until `count` exports are queued for `path`.
+    fn wait_for_queue(path: &str, count: usize) {
+        for _ in 0..500 {
+            if super::lanes().unwrap().get(path).is_some_and(|l| l.queue.len() == count) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("{count} exports never queued for {path}");
+    }
+
+    #[test]
+    fn exports_to_one_stick_queue_in_order_and_share_one_bar() {
+        let path = "queue-test-order";
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut first = super::ExportTurn::take(path, 10, |_, _| {}).unwrap();
+        std::thread::scope(|scope| {
+            let spawn = |name: &'static str, tracks: u32| {
+                let order = std::sync::Arc::clone(&order);
+                scope.spawn(move || {
+                    let mut turn = super::ExportTurn::take(path, tracks, |_, _| {}).unwrap();
+                    order.lock().unwrap().push(name);
+                    turn.release(true);
+                });
+            };
+            spawn("second", 5);
+            wait_for_queue(path, 1);
+            spawn("third", 7);
+            wait_for_queue(path, 2);
+            // Both waiting exports are on the first one's bar.
+            assert_eq!(first.progress(3), (3, 22));
+            first.release(true);
+        });
+        assert_eq!(*order.lock().unwrap(), vec!["second", "third"]);
+        assert!(super::lanes().unwrap().get(path).is_none(), "the lane is gone once its queue empties");
+    }
+
+    #[test]
+    fn stop_cancels_the_queue_but_not_an_export_asked_for_afterwards() {
+        let path = "queue-test-stop";
+        let mut first = super::ExportTurn::take(path, 4, |_, _| {}).unwrap();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(move || super::ExportTurn::take(path, 4, |_, _| {}).map(|_| ()));
+            wait_for_queue(path, 1);
+            super::cancel_export(path);
+            let refused = waiting.join().unwrap().unwrap_err();
+            assert!(matches!(refused.kind, crate::error::ErrorKind::Cancelled));
+            assert!(first.cancelled());
+
+            let later = scope.spawn(move || {
+                let mut turn = super::ExportTurn::take(path, 2, |_, _| {})?;
+                let cancelled = turn.cancelled();
+                turn.release(true);
+                Ok::<bool, crate::error::AppError>(cancelled)
+            });
+            wait_for_queue(path, 1);
+            first.release(false);
+            assert!(!later.join().unwrap().unwrap(), "an export asked for after Stop runs");
+        });
+    }
 
     /// Sorted file names, so a filesystem-dependent walk order does not make
     /// the assertions flaky.
