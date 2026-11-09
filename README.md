@@ -70,7 +70,7 @@ On macOS 11 to 14 you can instead **Control-click rbxport → Open → Open**; m
 
 ### Recent changes
 
-- **Export queue** (the release after v1.2.15): a second export to a stick that is being written waits its turn and joins the progress bar, instead of failing with "An export to this device is already running."
+- **v1.2.16**: export queue. A second export to a stick that is being written waits its turn and joins the progress bar, instead of failing with "An export to this device is already running."
 - **v1.2.15**: exporting a second playlist to a stick no longer removes the first.
 - **v1.2.14**: sticks load on the XDJ-1000 mk1; details below.
 
